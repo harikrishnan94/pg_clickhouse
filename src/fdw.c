@@ -1797,16 +1797,16 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER and SEMI joins.
-	 * ANTI joins are not supported.
+	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, SEMI, and ANTI
+	 * joins. SEMI deparses to LEFT SEMI JOIN, ANTI to LEFT ANTI JOIN.
 	 */
 	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
 		jointype != JOIN_RIGHT && jointype != JOIN_FULL &&
-		jointype != JOIN_SEMI)
+		jointype != JOIN_SEMI && jointype != JOIN_ANTI)
 		return false;
 
-	/* Semi-join target can only reference the outer relation */
-	if (jointype == JOIN_SEMI &&
+	/* Semi/anti-join target can only reference the outer relation */
+	if ((jointype == JOIN_SEMI || jointype == JOIN_ANTI) &&
 		!semijoin_target_ok(root, joinrel, outerrel, innerrel))
 		return false;
 
@@ -1979,9 +1979,10 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 			break;
 
 		case JOIN_SEMI:
+		case JOIN_ANTI:
 
 			/*
-			 * For semi-join, inner's conditions go to joinclauses (ON),
+			 * For semi/anti-join, inner's conditions go to joinclauses (ON),
 			 * outer's conditions go to remote_conds (WHERE). Extract join key
 			 * equalities to joinclauses for the ON clause.
 			 */
@@ -1991,6 +1992,26 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 											   list_copy(fpinfo_o->remote_conds));
 			fpinfo->remote_conds = extract_join_equals(fpinfo->remote_conds,
 													   &fpinfo->joinclauses);
+
+			/*
+			 * ClickHouse cannot parse inline nested joins (A JOIN B JOIN C ON
+			 * ... ON ...). When either input is itself a join, wrap it in a
+			 * subquery so it deparses as (SELECT ...) sN.
+			 */
+			if (IS_JOIN_REL(outerrel))
+			{
+				fpinfo->make_outerrel_subquery = true;
+				fpinfo->lower_subquery_rels =
+					bms_add_members(fpinfo->lower_subquery_rels,
+									outerrel->relids);
+			}
+			if (IS_JOIN_REL(innerrel))
+			{
+				fpinfo->make_innerrel_subquery = true;
+				fpinfo->lower_subquery_rels =
+					bms_add_members(fpinfo->lower_subquery_rels,
+									innerrel->relids);
+			}
 			break;
 
 		case JOIN_FULL:
@@ -2025,15 +2046,27 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	}
 
 	/*
-	 * ClickHouse requires SEMI JOINs to have an ON clause with join
-	 * conditions. Reject uncorrelated EXISTS subqueries that have no join
-	 * keys.
-	 *
-	 * XXX Change to use ClickHouse EXISTS in this case?
-	 * https://clickhouse.com/docs/sql-reference/operators/exists
+	 * ClickHouse SEMI/ANTI JOINs require at least one equi-join key in the
+	 * ON clause. Reject when joinclauses has no simple equality referencing
+	 * both sides (e.g. uncorrelated EXISTS).
 	 */
-	if (jointype == JOIN_SEMI && fpinfo->joinclauses == NIL)
-		return false;
+	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
+	{
+		bool		has_equi_key = false;
+
+		foreach(lc, fpinfo->joinclauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (is_simple_join_clause((Expr *) rinfo))
+			{
+				has_equi_key = true;
+				break;
+			}
+		}
+		if (!has_equi_key)
+			return false;
+	}
 
 	/* Mark that this join can be pushed down safely */
 	fpinfo->pushdown_safe = true;

@@ -1663,6 +1663,9 @@ chfdw_get_jointype_name(JoinType jointype)
 		case JOIN_SEMI:
 			return "LEFT SEMI";
 
+		case JOIN_ANTI:
+			return "LEFT ANTI";
+
 		default:
 			/* Shouldn't come here, but protect from buggy code. */
 			elog(ERROR, "unsupported join type %d", jointype);
@@ -1859,9 +1862,9 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo * root, RelOptInfo * foreignre
 		 *
 		 * ((outer relation) <join type> (inner relation) ON (joinclauses))
 		 *
-		 * ClickHouse doesn't use ALL modifier for SEMI joins.
+		 * ClickHouse doesn't use ALL modifier for SEMI/ANTI joins.
 		 */
-		if (fpinfo->jointype == JOIN_SEMI)
+		if (fpinfo->jointype == JOIN_SEMI || fpinfo->jointype == JOIN_ANTI)
 			appendStringInfo(buf, " %s %s JOIN %s ON ", join_sql_o.data,
 							 chfdw_get_jointype_name(fpinfo->jointype), join_sql_i.data);
 		else
@@ -5287,10 +5290,11 @@ appendOrderByClause(List * pathkeys, bool has_final_sort,
 														  target);
 		}
 		else if (IS_JOIN_REL(context->foreignrel) &&
-				 fpinfo->jointype == JOIN_SEMI)
+				 (fpinfo->jointype == JOIN_SEMI ||
+				  fpinfo->jointype == JOIN_ANTI))
 		{
 			/*
-			 * For SEMI JOINs, prefer expressions from the outer relation
+			 * For SEMI/ANTI JOINs, prefer expressions from the outer relation
 			 * since inner relation columns are not visible in the output.
 			 */
 			em_expr = chfdw_find_em_expr_for_rel(pathkey->pk_eclass,
