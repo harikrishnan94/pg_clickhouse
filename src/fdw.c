@@ -1824,6 +1824,19 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	}
 
 	/*
+	 * A SEMI/ANTI joinrel used as the input of a further join would deparse
+	 * as an inline nested join, which ClickHouse cannot parse, and the
+	 * subquery-wrapping escape hatch requires reltarget coverage that
+	 * SEMI/ANTI inputs do not guarantee. Keep such composites local; the
+	 * SEMI/ANTI join itself can still push down as the scan's top rel.
+	 */
+	if ((IS_JOIN_REL(outerrel) &&
+		 (fpinfo_o->jointype == JOIN_SEMI || fpinfo_o->jointype == JOIN_ANTI)) ||
+		(IS_JOIN_REL(innerrel) &&
+		 (fpinfo_i->jointype == JOIN_SEMI || fpinfo_i->jointype == JOIN_ANTI)))
+		return false;
+
+	/*
 	 * If joining relations have local conditions, those conditions are
 	 * required to be applied before joining the relations. Hence the join can
 	 * not be pushed down.
@@ -1994,24 +2007,17 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 													   &fpinfo->joinclauses);
 
 			/*
-			 * ClickHouse cannot parse inline nested joins (A JOIN B JOIN C ON
-			 * ... ON ...). When either input is itself a join, wrap it in a
-			 * subquery so it deparses as (SELECT ...) sN.
+			 * Subquery-wrapping a join-typed input would require its
+			 * reltarget to cover every Var the ON clause references, which
+			 * does not hold for SEMI/ANTI inputs (join-only columns are not
+			 * propagated upstream). Until the deparser can widen the wrapped
+			 * subquery's targetlist, refuse ANTI pushdown when either input
+			 * is itself a join and fall back to local execution. SEMI keeps
+			 * its historical behavior.
 			 */
-			if (IS_JOIN_REL(outerrel))
-			{
-				fpinfo->make_outerrel_subquery = true;
-				fpinfo->lower_subquery_rels =
-					bms_add_members(fpinfo->lower_subquery_rels,
-									outerrel->relids);
-			}
-			if (IS_JOIN_REL(innerrel))
-			{
-				fpinfo->make_innerrel_subquery = true;
-				fpinfo->lower_subquery_rels =
-					bms_add_members(fpinfo->lower_subquery_rels,
-									innerrel->relids);
-			}
+			if (jointype == JOIN_ANTI &&
+				(IS_JOIN_REL(outerrel) || IS_JOIN_REL(innerrel)))
+				return false;
 			break;
 
 		case JOIN_FULL:
