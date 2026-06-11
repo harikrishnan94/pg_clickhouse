@@ -28,6 +28,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/primnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "regex/regex.h"
@@ -100,6 +101,10 @@ typedef struct foreign_glob_cxt
 	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
 	Relids		relids;			/* relids of base relations in the underlying
 								 * scan */
+	bool		subquery_scope; /* true while walking the interior of a
+								 * SubPlan's Query; relaxes upper-rel-only
+								 * checks (e.g. bare aggregates are legal in a
+								 * scalar subquery) and forbids nesting */
 }			foreign_glob_cxt;
 
 /*
@@ -119,6 +124,24 @@ typedef struct deparse_expr_cxt
 	bool		interval_op;
 	bool		array_as_tuple; /* determines array output format */
 	bool		no_sort_parens; /* determines sort group clause format */
+
+	/*
+	 * SubPlan scope. While deparsing the body of a pushed-down SubPlan,
+	 * subplan points at it and root points at the SubPlan's own PlannerInfo
+	 * (so planner_rt_fetch resolves varnos against the subquery's rtable).
+	 * parent_ctx chains to the enclosing scope so correlation Params can be
+	 * deparsed with the outer query's aliases. Both are NULL at top level.
+	 */
+	SubPlan    *subplan;
+	struct deparse_expr_cxt *parent_ctx;
+
+	/*
+	 * True when the statement being deparsed inlines at least one SubPlan.
+	 * Forces r{N} aliasing even for single-table scans: an unqualified outer
+	 * column inlined into a subquery would be captured by the subquery's own
+	 * tables (innermost-scope resolution), silently changing the semantics.
+	 */
+	bool		has_subplan_inline;
 }			deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -127,6 +150,23 @@ typedef struct deparse_expr_cxt
 		appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
 #define SUBQUERY_REL_ALIAS_PREFIX	"s"
 #define SUBQUERY_COL_ALIAS_PREFIX	"c"
+
+/*
+ * SubPlan-interior aliases. plan_id is unique across PlannedStmt.subplans,
+ * so q{plan_id}_{varno} can never collide with the outer query's r{N}/s{N}
+ * aliases nor with a sibling SubPlan's tables. See deparseSubPlanQuery.
+ *
+ * INVARIANT (scope discipline): every alias qualifier emitted anywhere in
+ * this file must come from exactly one of these namespaces, chosen by the
+ * deparse_expr_cxt that is current at the emit site:
+ *   context->subplan == NULL  ->  r{N} / s{N}.c{M}   (outer scope)
+ *   context->subplan != NULL  ->  q{plan_id}_{N}     (SubPlan scope)
+ * Emit sites assert this so a scope leak fails loudly in test builds.
+ */
+#define SUBPLAN_REL_ALIAS_PREFIX	"q"
+#define ADD_SUBPLAN_REL_QUALIFIER(buf, plan_id, varno)	\
+		appendStringInfo((buf), "%s%d_%d.", SUBPLAN_REL_ALIAS_PREFIX, \
+						 (plan_id), (varno))
 
 #define CSTRING_TOLOWER(str) \
 do { \
@@ -141,6 +181,8 @@ do { \
  */
 static bool foreign_expr_walker(Node * node,
 								foreign_glob_cxt * glob_cxt);
+static bool is_shippable_subplan(SubPlan * subplan,
+								 foreign_glob_cxt * glob_cxt);
 static char *deparse_type_name(Oid type_oid, int32 typemod);
 
 /*
@@ -209,6 +251,9 @@ static void deparseMinMaxExpr(MinMaxExpr * node, deparse_expr_cxt * context);
 static void deparseRowExpr(RowExpr * node, deparse_expr_cxt * context);
 static void deparseNullIfExpr(NullIfExpr * node, deparse_expr_cxt * context);
 static void appendRegex(List * args, deparse_expr_cxt * context);
+static void deparseSubPlan(SubPlan * node, deparse_expr_cxt * context);
+static void deparseSubPlanQuery(SubPlan * subplan, deparse_expr_cxt * context);
+static void deparseSubPlanQuals(Node * quals, deparse_expr_cxt * context);
 
 /*
  * Helper functions
@@ -264,6 +309,7 @@ chfdw_is_foreign_expr(PlannerInfo * root,
 	 */
 	glob_cxt.root = root;
 	glob_cxt.foreignrel = baserel;
+	glob_cxt.subquery_scope = false;
 
 	/*
 	 * For an upper relation, use relids from its underneath scan relation,
@@ -578,8 +624,13 @@ foreign_expr_walker(Node * node,
 				Aggref	   *agg = (Aggref *) node;
 				ListCell   *lc;
 
-				/* Not safe to pushdown when not in grouping context */
-				if (!IS_UPPER_REL(glob_cxt->foreignrel))
+				/*
+				 * Not safe to pushdown when not in grouping context. Inside a
+				 * SubPlan's Query a bare aggregate is legal (it is the
+				 * subquery's own implicit grouping context).
+				 */
+				if (!IS_UPPER_REL(glob_cxt->foreignrel) &&
+					!glob_cxt->subquery_scope)
 					return false;
 
 				/* Only non-split aggregates are pushable. */
@@ -727,6 +778,24 @@ foreign_expr_walker(Node * node,
 			break;
 		case T_CaseTestExpr:
 			break;
+		case T_SubPlan:
+			{
+				/*
+				 * A SubPlan node is the planner's residue of a SubLink that
+				 * could not be flattened into a join: a correlated or
+				 * uncorrelated subquery evaluated per-row. We can fold a
+				 * restricted class of these into the remote SQL as a real SQL
+				 * subquery; is_shippable_subplan() decides. Nested SubPlans
+				 * are out of scope: deparseParam resolves correlation through
+				 * a single parent_ctx link.
+				 */
+				if (glob_cxt->subquery_scope)
+					return false;
+
+				if (!is_shippable_subplan((SubPlan *) node, glob_cxt))
+					return false;
+			}
+			break;
 		default:
 
 			/*
@@ -744,6 +813,189 @@ foreign_expr_walker(Node * node,
 	{
 		return false;
 	}
+
+	return true;
+}
+
+/*
+ * Decide whether a SubPlan can be folded into the remote SQL as a real SQL
+ * subquery.
+ *
+ * Supported SubLinkTypes:
+ *   EXPR_SUBLINK    (SELECT agg(..) ..)        scalar; aggregate-only, see
+ *                                              the single-row note below
+ *   EXISTS_SUBLINK  EXISTS (SELECT ..)
+ *   ANY_SUBLINK     x IN (SELECT ..)           single-column equality only
+ *
+ * Unsupported (and why):
+ *   ALL_SUBLINK         ClickHouse lacks a direct ALL; NOT IN arrives as
+ *                       NOT(ANY) and is handled by the BoolExpr case.
+ *   ROWCOMPARE_SUBLINK  multi-column compares not deparsed.
+ *   MULTIEXPR_SUBLINK   UPDATE-only; also blocked by the PARAM_MULTIEXPR
+ *                       guard in the walker.
+ *   ARRAY_SUBLINK       ARRAY() construction differs on ClickHouse.
+ *   CTE_SUBLINK         materialized CTEs cannot be hosted remotely.
+ *
+ * The subquery body itself must be a plain comma-joined SELECT over foreign
+ * tables that live on the same server as the outer scan: no set ops, CTEs,
+ * window functions, DISTINCT, ORDER BY, LIMIT, grouping sets, SRFs, nested
+ * SubPlans, or InitPlans. Correlation arrives as PARAM_EXEC Params (the
+ * planner has already replaced outer Vars via SS_replace_correlation_vars);
+ * each correlation arg expression is itself checked for shippability in the
+ * OUTER scope, since deparseParam will inline it with outer aliases.
+ *
+ * Single-row note: a scalar (EXPR) subquery returning zero rows yields NULL
+ * in Postgres but is an error in some ClickHouse versions/contexts. We only
+ * push scalar subqueries whose top level is a bare aggregate with no GROUP
+ * BY, which is guaranteed to produce exactly one row on both systems.
+ */
+static bool
+is_shippable_subplan(SubPlan * subplan, foreign_glob_cxt * glob_cxt)
+{
+	PlannerInfo *subroot;
+	Query	   *query;
+	foreign_glob_cxt sub_cxt;
+	CHFdwRelationInfo *fpinfo;
+	ListCell   *lc;
+
+	if (subplan->subLinkType != EXPR_SUBLINK &&
+		subplan->subLinkType != EXISTS_SUBLINK &&
+		subplan->subLinkType != ANY_SUBLINK)
+		return false;
+
+	/*
+	 * plan_id is 1-based and indexes both glob->subplans and glob->subroots
+	 * in parallel (see pathnodes.h).
+	 */
+	if (subplan->plan_id <= 0 ||
+		subplan->plan_id > list_length(glob_cxt->root->glob->subroots))
+		return false;
+
+	subroot = (PlannerInfo *) list_nth(glob_cxt->root->glob->subroots,
+									   subplan->plan_id - 1);
+	query = subroot->parse;
+	fpinfo = (CHFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
+
+	if (fpinfo == NULL || fpinfo->server == NULL)
+		return false;
+
+	/* Structural features we do not deparse */
+	if (query->setOperations || query->cteList || query->windowClause ||
+		query->distinctClause || query->sortClause || query->limitOffset ||
+		query->limitCount || query->groupingSets || query->hasTargetSRFs ||
+		query->jointree == NULL || query->jointree->fromlist == NIL)
+		return false;
+
+	/* No InitPlans hanging off the subquery, no nested SubPlans */
+	if (subroot->init_plans != NIL)
+		return false;
+	if (contain_subplans((Node *) query->targetList) ||
+		contain_subplans((Node *) query->jointree->quals) ||
+		contain_subplans(query->havingQual))
+		return false;
+
+	/* Scalar subqueries must be single-row by construction (see note) */
+	if (subplan->subLinkType == EXPR_SUBLINK &&
+		(!query->hasAggs || query->groupClause != NIL))
+		return false;
+
+	/*
+	 * FROM must be plain comma-joined foreign tables on the same server as
+	 * the outer scan.
+	 */
+	foreach(lc, query->jointree->fromlist)
+	{
+		RangeTblRef *rtr;
+		RangeTblEntry *rte;
+
+		if (!IsA(lfirst(lc), RangeTblRef))
+			return false;
+		rtr = (RangeTblRef *) lfirst(lc);
+		rte = rt_fetch(rtr->rtindex, query->rtable);
+
+		if (rte->rtekind != RTE_RELATION ||
+			rte->relkind != RELKIND_FOREIGN_TABLE ||
+			rte->securityQuals != NIL)
+			return false;
+
+		if (GetForeignTable(rte->relid)->serverid != fpinfo->server->serverid)
+			return false;
+	}
+
+	/*
+	 * ANY: only single-column equality (deparsed as IN). testexpr compares
+	 * an outer-scope LHS against the subquery's output Param.
+	 */
+	if (subplan->subLinkType == ANY_SUBLINK)
+	{
+		OpExpr	   *op;
+
+		if (subplan->testexpr == NULL || !IsA(subplan->testexpr, OpExpr))
+			return false;
+		op = (OpExpr *) subplan->testexpr;
+		if (list_length(op->args) != 2)
+			return false;
+		if (chfdw_is_equal_op(op->opno) != 1)
+			return false;
+		if (!IsA(lsecond(op->args), Param))
+			return false;
+
+		/* The LHS lives in the outer scope: walk it there. */
+		if (!foreign_expr_walker((Node *) linitial(op->args), glob_cxt))
+			return false;
+	}
+
+	/* Scalar output must be a single column */
+	if (subplan->subLinkType == EXPR_SUBLINK)
+	{
+		int			n = 0;
+
+		foreach(lc, query->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!tle->resjunk)
+				n++;
+		}
+		if (n != 1)
+			return false;
+	}
+
+	/*
+	 * Correlation args are OUTER-scope expressions; deparseParam will inline
+	 * them with outer aliases, so they must be shippable out here.
+	 */
+	if (!foreign_expr_walker((Node *) subplan->args, glob_cxt))
+		return false;
+
+	/*
+	 * Walk the subquery's own expressions in a sub-scope whose relids are
+	 * the subquery's FROM entries.
+	 */
+	memset(&sub_cxt, 0, sizeof(sub_cxt));
+	sub_cxt.root = subroot;
+	sub_cxt.foreignrel = glob_cxt->foreignrel;	/* for fpinfo lookups */
+	sub_cxt.subquery_scope = true;
+	sub_cxt.relids = NULL;
+	foreach(lc, query->jointree->fromlist)
+	{
+		RangeTblRef *rtr = (RangeTblRef *) lfirst(lc);
+
+		sub_cxt.relids = bms_add_member(sub_cxt.relids, rtr->rtindex);
+	}
+
+	foreach(lc, query->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (!foreign_expr_walker((Node *) tle->expr, &sub_cxt))
+			return false;
+	}
+	if (!foreign_expr_walker((Node *) query->jointree->quals, &sub_cxt))
+		return false;
+	if (query->havingQual &&
+		!foreign_expr_walker(query->havingQual, &sub_cxt))
+		return false;
 
 	return true;
 }
@@ -1088,6 +1340,7 @@ chfdw_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo * root, RelOptInfo
 	Assert(IS_JOIN_REL(rel) || IS_SIMPLE_REL(rel) || IS_UPPER_REL(rel));
 
 	/* Fill portions of context common to upper, join and base relation */
+	memset(&context, 0, sizeof(context));
 	context.buf = buf;
 	context.root = root;
 	context.foreignrel = rel;
@@ -1097,9 +1350,7 @@ chfdw_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo * root, RelOptInfo
 	context.interval_op = false;
 	context.array_as_tuple = false;
 	context.no_sort_parens = false;
-
-	/* Construct SELECT clause */
-	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
+	context.fpinfo = fpinfo;
 
 	/*
 	 * For upper relations, the WHERE clause is built from the remote
@@ -1115,6 +1366,42 @@ chfdw_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo * root, RelOptInfo
 	}
 	else
 		quals = remote_conds;
+
+	/*
+	 * Detect inlined SubPlans before emitting anything: their presence
+	 * forces r{N} qualification throughout the statement (see
+	 * has_subplan_inline). Quals may carry RestrictInfo decoration, which
+	 * expression_tree_walker does not look through on all versions, so
+	 * unwrap manually. remote_conds is checked too: for upper relations it
+	 * becomes the HAVING clause.
+	 */
+	{
+		ListCell   *lc;
+
+		foreach(lc, quals)
+		{
+			Node	   *clause = (Node *) lfirst(lc);
+
+			if (IsA(clause, RestrictInfo))
+				clause = (Node *) ((RestrictInfo *) clause)->clause;
+			if (contain_subplans(clause))
+				context.has_subplan_inline = true;
+		}
+		foreach(lc, remote_conds)
+		{
+			Node	   *clause = (Node *) lfirst(lc);
+
+			if (IsA(clause, RestrictInfo))
+				clause = (Node *) ((RestrictInfo *) clause)->clause;
+			if (contain_subplans(clause))
+				context.has_subplan_inline = true;
+		}
+		if (contain_subplans((Node *) tlist))
+			context.has_subplan_inline = true;
+	}
+
+	/* Construct SELECT clause */
+	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
 
 	/* Construct FROM and WHERE clauses */
 	deparseFromExpr(quals, &context);
@@ -1230,7 +1517,8 @@ deparseFromExpr(List * quals, deparse_expr_cxt * context)
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
 	deparseFromExprForRel(buf, context->root, scanrel,
-						  (bms_num_members(scanrel->relids) > 1),
+						  (bms_num_members(scanrel->relids) > 1 ||
+						   context->has_subplan_inline),
 						  (Index) 0, NULL, context->params_list);
 
 	/* Construct WHERE clause */
@@ -1585,6 +1873,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo * root, RelOptInfo * foreignre
 		{
 			deparse_expr_cxt context;
 
+			memset(&context, 0, sizeof(context));
 			context.buf = buf;
 			context.foreignrel = foreignrel;
 			context.scanrel = foreignrel;
@@ -1594,6 +1883,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo * root, RelOptInfo * foreignre
 			context.interval_op = false;
 			context.array_as_tuple = false;
 			context.no_sort_parens = false;
+			context.fpinfo = fpinfo;
 
 			appendStringInfoChar(buf, '(');
 			appendConditions(fpinfo->joinclauses, &context);
@@ -1919,6 +2209,9 @@ deparseExpr(Expr * node, deparse_expr_cxt * context)
 		case T_RowExpr:
 			deparseRowExpr((RowExpr *) node, context);
 			break;
+		case T_SubPlan:
+			deparseSubPlan((SubPlan *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
@@ -1941,8 +2234,43 @@ deparseVar(Var * node, deparse_expr_cxt * context)
 	int			relno;
 	int			colno;
 
-	/* Qualify columns when multiple relations are involved. */
-	bool		qualify_col = (bms_num_members(relids) > 1);
+	/*
+	 * Qualify columns when multiple relations are involved, or when a
+	 * SubPlan is inlined anywhere in the statement (unqualified outer
+	 * columns would be captured by the subquery's scope).
+	 */
+	bool		qualify_col = (bms_num_members(relids) > 1 ||
+							   context->has_subplan_inline);
+
+	/*
+	 * SubPlan scope: the Var's varno indexes the subquery's own rtable
+	 * (context->root is the SubPlan's PlannerInfo here), and the alias
+	 * namespace is q{plan_id}_{varno} — never the outer r{N}. Pass
+	 * qualify_col=false to deparseColumnRef so it cannot add an r{N}
+	 * qualifier of its own.
+	 */
+	if (context->subplan != NULL)
+	{
+		Assert(node->varlevelsup == 0);
+
+		cdef = context->func;
+		if (!cdef)
+			cdef = chfdw_check_for_custom_type(node->vartype);
+
+		ADD_SUBPLAN_REL_QUALIFIER(context->buf,
+								  context->subplan->plan_id, node->varno);
+		deparseColumnRef(context->buf, cdef,
+						 node->varno, node->varattno,
+						 planner_rt_fetch(node->varno, context->root),
+						 false);
+		return;
+	}
+
+	/*
+	 * Outer scope from here down: r{N} / s{N}.c{M} namespaces only (see the
+	 * INVARIANT comment at SUBPLAN_REL_ALIAS_PREFIX).
+	 */
+	Assert(context->subplan == NULL);
 
 	/*
 	 * If the Var belongs to the foreign relation that is deparsed as a
@@ -2228,6 +2556,7 @@ chfdw_array_to_ch_literal(Datum arr)
 
 	deparse_expr_cxt context;
 
+	memset(&context, 0, sizeof(context));
 	context.array_as_tuple = false;
 	context.buf = makeStringInfo();
 	deparseArray(arr, &context);
@@ -2396,6 +2725,34 @@ cleanup:
 static void
 deparseParam(Param * node, deparse_expr_cxt * context)
 {
+	/*
+	 * SubPlan scope: a PARAM_EXEC Param here is (usually) a correlation
+	 * reference — the planner's replacement for an outer-query Var inside
+	 * the subquery (SS_replace_correlation_vars). subplan->parParam and
+	 * subplan->args run in parallel: paramid -> the outer expression that
+	 * feeds it. Inline that expression, deparsed in the PARENT scope so it
+	 * picks up the outer query's aliases.
+	 */
+	if (context->subplan != NULL && node->paramkind == PARAM_EXEC)
+	{
+		ListCell   *pp;
+		ListCell   *ap;
+
+		Assert(context->parent_ctx != NULL);
+
+		forboth(pp, context->subplan->parParam, ap, context->subplan->args)
+		{
+			if (lfirst_int(pp) == node->paramid)
+			{
+				appendStringInfoChar(context->buf, '(');
+				deparseExpr((Expr *) lfirst(ap), context->parent_ctx);
+				appendStringInfoChar(context->buf, ')');
+				return;
+			}
+		}
+		/* Not a correlation param; fall through to normal handling. */
+	}
+
 	if (context->params_list)
 	{
 		int			pindex = 0;
@@ -2458,6 +2815,184 @@ printRemotePlaceholder(Oid paramtype, int32 paramtypmod,
 	char	   *ptypename = deparse_type_name(paramtype, paramtypmod);
 
 	appendStringInfo(buf, "((SELECT CAST(null AS Nullable(%s))", ptypename);
+}
+
+/*
+ * Deparse a SubPlan node: the planner's per-row subquery. Emits a real SQL
+ * subquery in place, in the shape appropriate to the SubLinkType. The
+ * subquery body itself is printed by deparseSubPlanQuery; shippability was
+ * established by is_shippable_subplan, so the shapes here are exhaustive.
+ */
+static void
+deparseSubPlan(SubPlan * node, deparse_expr_cxt * context)
+{
+	StringInfo	buf = context->buf;
+
+	switch (node->subLinkType)
+	{
+		case EXISTS_SUBLINK:
+			appendStringInfoString(buf, "EXISTS (");
+			deparseSubPlanQuery(node, context);
+			appendStringInfoChar(buf, ')');
+			break;
+		case EXPR_SUBLINK:
+			appendStringInfoChar(buf, '(');
+			deparseSubPlanQuery(node, context);
+			appendStringInfoChar(buf, ')');
+			break;
+		case ANY_SUBLINK:
+			{
+				/*
+				 * testexpr is OpExpr('=', lhs, Param), enforced by
+				 * is_shippable_subplan. The LHS belongs to the OUTER scope:
+				 * deparse it with the current (outer) context.
+				 */
+				OpExpr	   *op = castNode(OpExpr, node->testexpr);
+
+				appendStringInfoChar(buf, '(');
+				deparseExpr((Expr *) linitial(op->args), context);
+				appendStringInfoString(buf, " IN (");
+				deparseSubPlanQuery(node, context);
+				appendStringInfoString(buf, "))");
+			}
+			break;
+		default:
+			elog(ERROR,
+				 "pg_clickhouse: unsupported SubLink type for deparse: %d",
+				 (int) node->subLinkType);
+	}
+}
+
+/*
+ * Deparse implicitly-ANDed quals. preprocess_qual_conditions() turns the
+ * parse tree's WHERE/HAVING expressions into bare Lists of clauses, but
+ * older shapes (single expression) survive in some paths, so accept both.
+ */
+static void
+deparseSubPlanQuals(Node * quals, deparse_expr_cxt * context)
+{
+	if (IsA(quals, List))
+	{
+		ListCell   *lc;
+		bool		first = true;
+
+		foreach(lc, (List *) quals)
+		{
+			if (!first)
+				appendStringInfoString(context->buf, " AND ");
+			first = false;
+			appendStringInfoChar(context->buf, '(');
+			deparseExpr((Expr *) lfirst(lc), context);
+			appendStringInfoChar(context->buf, ')');
+		}
+	}
+	else
+		deparseExpr((Expr *) quals, context);
+}
+
+/*
+ * Print the body of a pushed-down SubPlan as a SQL subquery.
+ *
+ * We deparse from the SubPlan's *Query* tree (subroot->parse), not from its
+ * Plan: the Query preserves the declarative shape (FROM list, quals, GROUP
+ * BY) that maps 1:1 onto remote SQL. By this point the planner has already
+ * replaced outer-query references with PARAM_EXEC Params in that tree, which
+ * deparseParam resolves back to outer-alias text via parent_ctx.
+ *
+ * Scope discipline: the sub-context's root is the SubPlan's own PlannerInfo,
+ * so every varno resolves against the subquery's rtable, and every table
+ * gets a q{plan_id}_{rtindex} alias — collision-free with the outer r{N}/
+ * s{N} namespaces and with sibling SubPlans.
+ */
+static void
+deparseSubPlanQuery(SubPlan * subplan, deparse_expr_cxt * context)
+{
+	PlannerInfo *subroot;
+	Query	   *query;
+	StringInfo	buf = context->buf;
+	deparse_expr_cxt subctx;
+	ListCell   *lc;
+	bool		first;
+
+	Assert(context->root->glob != NULL);
+	subroot = (PlannerInfo *) list_nth(context->root->glob->subroots,
+									   subplan->plan_id - 1);
+	query = subroot->parse;
+
+	/* Sub-scope context: same buffer, subquery's planner state. */
+	memset(&subctx, 0, sizeof(subctx));
+	subctx.root = subroot;
+	subctx.foreignrel = context->foreignrel;
+	subctx.scanrel = context->scanrel;
+	subctx.buf = buf;
+	subctx.params_list = context->params_list;
+	subctx.fpinfo = context->fpinfo;
+	subctx.subplan = subplan;
+	subctx.parent_ctx = context;
+
+	appendStringInfoString(buf, "SELECT ");
+	if (subplan->subLinkType == EXISTS_SUBLINK)
+		appendStringInfoChar(buf, '1');
+	else
+	{
+		first = true;
+		foreach(lc, query->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (tle->resjunk)
+				continue;
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+			deparseExpr(tle->expr, &subctx);
+		}
+	}
+
+	appendStringInfoString(buf, " FROM ");
+	first = true;
+	foreach(lc, query->jointree->fromlist)
+	{
+		RangeTblRef *rtr = lfirst_node(RangeTblRef, lc);
+		RangeTblEntry *rte = rt_fetch(rtr->rtindex, query->rtable);
+		Relation	rel = table_open_compat(rte->relid, NoLock);
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+		deparseRelation(buf, rel);
+		appendStringInfo(buf, " %s%d_%d", SUBPLAN_REL_ALIAS_PREFIX,
+						 subplan->plan_id, rtr->rtindex);
+		table_close_compat(rel, NoLock);
+	}
+
+	if (query->jointree->quals != NULL)
+	{
+		appendStringInfoString(buf, " WHERE ");
+		deparseSubPlanQuals(query->jointree->quals, &subctx);
+	}
+
+	if (query->groupClause != NIL)
+	{
+		appendStringInfoString(buf, " GROUP BY ");
+		first = true;
+		foreach(lc, query->groupClause)
+		{
+			SortGroupClause *grp = lfirst_node(SortGroupClause, lc);
+			TargetEntry *tle = get_sortgroupclause_tle(grp, query->targetList);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+			deparseExpr(tle->expr, &subctx);
+		}
+	}
+
+	if (query->havingQual != NULL)
+	{
+		appendStringInfoString(buf, " HAVING ");
+		deparseSubPlanQuals(query->havingQual, &subctx);
+	}
 }
 
 /*
