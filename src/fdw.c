@@ -1813,8 +1813,8 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 			if (!semijoin_target_ok(root, joinrel, outerrel, innerrel))
 				return false;
 			break;
-		case JOIN_RIGHT_SEMI:
-		case JOIN_RIGHT_ANTI:
+		//case JOIN_RIGHT_SEMI: /* Added in Postgres 18. */
+		//case JOIN_RIGHT_ANTI: /* Added in Postgres 16. */
 		case JOIN_UNIQUE_OUTER:
 		case JOIN_UNIQUE_INNER:
 		default:
