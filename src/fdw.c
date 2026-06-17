@@ -1797,18 +1797,29 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, SEMI, and ANTI
-	 * joins. SEMI deparses to LEFT SEMI JOIN, ANTI to LEFT ANTI JOIN.
+	 * We support the most common joins, but list those we don't yet support
+	 * for clarity.
 	 */
-	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
-		jointype != JOIN_RIGHT && jointype != JOIN_FULL &&
-		jointype != JOIN_SEMI && jointype != JOIN_ANTI)
-		return false;
-
-	/* Semi/anti-join target can only reference the outer relation */
-	if ((jointype == JOIN_SEMI || jointype == JOIN_ANTI) &&
-		!semijoin_target_ok(root, joinrel, outerrel, innerrel))
-		return false;
+	switch (jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_RIGHT:
+		case JOIN_FULL:
+			break;
+		case JOIN_SEMI:			/* deparses to LEFT SEMI JOIN */
+		case JOIN_ANTI:			/* deparses to LEFT ANTI JOIN */
+			/* Semi/anti-join target can only reference the outer relation. */
+			if (!semijoin_target_ok(root, joinrel, outerrel, innerrel))
+				return false;
+			break;
+		case JOIN_RIGHT_SEMI:
+		case JOIN_RIGHT_ANTI:
+		case JOIN_UNIQUE_OUTER:
+		case JOIN_UNIQUE_INNER:
+		default:
+			return false;
+	}
 
 	/*
 	 * If either of the joining relations is marked as unsafe to pushdown, the
@@ -1824,7 +1835,7 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	}
 
 	/*
-	 * A SEMI/ANTI joinrel used as the input of a further join would deparse
+	 * A SEMI/ANTI joinrel used as the input for a further join would deparse
 	 * as an inline nested join, which ClickHouse cannot parse, and the
 	 * subquery-wrapping escape hatch requires reltarget coverage that
 	 * SEMI/ANTI inputs do not guarantee. Keep such composites local; the
@@ -1838,8 +1849,8 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 
 	/*
 	 * If joining relations have local conditions, those conditions are
-	 * required to be applied before joining the relations. Hence the join can
-	 * not be pushed down.
+	 * required to be applied before joining the relations. Hence the join
+	 * cannot be pushed down.
 	 */
 	if (fpinfo_o->local_conds || fpinfo_i->local_conds)
 	{
@@ -2052,9 +2063,9 @@ foreign_join_ok(PlannerInfo * root, RelOptInfo * joinrel, JoinType jointype,
 	}
 
 	/*
-	 * ClickHouse SEMI/ANTI JOINs require at least one equi-join key in the
-	 * ON clause. Reject when joinclauses has no simple equality referencing
-	 * both sides (e.g. uncorrelated EXISTS).
+	 * ClickHouse SEMI/ANTI JOINs require at least one equi-join key in the ON
+	 * clause. Reject when the joinclauses have no simple equality referencing
+	 * both sides (e.g., uncorrelated EXISTS).
 	 */
 	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
 	{

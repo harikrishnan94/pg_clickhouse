@@ -923,8 +923,8 @@ is_shippable_subplan(SubPlan * subplan, foreign_glob_cxt * glob_cxt)
 	}
 
 	/*
-	 * ANY: only single-column equality (deparsed as IN). testexpr compares
-	 * an outer-scope LHS against the subquery's output Param.
+	 * ANY: only single-column equality (deparsed as IN). testexpr compares an
+	 * outer-scope LHS against the subquery's output Param.
 	 */
 	if (subplan->subLinkType == ANY_SUBLINK)
 	{
@@ -969,8 +969,8 @@ is_shippable_subplan(SubPlan * subplan, foreign_glob_cxt * glob_cxt)
 		return false;
 
 	/*
-	 * Walk the subquery's own expressions in a sub-scope whose relids are
-	 * the subquery's FROM entries.
+	 * Walk the subquery's own expressions in a sub-scope whose relids are the
+	 * subquery's FROM entries.
 	 */
 	memset(&sub_cxt, 0, sizeof(sub_cxt));
 	sub_cxt.root = subroot;
@@ -1368,12 +1368,11 @@ chfdw_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo * root, RelOptInfo
 		quals = remote_conds;
 
 	/*
-	 * Detect inlined SubPlans before emitting anything: their presence
-	 * forces r{N} qualification throughout the statement (see
-	 * has_subplan_inline). Quals may carry RestrictInfo decoration, which
-	 * expression_tree_walker does not look through on all versions, so
-	 * unwrap manually. remote_conds is checked too: for upper relations it
-	 * becomes the HAVING clause.
+	 * Detect inlined SubPlans before emitting anything: their presence forces
+	 * r{N} qualification throughout the statement (see has_subplan_inline).
+	 * Quals may carry RestrictInfo decoration, which expression_tree_walker
+	 * does not look through on all versions, so unwrap manually. remote_conds
+	 * is checked too: for upper relations it becomes the HAVING clause.
 	 */
 	{
 		ListCell   *lc;
@@ -2238,9 +2237,9 @@ deparseVar(Var * node, deparse_expr_cxt * context)
 	int			colno;
 
 	/*
-	 * Qualify columns when multiple relations are involved, or when a
-	 * SubPlan is inlined anywhere in the statement (unqualified outer
-	 * columns would be captured by the subquery's scope).
+	 * Qualify columns when multiple relations are involved, or when a SubPlan
+	 * is inlined anywhere in the statement (unqualified outer columns would
+	 * be captured by the subquery's scope).
 	 */
 	bool		qualify_col = (bms_num_members(relids) > 1 ||
 							   context->has_subplan_inline);
