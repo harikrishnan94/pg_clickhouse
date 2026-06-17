@@ -79,7 +79,7 @@ ORDER BY item_id;
  Foreign Scan on subplan_test.items
    Output: items.item_id, items.price
    Remote SQL: SELECT item_id, price FROM subplan_test.items WHERE ((price > {p1:Decimal})) ORDER BY item_id ASC NULLS LAST
-   InitPlan expr_1
+   InitPlan 1
      ->  Foreign Scan
            Output: (avg(items_1.price))
            Relations: Aggregate on (items)
@@ -108,7 +108,7 @@ ORDER BY s.sale_id;
  Foreign Scan on subplan_test.sales s
    Output: s.sale_id, s.amount
    Remote SQL: SELECT sale_id, amount FROM subplan_test.sales r1 WHERE ((r1.amount > (SELECT (1.5 * avg(q1_1.amount)) FROM subplan_test.sales q1_1 WHERE ((q1_1.item_id = (r1.item_id)))))) ORDER BY r1.sale_id ASC NULLS LAST
-   SubPlan expr_1
+   SubPlan 1
      ->  Foreign Scan
            Output: ((1.5 * avg(s2.amount)))
            Relations: Aggregate on (sales s2)
@@ -198,13 +198,16 @@ EXPLAIN (VERBOSE, COSTS OFF)
 SELECT item_id FROM items
 WHERE item_id NOT IN (SELECT item_id FROM sales WHERE region = 'east')
 ORDER BY item_id;
-                                                                                           QUERY PLAN                                                                                            
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Foreign Scan
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on subplan_test.items
    Output: items.item_id
-   Relations: (items) LEFT ANTI JOIN (sales)
-   Remote SQL: SELECT r1.item_id FROM  subplan_test.items r1 LEFT ANTI JOIN subplan_test.sales r3 ON (((r1.item_id = r3.item_id)) AND ((r3.region = 'east'))) ORDER BY r1.item_id ASC NULLS LAST
-(4 rows)
+   Remote SQL: SELECT item_id FROM subplan_test.items r1 WHERE ((NOT (r1.item_id IN (SELECT q1_1.item_id FROM subplan_test.sales q1_1 WHERE ((q1_1.region = 'east')))))) ORDER BY r1.item_id ASC NULLS LAST
+   SubPlan 1
+     ->  Foreign Scan on subplan_test.sales
+           Output: sales.item_id
+           Remote SQL: SELECT item_id FROM subplan_test.sales WHERE ((region = 'east'))
+(7 rows)
 
 SELECT item_id FROM items
 WHERE item_id NOT IN (SELECT item_id FROM sales WHERE region = 'east')
@@ -229,7 +232,7 @@ ORDER BY value DESC;
    Output: items.grp, (sum((items.price * (items.qty)::numeric)))
    Relations: Aggregate on (items)
    Remote SQL: SELECT grp, sum((price * qty)) FROM subplan_test.items GROUP BY grp HAVING ((sum((price * qty)) > {p1:Decimal})) ORDER BY sum((price * qty)) DESC NULLS FIRST
-   InitPlan expr_1
+   InitPlan 1
      ->  Foreign Scan
            Output: ((sum((items_1.price * (items_1.qty)::numeric)) * 0.2))
            Relations: Aggregate on (items)
@@ -259,12 +262,12 @@ ORDER BY item_id;
  Foreign Scan on subplan_test.items
    Output: items.item_id
    Remote SQL: SELECT item_id FROM subplan_test.items WHERE ((price > {p1:Decimal})) ORDER BY item_id ASC NULLS LAST
-   InitPlan expr_1
+   InitPlan 2
      ->  Foreign Scan
            Output: (avg(items_2.price))
            Relations: Aggregate on (items)
            Remote SQL: SELECT avg(price) FROM subplan_test.items WHERE ((qty > {p1:Decimal}))
-           InitPlan expr_2
+           InitPlan 1
              ->  Foreign Scan
                    Output: (avg(items_1.qty))
                    Relations: Aggregate on (items)
@@ -295,9 +298,9 @@ ORDER BY s.sale_id;
 --------------------------------------------------------------------------------------------------
  Foreign Scan on subplan_test.sales s
    Output: s.sale_id
-   Filter: (s.amount = (SubPlan expr_1))
+   Filter: (s.amount = (SubPlan 1))
    Remote SQL: SELECT sale_id, amount FROM subplan_test.sales ORDER BY sale_id ASC NULLS LAST
-   SubPlan expr_1
+   SubPlan 1
      ->  Foreign Scan on subplan_test.sales s2
            Output: s2.amount
            Remote SQL: SELECT amount FROM subplan_test.sales WHERE ((sale_id = ({p1:Int32} + 1)))
