@@ -2875,12 +2875,7 @@ deparseSubPlan(SubPlan * node, deparse_expr_cxt * context)
 			}
 			break;
 		default:
-
-			/*
-			 * Unreachable: is_shippable_subplan only admits the three types
-			 * handled above. Kept as a hard guard in case that set widens
-			 * without this switch being updated in lockstep.
-			 */
+			/* Unreachable unless a new SubLinkType is added above. */
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("pg_clickhouse: unsupported SubLink type for deparse: %d",
