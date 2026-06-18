@@ -834,7 +834,9 @@ foreign_expr_walker(Node * node,
  *   MULTIEXPR_SUBLINK   UPDATE-only; also blocked by the PARAM_MULTIEXPR
  *                       guard in the walker.
  *   ARRAY_SUBLINK       ARRAY() construction differs on ClickHouse.
- *   CTE_SUBLINK         materialized CTEs cannot be hosted remotely.
+ *   CTE_SUBLINK         WITH-clause references; ClickHouse does support CTEs,
+ *                       so this is deparsable in principle but not yet wired
+ *                       up here. Future work.
  *
  * The subquery body itself must be a plain comma-joined SELECT over foreign
  * tables that live on the same server as the outer scan: no set ops, CTEs,
@@ -844,10 +846,16 @@ foreign_expr_walker(Node * node,
  * each correlation arg expression is itself checked for shippability in the
  * OUTER scope, since deparseParam will inline it with outer aliases.
  *
- * Single-row note: a scalar (EXPR) subquery returning zero rows yields NULL
- * in Postgres but is an error in some ClickHouse versions/contexts. We only
- * push scalar subqueries whose top level is a bare aggregate with no GROUP
- * BY, which is guaranteed to produce exactly one row on both systems.
+ * Single-row note (semantic wrinkle, deliberately fenced off): a scalar
+ * subquery is required to return at most one row. When it returns ZERO rows,
+ * Postgres substitutes NULL, but ClickHouse's scalar-subquery semantics
+ * differ (it can raise or yield an empty result rather than NULL), so a naive
+ * push would change query results. We sidestep this entirely by only pushing
+ * EXPR subqueries whose top level is a bare aggregate with no GROUP BY: such a
+ * query returns exactly one row on both systems by construction, so the
+ * zero-row divergence cannot arise. A non-aggregate or grouped scalar
+ * subquery is left for local execution (see the guard below, and the
+ * negative case in test/sql/subplan_pushdown.sql).
  */
 static bool
 is_shippable_subplan(SubPlan * subplan, foreign_glob_cxt * glob_cxt)
@@ -876,6 +884,14 @@ is_shippable_subplan(SubPlan * subplan, foreign_glob_cxt * glob_cxt)
 	query = subroot->parse;
 	fpinfo = (CHFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
 
+	/*
+	 * fdw_private and ->server are populated by clickhouseGetForeignRelSize /
+	 * foreign_join_ok for any relation we plan, so for the rels this walker
+	 * runs against they are normally set. Guard defensively anyway: we
+	 * dereference fpinfo->server->serverid below to require the subquery's
+	 * tables live on the same server, and a NULL here simply means "can't
+	 * prove same-server" -> refuse the pushdown rather than risk a crash.
+	 */
 	if (fpinfo == NULL || fpinfo->server == NULL)
 		return false;
 
@@ -2859,9 +2875,16 @@ deparseSubPlan(SubPlan * node, deparse_expr_cxt * context)
 			}
 			break;
 		default:
-			elog(ERROR,
-				 "pg_clickhouse: unsupported SubLink type for deparse: %d",
-				 (int) node->subLinkType);
+
+			/*
+			 * Unreachable: is_shippable_subplan only admits the three types
+			 * handled above. Kept as a hard guard in case that set widens
+			 * without this switch being updated in lockstep.
+			 */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_clickhouse: unsupported SubLink type for deparse: %d",
+							(int) node->subLinkType)));
 	}
 }
 
