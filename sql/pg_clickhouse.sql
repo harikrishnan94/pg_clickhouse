@@ -209,3 +209,12 @@ LANGUAGE C STRICT;
 CREATE FUNCTION toUInt128("any") RETURNS BIGINT
 AS 'MODULE_PATHNAME', 'clickhouse_push_fail'
 LANGUAGE C STRICT;
+
+-- Stream a heap relation's snapshot-visible rows into a co-located ClickHouse
+-- over POSIX shared memory. A co-located ClickHouse reads them with
+-- streamed_table('<shm_name>', '<schema>'). Superuser-only: it creates SHM
+-- objects and a Unix socket and reads the named relation directly.
+CREATE FUNCTION clickhouse_stream_relation(regclass, text, integer DEFAULT 65536) RETURNS bigint
+AS 'MODULE_PATHNAME', 'clickhouse_stream_relation'
+LANGUAGE C;
+REVOKE ALL ON FUNCTION clickhouse_stream_relation(regclass, text, integer) FROM PUBLIC;

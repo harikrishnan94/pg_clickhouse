@@ -16,6 +16,7 @@
 
 #include "fdw.h"
 #include "kv_list.h"
+#include "shm_offload.h"
 
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_server.h"
@@ -714,6 +715,9 @@ _PG_init(void) {
         NULL,
         NULL
     );
+
+    /* Register the SHM heap-offload GUCs (pg_clickhouse.enable_shm_offload etc.). */
+    pgch_shm_offload_init();
 
 #if PG_VERSION_NUM >= 150000
     MarkGUCPrefixReserved("pg_clickhouse");

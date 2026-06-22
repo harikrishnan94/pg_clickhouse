@@ -31,9 +31,10 @@ PG_CPPFLAGS = -I./src/include -I$(CH_C_DIR)
 # (for the binary driver's compressed-frame codecs).
 PG_LDFLAGS = -lssl -lcrypto -llz4 -lzstd $(shell $(CURL_CONFIG) --libs)
 
-# libuuid is provided by the OS on darwin; explicit link elsewhere.
+# libuuid is provided by the OS on darwin; explicit link elsewhere. librt
+# provides shm_open/shm_unlink for the SHM producer (shm_producer.c) on Linux.
 ifneq ($(OS),darwin)
-	PG_LDFLAGS += -luuid
+	PG_LDFLAGS += -luuid -lrt
 endif
 
 # Suppress annoying pre-c99 warning, error on other warnings, include curl.
