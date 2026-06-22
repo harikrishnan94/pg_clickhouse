@@ -1,23 +1,43 @@
+-- TPC-H SF=10 PostgreSQL side: native heap tables (schema `pg`), the FDW import
+-- of the ClickHouse tables (schema `ch`), and the Float64 lineitem variant.
+--
+-- Connection is templated by the Makefile, which passes the dedicated
+-- ClickHouse server's manifest ports:
+--   psql -v ch_host=127.0.0.1 -v ch_http_port=<manifest CH_HTTP_PORT> ...
+--
+-- Standardized server: `ch_bench`, driver 'http' (one server used for BOTH FDW
+-- pushdown and SHM offload). Re-runnable: only objects this script owns are
+-- dropped; tpch-ch.sql must have loaded the ClickHouse side (incl. lineitem_f64)
+-- first so the IMPORT picks it up as ch.lineitem_f64.
+
 SET client_min_messages = notice;
-BEGIN;
 
 \set ch_user default
 \getenv ch_user CLICKHOUSE_USER
-\set ch_pass
+\set ch_pass ''
 \getenv ch_pass CLICKHOUSE_PASSWORD
-\set ch_host localhost
-\getenv ch_host CLICKHOUSE_HOST
 
-CREATE EXTENSION pg_clickhouse;
-CREATE SERVER ch_tpch_svr FOREIGN DATA WRAPPER clickhouse_fdw
-    OPTIONS(dbname 'tpch', driver 'binary', host :'ch_host');
-CREATE USER MAPPING FOR CURRENT_USER SERVER ch_tpch_svr OPTIONS (user :'ch_user', password :'ch_pass');
+-- Install the planner/executor hooks for every session on this database (the
+-- supported way to enable SHM offload); per-database, never global.
+ALTER DATABASE tpch_sf10 SET session_preload_libraries = 'pg_clickhouse';
 
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS pg_clickhouse;
+
+DROP SERVER IF EXISTS ch_bench CASCADE;
+CREATE SERVER ch_bench FOREIGN DATA WRAPPER clickhouse_fdw
+    OPTIONS (driver 'http', host :'ch_host', port :'ch_http_port', dbname 'tpch_sf10');
+CREATE USER MAPPING FOR CURRENT_USER SERVER ch_bench OPTIONS (user :'ch_user', password :'ch_pass');
+
+DROP SCHEMA IF EXISTS ch CASCADE;
 CREATE SCHEMA ch;
-IMPORT FOREIGN SCHEMA tpch FROM SERVER ch_tpch_svr INTO ch;
+IMPORT FOREIGN SCHEMA tpch_sf10 FROM SERVER ch_bench INTO ch;
 
-CREATE SCHEMA pg;
+CREATE SCHEMA IF NOT EXISTS pg;
 SET search_path = pg;
+
+DROP TABLE IF EXISTS REGION, NATION, PART, SUPPLIER, PARTSUPP, CUSTOMER, ORDERS, LINEITEM, LINEITEM_F64 CASCADE;
 
 CREATE TABLE REGION
 (
@@ -102,7 +122,6 @@ CREATE TABLE ORDERS
 );
 CREATE INDEX ON ORDERS (O_ORDERDATE);
 
--- DROP TABLE LINEITEM;
 CREATE TABLE LINEITEM
 (
     L_ORDERKEY      INTEGER        NOT NULL,
@@ -121,42 +140,39 @@ CREATE TABLE LINEITEM
     L_SHIPINSTRUCT  CHAR(25)       NOT NULL,
     L_SHIPMODE      CHAR(10)       NOT NULL,
     L_COMMENT       VARCHAR(44)    NOT NULL
-    -- PRIMARY KEY (L_ORDERKEY, L_LINENUMBER),
-    -- FOREIGN KEY (L_ORDERKEY) REFERENCES ORDERS (O_ORDERKEY)
-    -- FOREIGN KEY (L_PARTKEY, L_SUPPKEY) REFERENCES PARTSUPP (PS_PARTKEY, PS_SUPPKEY)
+);
+
+-- Float64 lineitem variant: only the numeric columns become double precision;
+-- integer keys stay INTEGER. Populated from LINEITEM below.
+CREATE TABLE LINEITEM_F64 (
+    l_orderkey INTEGER NOT NULL, l_partkey INTEGER NOT NULL,
+    l_suppkey INTEGER NOT NULL, l_linenumber INTEGER NOT NULL,
+    l_quantity DOUBLE PRECISION NOT NULL, l_extendedprice DOUBLE PRECISION NOT NULL,
+    l_discount DOUBLE PRECISION NOT NULL, l_tax DOUBLE PRECISION NOT NULL,
+    l_returnflag CHAR(1) NOT NULL, l_linestatus CHAR(1) NOT NULL,
+    l_shipdate DATE NOT NULL, l_commitdate DATE NOT NULL, l_receiptdate DATE NOT NULL,
+    l_shipinstruct CHAR(25) NOT NULL, l_shipmode CHAR(10) NOT NULL,
+    l_comment VARCHAR(44) NOT NULL
 );
 
 \set ECHO queries
--- Scaling factor 1
-COPY region   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/region.tbl'   DELIMITER '|';
-COPY nation   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/nation.tbl'   DELIMITER '|';
-COPY part     FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/part.tbl'     DELIMITER '|';
-COPY supplier FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/supplier.tbl' DELIMITER '|';
-COPY partsupp FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/partsupp.tbl' DELIMITER '|';
-COPY customer FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/customer.tbl' DELIMITER '|';
-COPY orders   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/orders.tbl'   DELIMITER '|';
-COPY lineitem FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/1/lineitem.tbl' DELIMITER '|';
+-- Scaling factor 10 (zstd-compressed; the postgres OS user needs curl + zstd on PATH).
+COPY region   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/region.tbl.zst   | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY nation   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/nation.tbl.zst   | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY part     FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/part.tbl.zst     | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY supplier FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/supplier.tbl.zst | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY partsupp FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/partsupp.tbl.zst | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY customer FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/customer.tbl.zst | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY orders   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/orders.tbl.zst   | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
+COPY lineitem FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/10/lineitem.tbl.zst | zstd -dc' WITH (FORMAT csv, DELIMITER '|');
 
-/*
-
--- Scaling factor 100
-COPY region   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/region.tbl'   DELIMITER '|';
-COPY nation   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/nation.tbl'   DELIMITER '|';
-COPY part     FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/part.tbl'     DELIMITER '|';
-COPY supplier FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/supplier.tbl' DELIMITER '|';
-COPY partsupp FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/partsupp.tbl' DELIMITER '|';
-COPY customer FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/customer.tbl' DELIMITER '|';
-COPY orders   FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/orders.tbl'   DELIMITER '|';
-COPY lineitem FROM PROGRAM 'curl -sSL https://clickhouse-datasets.s3.amazonaws.com/h/100/lineitem.tbl' DELIMITER '|';
-
-*/
+-- Float64 lineitem variant: numeric -> float8 assignment cast.
+INSERT INTO lineitem_f64 SELECT * FROM lineitem;
 
 CREATE INDEX ON LINEITEM (L_PARTKEY, L_SUPPKEY);
 CREATE INDEX ON LINEITEM (L_ORDERKEY);
 CREATE INDEX ON LINEITEM (L_SHIPDATE);
-ALTER TABLE LINEITEM ADD PRIMARY KEY (L_ORDERKEY,L_LINENUMBER);
--- ALTER TABLE LINEITEM ADD FOREIGN KEY (L_PARTKEY, L_SUPPKEY) REFERENCES PARTSUPP (PS_PARTKEY, PS_SUPPKEY);
--- ALTER TABLE LINEITEM ADD FOREIGN KEY (L_ORDERKEY) REFERENCES ORDERS (O_ORDERKEY);
+ALTER TABLE LINEITEM ADD PRIMARY KEY (L_ORDERKEY, L_LINENUMBER);
 ANALYZE;
 
 COMMIT;

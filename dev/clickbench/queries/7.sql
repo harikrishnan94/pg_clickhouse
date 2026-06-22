@@ -1,0 +1,2 @@
+EXPLAIN (ANALYZE, COSTS)
+SELECT MIN(EventDate), MAX(EventDate) FROM hits;
