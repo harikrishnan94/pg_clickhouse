@@ -232,6 +232,18 @@ typedef struct CHFdwRelationInfo {
      * escaped.
      */
     char ch_table_sign_field[CH_ESCAPED_NAMEDATALEN];
+
+    /*
+     * SHM heap-offload (shm_offload.c). When is_heap_offload is true this rel is
+     * a regular heap relation whose rows are streamed into a co-located
+     * ClickHouse via shared memory; the deparser emits its FROM clause as
+     * streamed_table(shm_name, shm_schema_string) instead of a catalog name.
+     */
+    bool is_heap_offload;
+    Oid heap_relid;            /* the heap relation OID to scan */
+    char *shm_name;            /* POSIX SHM object name (with leading '/') */
+    char *shm_schema_string;   /* ClickHouse columns string for streamed_table */
+    List *shm_attnos;          /* projected heap attnos (Integer list, ascending) */
 } CHFdwRelationInfo;
 
 /* in fdw.c */

@@ -1674,6 +1674,19 @@ deparseFromExprForRel(
         } else {
             appendStringInfoString(buf, "(TRUE)");
         }
+    } else if (fpinfo->is_heap_offload) {
+        /*
+         * SHM heap-offload: the source is a co-located ClickHouse fed from this
+         * relation's snapshot-visible rows over shared memory. Emit the
+         * streamed_table() table function instead of a catalog relation name.
+         * Column references stay unqualified (single relation), matching the
+         * streamed_table schema column names (the heap attnames).
+         */
+        appendStringInfo(buf, "streamed_table(%s, %s)",
+                         ch_quote_literal(fpinfo->shm_name),
+                         ch_quote_literal(fpinfo->shm_schema_string));
+        if (use_alias)
+            appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, foreignrel->relid);
     } else {
         RangeTblEntry* rte = planner_rt_fetch(foreignrel->relid, root);
 

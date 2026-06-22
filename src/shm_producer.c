@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -124,6 +125,18 @@ struct ShmProducer {
 
     int         parked_conns[MAX_PARKED_CONNS];
     int         n_parked;
+
+    /*
+     * Socket-pump thread. A single PostgreSQL backend cannot both block
+     * publishing into the ring and block on the ClickHouse query result, so a
+     * dedicated thread accepts the consumer's control-socket connection and
+     * hands over the readiness eventfd via SCM_RIGHTS. The thread touches ONLY
+     * raw fds (no PostgreSQL API / palloc / ereport), mirroring the ClickHouse
+     * reference producer's accept loop.
+     */
+    pthread_t   pump_thread;
+    bool        pump_running;
+    volatile sig_atomic_t pump_stop;
 
     MemoryContext owner_cxt;
     MemoryContextCallback cleanup_cb;
@@ -247,7 +260,8 @@ send_eventfd(int conn_fd, int eventfd_to_pass)
     (void) sendmsg(conn_fd, &msg, MSG_NOSIGNAL);
 }
 
-/* Accept any pending consumer connections and hand each the readiness eventfd. */
+/* Accept any pending consumer connections and hand each the readiness eventfd.
+ * Runs only on the pump thread, which solely owns parked_conns. */
 static void
 pump_control_socket(ShmProducer *p)
 {
@@ -269,6 +283,33 @@ pump_control_socket(ShmProducer *p)
     }
 }
 
+/* Pump thread: accept consumer connections and serve the readiness eventfd until
+ * asked to stop. Pure syscalls only — never touches PostgreSQL state. */
+static void *
+pump_thread_main(void *arg)
+{
+    ShmProducer *p = (ShmProducer *) arg;
+    int i;
+
+    while (!p->pump_stop)
+    {
+        struct pollfd pfd;
+
+        pfd.fd = p->listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN))
+            pump_control_socket(p);
+        else
+            prune_parked_conns(p);
+    }
+
+    for (i = 0; i < p->n_parked; i++)
+        close(p->parked_conns[i]);
+    p->n_parked = 0;
+    return NULL;
+}
+
 /* --------------------------------------------------------------------- */
 /* Lifecycle */
 /* --------------------------------------------------------------------- */
@@ -281,6 +322,14 @@ producer_cleanup(ShmProducer *p)
     if (p->cleaned)
         return;
     p->cleaned = true;
+
+    /* Stop the pump thread before touching its fds; it closes parked conns. */
+    if (p->pump_running)
+    {
+        p->pump_stop = 1;
+        pthread_join(p->pump_thread, NULL);
+        p->pump_running = false;
+    }
 
     for (i = 0; i < p->n_parked; i++)
         close(p->parked_conns[i]);
@@ -443,6 +492,12 @@ shm_producer_create(const char *name,
     if (listen(p->listen_fd, 16) < 0)
         ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: listen() failed: %m")));
 
+    /* Start the socket-pump thread (serves the readiness eventfd to consumers). */
+    p->pump_stop = 0;
+    if (pthread_create(&p->pump_thread, NULL, pump_thread_main, p) != 0)
+        ereport(ERROR, (errmsg("pg_clickhouse: could not start SHM control-socket pump thread")));
+    p->pump_running = true;
+
     MemoryContextSwitchTo(old);
     return p;
 }
@@ -487,8 +542,9 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
      * the control socket while waiting so the consumer can attach and drain. */
     while (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != SHM_STATE_EMPTY)
     {
+        /* The pump thread services the control socket; just wait for the
+         * consumer to free a slot (honouring query cancel). */
         CHECK_FOR_INTERRUPTS();
-        pump_control_socket(p);
         pg_usleep(1000L);       /* 1 ms */
     }
 
@@ -581,7 +637,6 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ssize_t w = write(p->event_fd, &one, sizeof(one));
         (void) w;   /* EAGAIN on a full counter is harmless: consumer still polls */
     }
-    pump_control_socket(p);
 
     p->next_slot++;
     return;
@@ -628,7 +683,7 @@ shm_producer_destroy(ShmProducer *p)
         bool all_empty = true;
         uint32_t i;
 
-        pump_control_socket(p);
+        /* The pump thread keeps serving the control socket; just observe drain. */
         for (i = 0; i < p->ring_depth_k; i++)
         {
             if (__atomic_load_n(&slot_at(p, i)->state, __ATOMIC_ACQUIRE) != SHM_STATE_EMPTY)

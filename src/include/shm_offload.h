@@ -23,6 +23,13 @@
  * _PG_init (option.c) before MarkGUCPrefixReserved. */
 extern void pgch_shm_offload_init(void);
 
+/* Installs the planner/executor hooks + CustomScan methods + the
+ * last_query_used_clickhouse observability GUC. Called from pgch_shm_offload_init. */
+extern void pgch_register_customscan_and_hooks(void);
+
+/* Set true by the CustomScan executor when a scan actually offloads to ClickHouse. */
+extern bool pgch_this_query_used_ch;
+
 /* GUCs (defined in shm_offload.c, registered by pgch_shm_offload_init). */
 extern bool  pgch_enable_shm_offload;
 extern char *pgch_local_ch_server;

@@ -423,6 +423,10 @@ pgch_shm_offload_init(void)
                             NULL, &pgch_shm_min_rows, 100000, 0, INT_MAX,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
+    /* Planner/executor hooks, CustomScan methods, and the
+     * last_query_used_clickhouse observability GUC. */
+    pgch_register_customscan_and_hooks();
+
     /* MarkGUCPrefixReserved("pg_clickhouse") is called by the extension's
      * _PG_init in option.c after this function returns. */
 }
