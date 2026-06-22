@@ -148,6 +148,19 @@ INSERT INTO lineitem VALUES
   (4,  2.00,   2618.76, 0.06, 0.01, 'R', 'F', DATE '1994-12-12'),
   (5, 350.00, 88941.79, 0.05, 0.04, 'A', 'F', DATE '1994-07-15'),
   (5, 320.00, 71531.20, 0.07, 0.08, 'R', 'F', DATE '1994-06-30');
+
+-- Large table: far more rows than the SHM ring can hold at once, so it can only
+-- offload by streaming through the bounded ring (the old whole-relation
+-- pre-buffer would have errored on the size guard). Adopts many blocks.
+DROP TABLE IF EXISTS big;
+CREATE TABLE big (id bigint NOT NULL, v bigint NOT NULL, p numeric(15,2) NOT NULL);
+INSERT INTO big SELECT g, g * 2, (g::numeric / 100) FROM generate_series(1, 1000000) g;
+
+-- A numeric column holding NaN: the offloaded query must fail closed (the worker
+-- raises rather than silently corrupting), and leave no leaked SHM object/socket.
+DROP TABLE IF EXISTS nantbl;
+CREATE TABLE nantbl (id bigint NOT NULL, amt numeric(10,2) NOT NULL);
+INSERT INTO nantbl VALUES (1, 5.00), (2, 'NaN'), (3, 7.50);
 SQL
 [ $? -eq 0 ] || { say "PG fixture setup failed"; exit 1; }
 
@@ -157,7 +170,7 @@ SQL
 # to this database (the supported way to enable the hooks).
 "${PSQL[@]}" -c "ALTER DATABASE \"$PG_DB\" SET session_preload_libraries = 'pg_clickhouse';" >/dev/null
 
-ROWS_T=5; ROWS_W=5; ROWS_M=5; ROWS_L=8
+ROWS_T=5; ROWS_W=5; ROWS_M=5; ROWS_L=8; ROWS_BIG=1000000
 SET_OFF="SET pg_clickhouse.enable_shm_offload=off;"
 # LOAD is belt-and-braces in case session_preload_libraries has not taken effect.
 SET_ON="LOAD 'pg_clickhouse'; SET pg_clickhouse.local_ch_server='local_ch'; SET pg_clickhouse.shm_min_rows=0; SET pg_clickhouse.session_settings='allow_experimental_streamed_table_function 1'; SET pg_clickhouse.enable_shm_offload=on;"
@@ -227,6 +240,58 @@ verify_declined() {
         && ok "$name: planner declined (no streamed_table query)" || bad "$name: unexpected offload ($before -> $after)"
 }
 
+# verify_big <name> <want_rows> <min_blocks> <extra_set> <sql>: like verify_offload, but
+# also asserts the stream adopted MANY blocks (scaling with row count, not 1). The caller
+# passes a small shm_data_region_mb in <extra_set> so the ring is far smaller than the table,
+# proving the relation streams through a bounded ring rather than being pre-buffered whole.
+verify_big() {
+    local name="$1" want_rows="$2" min_blocks="$3" extra_set="$4" sql="$5"
+    local baseline result before after read_rows shm_blocks chsql
+
+    baseline=$("${PSQL[@]}" -c "$SET_OFF $sql" 2>/dev/null)
+    chq "SYSTEM FLUSH LOGS" >/dev/null
+    before=$(ch_count_streamed)
+    result=$("${PSQL[@]}" -c "$SET_ON $extra_set $sql" 2>/dev/null)
+    chq "SYSTEM FLUSH LOGS" >/dev/null
+    after=$(ch_count_streamed)
+    read_rows=$(ch_latest "read_rows")
+    shm_blocks=$(ch_latest "ProfileEvents['ShmAdoptedBlocks']")
+    chsql=$(ch_latest "replaceRegexpAll(query,'\\\\s+',' ')")
+
+    say ""
+    say "[$name] (bounded-ring streaming of a large relation)"
+    say "    pg(off): $(echo "$baseline" | tr '\n' '|')   pg(on): $(echo "$result" | tr '\n' '|')"
+    say "    CH executed : $chsql"
+    say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
+
+    [ "$result" = "$baseline" ] && ok "$name: offload result == baseline" || bad "$name: result mismatch"
+    { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
+        && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query"
+    [ "${shm_blocks:-0}" -ge "$min_blocks" ] 2>/dev/null \
+        && ok "$name: adopted many SHM blocks (ShmAdoptedBlocks=$shm_blocks >= $min_blocks)" \
+        || bad "$name: ShmAdoptedBlocks=$shm_blocks < $min_blocks (not streaming through the ring?)"
+    [ "${read_rows:-0}" = "$want_rows" ] 2>/dev/null \
+        && ok "$name: CH read_rows == $want_rows (whole relation streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
+}
+
+# verify_error_closed <name> <sql>: an offloaded query over an out-of-domain value must FAIL
+# (the worker raises) rather than silently corrupt, and must leave no leaked SHM object/socket.
+verify_error_closed() {
+    local name="$1" sql="$2"
+    local before_shm after_shm
+    before_shm=$(ls /dev/shm/ 2>/dev/null | grep -c '^pgch_' || true)
+    if "${PSQL[@]}" -c "$SET_ON $sql" >/dev/null 2>&1; then
+        bad "$name: offloaded query unexpectedly succeeded on an out-of-domain value"
+    else
+        ok "$name: offloaded query failed closed on an out-of-domain value"
+    fi
+    sleep 1
+    after_shm=$(ls /dev/shm/ 2>/dev/null | grep -c '^pgch_' || true)
+    [ "${after_shm:-0}" -le "${before_shm:-0}" ] \
+        && ok "$name: no leaked /dev/shm object after the failed offload" \
+        || bad "$name: leaked /dev/shm object after the failed offload ($before_shm -> $after_shm)"
+}
+
 say ""
 say "================ SHM offload verification matrix ================"
 
@@ -261,9 +326,32 @@ verify_offload tpch_q18_inner  $ROWS_L \
 verify_offload tpch_q1         $ROWS_L \
   "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, sum(l_extendedprice) AS sum_base_price, sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, avg(l_quantity) AS avg_qty, avg(l_extendedprice) AS avg_price, avg(l_discount) AS avg_disc, count(*) AS count_order FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;"
 
+# large-data streaming through a bounded ring (Task 2): the relation is far larger
+# than the configured SHM region, so it can only offload by streaming many blocks.
+verify_big big_stream  $ROWS_BIG 10 "SET pg_clickhouse.shm_data_region_mb=8;" \
+  "SELECT count(*), sum(id), sum(v) FROM big;"
+verify_big big_decimal $ROWS_BIG 10 "SET pg_clickhouse.shm_data_region_mb=4;" \
+  "SELECT sum(p) FROM big;"
+
+# fail-closed: an out-of-domain numeric (NaN) makes the streaming worker raise; the
+# offloaded query must error rather than silently corrupt, leaving no leaked SHM object.
+verify_error_closed nan_fail_closed "SELECT sum(amt) FROM nantbl;"
+
 # negative controls
 verify_not_offloaded disabled    "SELECT count(*), sum(id) FROM t WHERE id >= 2;"   # feature off
 verify_declined      bare_count  "SELECT count(*) FROM t;"   # no column referenced => nothing to stream
+
+# After the whole matrix (incl. repeated large-data runs), nothing must leak: no
+# /dev/shm pgch object, no control socket, no leftover streaming worker.
+say ""
+say "[teardown] (no leaked resources after the full matrix)"
+chq "SYSTEM FLUSH LOGS" >/dev/null
+shm_left=$(ls /dev/shm/ 2>/dev/null | grep -c '^pgch_' || true)
+sock_left=$(ls /tmp/clickhouse_shm_pgch_*.sock 2>/dev/null | wc -l)
+bgw_left=$("${PSQL[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_clickhouse shm stream';" 2>/dev/null)
+[ "${shm_left:-0}" = 0 ] && ok "teardown: no leaked /dev/shm pgch objects" || bad "teardown: $shm_left leaked /dev/shm objects"
+[ "${sock_left:-0}" = 0 ] && ok "teardown: no leaked control sockets" || bad "teardown: $sock_left leaked control sockets"
+[ "${bgw_left:-0}" = 0 ] && ok "teardown: no leaked streaming background workers" || bad "teardown: $bgw_left leaked workers"
 
 say ""
 say "================================================================"

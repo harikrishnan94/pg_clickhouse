@@ -60,6 +60,7 @@
 #include "fdw.h"
 #include "shm_offload.h"
 #include "shm_producer.h"
+#include "shm_worker.h"
 
 /* fdw_private / custom_private indexes for the CustomScan. */
 enum ShmScanPrivate {
@@ -90,13 +91,9 @@ typedef struct ShmScanState {
     int             fetch_size;
     char           *shm_name;
     char           *schema_string;
-    List           *attnos;
+    List           *attnos;         /* projected heap attnos, handed to the worker */
     Oid             heap_relid;
-    Relation        heap_rel;
-    bool            opened_rel;     /* true if we table_open'd heap_rel ourselves */
-    ShmOffloadColumn *cols;
-    int             ncols;
-    ShmProducer    *producer;
+    ShmWorkerHandle *worker;        /* background worker streaming the heap into SHM */
     ch_connection   conn;
     ch_cursor      *cursor;
     bool            is_streaming;
@@ -504,69 +501,14 @@ static void
 shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
     ShmScanState *sss = (ShmScanState *) node;
-    Relation rel;
     ForeignServer *server;
     UserMapping *user;
-    ShmColumnSchema *producer_schema;
-    TupleDesc heap_tupdesc;
-    ListCell *lc;
-    int i;
 
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
 
     /* Observability: this query is offloading to ClickHouse. */
     pgch_this_query_used_ch = true;
-
-    /* Base scan (scanrelid>0) reuses the executor's relation; the grouped scan
-     * (scanrelid==0) has no ss_currentRelation, so open the heap rel ourselves. */
-    if (node->ss.ss_currentRelation != NULL)
-    {
-        rel = node->ss.ss_currentRelation;
-        sss->opened_rel = false;
-    }
-    else
-    {
-        rel = table_open(sss->heap_relid, AccessShareLock);
-        sss->opened_rel = true;
-    }
-    sss->heap_rel = rel;
-    heap_tupdesc = RelationGetDescr(rel);
-
-    /* Build the projected ShmOffloadColumn[] from the stored attnos. */
-    sss->ncols = list_length(sss->attnos);
-    sss->cols = palloc0(sizeof(ShmOffloadColumn) * sss->ncols);
-    producer_schema = palloc0(sizeof(ShmColumnSchema) * sss->ncols);
-    i = 0;
-    foreach (lc, sss->attnos)
-    {
-        AttrNumber attno = (AttrNumber) lfirst_int(lc);
-        Form_pg_attribute att = TupleDescAttr(heap_tupdesc, attno - 1);
-
-        if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &sss->cols[i]))
-            ereport(ERROR, (errmsg("pg_clickhouse: column '%s' became unsupported for SHM offload",
-                                   NameStr(att->attname))));
-        sss->cols[i].attno = attno;
-        strlcpy(sss->cols[i].name, NameStr(att->attname), sizeof(sss->cols[i].name));
-        strlcpy(producer_schema[i].name, NameStr(att->attname), sizeof(producer_schema[i].name));
-        strlcpy(producer_schema[i].type_string, sss->cols[i].ch_type, sizeof(producer_schema[i].type_string));
-        producer_schema[i].wire = sss->cols[i].wire;
-        i++;
-    }
-
-    /* Size guard: the whole relation must fit in the SHM data region (pre-buffer). */
-    {
-        size_t region = (size_t) pgch_shm_data_region_mb * 1024 * 1024;
-        size_t est = (size_t) RelationGetNumberOfBlocks(rel) * BLCKSZ;
-
-        if (est > region)
-            ereport(ERROR,
-                    (errmsg("pg_clickhouse: relation \"%s\" (~%zu bytes) exceeds "
-                            "pg_clickhouse.shm_data_region_mb (%d MiB) for SHM offload",
-                            RelationGetRelationName(rel), est, pgch_shm_data_region_mb),
-                     errhint("Raise pg_clickhouse.shm_data_region_mb, or disable "
-                             "pg_clickhouse.enable_shm_offload for this query.")));
-    }
 
     server = GetForeignServerByName(pgch_local_ch_server, false);
     user = GetUserMapping(GetUserId(), server->serverid);
@@ -581,10 +523,11 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
     sss->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
                                           "pg_clickhouse shm scan tmp", ALLOCSET_SMALL_SIZES);
 
-    sss->producer = shm_producer_create(sss->shm_name, producer_schema, sss->ncols,
-                                        (uint32_t) pgch_shm_ring_depth_k,
-                                        (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                        estate->es_query_cxt);
+    /* The heap scan + columnize + ring publish runs in a background worker
+     * (launched on the first ExecCustomScan call, once the query snapshot is
+     * available), so the backend can drain the ClickHouse result concurrently
+     * and peak shared memory stays bounded by the ring regardless of table size. */
+    sss->worker = NULL;
     sss->dispatched = false;
 }
 
@@ -630,25 +573,32 @@ shm_fetch_into_slot(ShmScanState *sss, TupleTableSlot *slot)
 }
 
 /* ExecScan access method: produce the next raw scan tuple. On the first call it
- * streams the whole relation into SHM and dispatches the ClickHouse query. */
+ * launches the streaming background worker and dispatches the ClickHouse query;
+ * the worker fills the bounded ring while ClickHouse drains it concurrently. */
 static TupleTableSlot *
 shm_scan_access_mtd(ScanState *ss)
 {
     ShmScanState *sss = (ShmScanState *) ss;   /* ss is at offset 0 of CustomScanState */
     TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+    bool got;
 
     if (!sss->dispatched)
     {
         EState *estate = ss->ps.state;
         MemoryContext old;
 
-        /* 1. Stream the whole relation into SHM (pre-buffer) + EOS, under the
-         *    executor snapshot for correct MVCC visibility. */
-        pgch_stream_relation_to_shm(sss->heap_rel, estate->es_snapshot,
-                                    sss->cols, sss->ncols, sss->producer, 65536);
+        /* 1. Launch the worker to stream the relation into the bounded ring under
+         *    the query snapshot, and wait for it to create the SHM producer +
+         *    control socket so the ClickHouse consumer can attach. */
+        sss->worker = pgch_shm_worker_launch(sss->shm_name, sss->heap_relid, sss->attnos,
+                                             estate->es_snapshot,
+                                             pgch_shm_ring_depth_k,
+                                             (size_t) pgch_shm_data_region_mb * 1024 * 1024,
+                                             65536);
+        pgch_shm_worker_wait_ready(sss->worker);
 
-        /* 2. Dispatch the ClickHouse query; CH attaches to the (now fully
-         *    populated) SHM stream, consumes it, and returns the result. */
+        /* 2. Dispatch the ClickHouse query; it attaches to the SHM stream and
+         *    drains it concurrently with the worker filling the ring. */
         old = MemoryContextSwitchTo(sss->batch_cxt);
         {
             ch_query query = new_query(sss->sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);
@@ -663,7 +613,21 @@ shm_scan_access_mtd(ScanState *ss)
         sss->dispatched = true;
     }
 
-    if (!shm_fetch_into_slot(sss, slot))
+    /* If ClickHouse errors because the worker died mid-stream, surface the
+     * worker's real error (e.g. an out-of-domain numeric) rather than an opaque
+     * producer-death error. */
+    PG_TRY();
+    {
+        got = shm_fetch_into_slot(sss, slot);
+    }
+    PG_CATCH();
+    {
+        pgch_shm_worker_check_error(sss->worker);   /* raises the worker error, if any */
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (!got)
         return ExecClearTuple(slot);
     return slot;
 }
@@ -694,16 +658,14 @@ shm_end_custom_scan(CustomScanState *node)
         MemoryContextDelete(sss->cursor->memcxt);
         sss->cursor = NULL;
     }
-    if (sss->producer)
+    /* Stop the streaming worker (SIGTERM + wait) and detach the DSM segment. On a
+     * normal finish the worker has already exited and this just reaps it; on
+     * cancel/error it tears the worker down so no worker, fd, /dev/shm object, or
+     * control socket outlives the query. */
+    if (sss->worker)
     {
-        shm_producer_destroy(sss->producer);
-        sss->producer = NULL;
-    }
-    if (sss->opened_rel && sss->heap_rel)
-    {
-        table_close(sss->heap_rel, AccessShareLock);
-        sss->heap_rel = NULL;
-        sss->opened_rel = false;
+        pgch_shm_worker_shutdown(sss->worker);
+        sss->worker = NULL;
     }
 }
 
@@ -718,10 +680,10 @@ shm_rescan_custom_scan(CustomScanState *node)
         MemoryContextDelete(sss->cursor->memcxt);
         sss->cursor = NULL;
     }
-    if (sss->producer)
+    if (sss->worker)
     {
-        shm_producer_destroy(sss->producer);
-        sss->producer = NULL;
+        pgch_shm_worker_shutdown(sss->worker);
+        sss->worker = NULL;
     }
     ereport(ERROR, (errmsg("pg_clickhouse: rescan of a SHM-offload scan is not supported in phase 1")));
 }
