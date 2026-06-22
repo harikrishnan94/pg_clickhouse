@@ -311,8 +311,7 @@ foreign_join_ok(
     RelOptInfo* innerrel,
     JoinPathExtraData* extra
 );
-static bool
-foreign_grouping_ok(PlannerInfo* root, RelOptInfo* grouped_rel, Node* havingQual);
+/* foreign_grouping_ok is declared extern in fdw.h (reused by shm_customscan.c). */
 static List*
 get_useful_pathkeys_for_relation(PlannerInfo* root, RelOptInfo* rel);
 static void
@@ -2399,7 +2398,7 @@ clickhouseGetForeignJoinPaths(
  * down to the foreign server. As a side effect, save information we obtain in
  * this function to CHFdwRelationInfo of the input relation.
  */
-static bool
+bool
 foreign_grouping_ok(PlannerInfo* root, RelOptInfo* grouped_rel, Node* havingQual) {
     Query* query                = root->parse;
     CHFdwRelationInfo* fpinfo   = (CHFdwRelationInfo*)grouped_rel->fdw_private;

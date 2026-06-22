@@ -299,6 +299,10 @@ chfdw_classify_conditions(
 );
 extern bool
 chfdw_is_foreign_expr(PlannerInfo* root, RelOptInfo* baserel, Expr* expr);
+/* Assess + build the grouped target list for aggregate pushdown (defined in
+ * fdw.c, reused by shm_customscan.c for heap-offload aggregate pushdown). */
+extern bool
+foreign_grouping_ok(PlannerInfo* root, RelOptInfo* grouped_rel, Node* havingQual);
 extern bool
 is_foreign_param(PlannerInfo* root, RelOptInfo* baserel, Expr* expr);
 extern char*

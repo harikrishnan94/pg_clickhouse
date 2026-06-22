@@ -44,6 +44,8 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
+#include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
@@ -64,7 +66,8 @@ enum ShmScanPrivate {
     ShmScanPrivateFetchSize,      /* Integer: streaming fetch size */
     ShmScanPrivateShmName,        /* String: SHM object name */
     ShmScanPrivateSchema,         /* String: streamed_table schema columns */
-    ShmScanPrivateAttnos          /* List<int>: projected heap attnos */
+    ShmScanPrivateAttnos,         /* List<int>: projected heap attnos */
+    ShmScanPrivateHeapRelid       /* Integer (Oid): heap relation to scan */
 };
 
 /* Observability: did the current / previous query offload to ClickHouse? */
@@ -73,6 +76,7 @@ static bool pgch_last_query_used_ch = false;
 static bool pgch_last_query_used_ch_gucvar = false; /* GUC backing var (unused for display) */
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 
@@ -85,6 +89,9 @@ typedef struct ShmScanState {
     char           *shm_name;
     char           *schema_string;
     List           *attnos;
+    Oid             heap_relid;
+    Relation        heap_rel;
+    bool            opened_rel;     /* true if we table_open'd heap_rel ourselves */
     ShmOffloadColumn *cols;
     int             ncols;
     ShmProducer    *producer;
@@ -98,6 +105,9 @@ typedef struct ShmScanState {
     MemoryContext   temp_cxt;
 } ShmScanState;
 
+static void shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+                                   RelOptInfo *input_rel, RelOptInfo *output_rel,
+                                   void *extra);
 static Plan *shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
                                   CustomPath *best_path, List *tlist,
                                   List *clauses, List *custom_plans);
@@ -274,6 +284,98 @@ shm_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntr
 }
 
 /* --------------------------------------------------------------------- */
+/* Planner: create_upper_paths_hook (aggregate / GROUP BY pushdown) */
+/* --------------------------------------------------------------------- */
+
+/*
+ * For a GROUP/aggregate upper rel whose input is an offload-eligible heap rel,
+ * add a CustomScan path that pushes the whole scan+filter+aggregate fragment to
+ * ClickHouse (deparsed against streamed_table()). Reuses the FDW's
+ * foreign_grouping_ok to validate shippability and build the grouped tlist.
+ */
+static void
+shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+                       RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
+{
+    CHFdwRelationInfo *ifpinfo;
+    CHFdwRelationInfo *fpinfo;
+    Query *parse = root->parse;
+    Node *havingQual;
+    CustomPath *cpath;
+    bool ok = false;
+
+    if (prev_create_upper_paths_hook)
+        prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+    if (!pgch_enable_shm_offload)
+        return;
+    if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private != NULL)
+        return;
+    if (input_rel->fdw_private == NULL)
+        return;
+    ifpinfo = (CHFdwRelationInfo *) input_rel->fdw_private;
+    if (!ifpinfo->is_heap_offload || !ifpinfo->pushdown_safe)
+        return;
+    if (!parse->groupClause && !parse->groupingSets && !parse->hasAggs && !root->hasHavingQual)
+        return;
+    if (parse->groupingSets)
+        return;                         /* GROUPING SETS not supported */
+
+    havingQual = ((GroupPathExtraData *) extra)->havingQual;
+
+    /* Grouped fpinfo: carry the SHM source info from the base rel. The seam
+     * still fires on outerrel (the base rel) during deparse, so is_heap_offload
+     * stays false here. */
+    fpinfo = (CHFdwRelationInfo *) palloc0(sizeof(CHFdwRelationInfo));
+    fpinfo->stage = stage;
+    fpinfo->pushdown_safe = false;
+    fpinfo->outerrel = input_rel;
+    fpinfo->server = ifpinfo->server;
+    fpinfo->table = NULL;
+    fpinfo->user = NULL;
+    fpinfo->fetch_size = ifpinfo->fetch_size;
+    fpinfo->is_heap_offload = false;
+    fpinfo->heap_relid = ifpinfo->heap_relid;
+    fpinfo->shm_name = ifpinfo->shm_name;
+    fpinfo->shm_schema_string = ifpinfo->shm_schema_string;
+    fpinfo->shm_attnos = ifpinfo->shm_attnos;
+    fpinfo->relation_name = ifpinfo->relation_name;
+    output_rel->fdw_private = fpinfo;
+
+    PG_TRY();
+    {
+        ok = foreign_grouping_ok(root, output_rel, havingQual);
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+        ok = false;
+    }
+    PG_END_TRY();
+
+    if (!ok)
+    {
+        output_rel->fdw_private = NULL;
+        return;
+    }
+
+    cpath = makeNode(CustomPath);
+    cpath->path.pathtype = T_CustomScan;
+    cpath->path.parent = output_rel;
+    cpath->path.pathtarget = output_rel->reltarget;
+    cpath->path.param_info = NULL;
+    cpath->path.rows = output_rel->rows > 0 ? output_rel->rows : 1;
+    cpath->path.startup_cost = 1.0;
+    cpath->path.total_cost = 2.0;            /* win when the feature is enabled */
+    cpath->path.pathkeys = NIL;
+    cpath->flags = 0;
+    cpath->custom_paths = NIL;
+    cpath->custom_private = NIL;
+    cpath->methods = &shm_path_methods;
+    add_path(output_rel, (Path *) cpath);
+}
+
+/* --------------------------------------------------------------------- */
 /* Planner: build the CustomScan plan node */
 /* --------------------------------------------------------------------- */
 
@@ -285,39 +387,56 @@ shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
     CustomScan *cscan = makeNode(CustomScan);
     List *remote_exprs = NIL;
     List *local_exprs = NIL;
+    List *fdw_scan_tlist = NIL;
     List *retrieved_attrs = NIL;
     List *params_list = NIL;
     StringInfoData sql;
-    ListCell *lc;
+    Index scan_relid;
 
-    /* Split scan_clauses into remote (pushed) and local (kept) like the FDW. */
-    foreach (lc, clauses)
+    if (IS_UPPER_REL(rel))
     {
-        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+        /* Aggregate/GROUP BY pushdown: scanrelid 0; the columns to fetch are the
+         * grouped target list, WHERE comes from the base rel's pushed conditions
+         * (handled inside the deparser), and HAVING from this rel's remote_conds. */
+        scan_relid = 0;
+        fdw_scan_tlist = chfdw_build_tlist_to_deparse(rel);
+        remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
+        local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+    }
+    else
+    {
+        ListCell *lc;
 
-        if (rinfo->pseudoconstant)
-            continue;
-        if (list_member_ptr(fpinfo->remote_conds, rinfo))
-            remote_exprs = lappend(remote_exprs, rinfo->clause);
-        else if (list_member_ptr(fpinfo->local_conds, rinfo))
-            local_exprs = lappend(local_exprs, rinfo->clause);
-        else if (chfdw_is_foreign_expr(root, rel, rinfo->clause))
-            remote_exprs = lappend(remote_exprs, rinfo->clause);
-        else
-            local_exprs = lappend(local_exprs, rinfo->clause);
+        /* Base scan: split scan_clauses into remote (pushed) and local (kept). */
+        scan_relid = rel->relid;
+        foreach (lc, clauses)
+        {
+            RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+            if (rinfo->pseudoconstant)
+                continue;
+            if (list_member_ptr(fpinfo->remote_conds, rinfo))
+                remote_exprs = lappend(remote_exprs, rinfo->clause);
+            else if (list_member_ptr(fpinfo->local_conds, rinfo))
+                local_exprs = lappend(local_exprs, rinfo->clause);
+            else if (chfdw_is_foreign_expr(root, rel, rinfo->clause))
+                remote_exprs = lappend(remote_exprs, rinfo->clause);
+            else
+                local_exprs = lappend(local_exprs, rinfo->clause);
+        }
     }
 
     initStringInfo(&sql);
-    chfdw_deparse_select_stmt_for_rel(&sql, root, rel, NIL, remote_exprs, NIL,
+    chfdw_deparse_select_stmt_for_rel(&sql, root, rel, fdw_scan_tlist, remote_exprs, NIL,
                                       false, false, false,
                                       &retrieved_attrs, &params_list);
 
     cscan->scan.plan.targetlist = tlist;
     cscan->scan.plan.qual = local_exprs;
-    cscan->scan.scanrelid = rel->relid;     /* base-rel scan over the heap rel */
-    cscan->custom_scan_tlist = NIL;
+    cscan->scan.scanrelid = scan_relid;
+    cscan->custom_scan_tlist = fdw_scan_tlist;   /* NIL for base, grouped tlist for upper */
     cscan->custom_plans = custom_plans;
-    cscan->custom_exprs = NIL;               /* no external params in phase 1 */
+    cscan->custom_exprs = NIL;                    /* no external params in phase 1 */
     cscan->custom_private = list_make5(
         makeString(sql.data),
         retrieved_attrs,
@@ -325,6 +444,7 @@ shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
         makeString(fpinfo->shm_name),
         makeString(fpinfo->shm_schema_string));
     cscan->custom_private = lappend(cscan->custom_private, fpinfo->shm_attnos);
+    cscan->custom_private = lappend(cscan->custom_private, makeInteger((int) fpinfo->heap_relid));
     cscan->methods = &shm_scan_methods;
     return (Plan *) cscan;
 }
@@ -349,6 +469,7 @@ shm_create_custom_scan_state(CustomScan *cscan)
     sss->shm_name = strVal(list_nth(cscan->custom_private, ShmScanPrivateShmName));
     sss->schema_string = strVal(list_nth(cscan->custom_private, ShmScanPrivateSchema));
     sss->attnos = (List *) list_nth(cscan->custom_private, ShmScanPrivateAttnos);
+    sss->heap_relid = (Oid) intVal(list_nth(cscan->custom_private, ShmScanPrivateHeapRelid));
     return (Node *) sss;
 }
 
@@ -356,11 +477,11 @@ static void
 shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
     ShmScanState *sss = (ShmScanState *) node;
-    Relation rel = node->ss.ss_currentRelation;
+    Relation rel;
     ForeignServer *server;
     UserMapping *user;
     ShmColumnSchema *producer_schema;
-    TupleDesc tupdesc;
+    TupleDesc heap_tupdesc;
     ListCell *lc;
     int i;
 
@@ -370,7 +491,20 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
     /* Observability: this query is offloading to ClickHouse. */
     pgch_this_query_used_ch = true;
 
-    tupdesc = RelationGetDescr(rel);
+    /* Base scan (scanrelid>0) reuses the executor's relation; the grouped scan
+     * (scanrelid==0) has no ss_currentRelation, so open the heap rel ourselves. */
+    if (node->ss.ss_currentRelation != NULL)
+    {
+        rel = node->ss.ss_currentRelation;
+        sss->opened_rel = false;
+    }
+    else
+    {
+        rel = table_open(sss->heap_relid, AccessShareLock);
+        sss->opened_rel = true;
+    }
+    sss->heap_rel = rel;
+    heap_tupdesc = RelationGetDescr(rel);
 
     /* Build the projected ShmOffloadColumn[] from the stored attnos. */
     sss->ncols = list_length(sss->attnos);
@@ -380,7 +514,7 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
     foreach (lc, sss->attnos)
     {
         AttrNumber attno = (AttrNumber) lfirst_int(lc);
-        Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+        Form_pg_attribute att = TupleDescAttr(heap_tupdesc, attno - 1);
 
         if (!pgch_pg_type_to_ch_wire(att->atttypid, &sss->cols[i]))
             ereport(ERROR, (errmsg("pg_clickhouse: column '%s' became unsupported for SHM offload",
@@ -411,8 +545,10 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
     user = GetUserMapping(GetUserId(), server->serverid);
     sss->conn = chfdw_get_connection(user);
 
-    sss->tupdesc = tupdesc;
-    sss->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+    /* Result rows are fetched into the scan tuple slot: heap tupdesc for a base
+     * scan, the grouped (custom_scan_tlist) tupdesc for an aggregate scan. */
+    sss->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+    sss->attinmeta = TupleDescGetAttInMetadata(sss->tupdesc);
     sss->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
                                            "pg_clickhouse shm scan", ALLOCSET_DEFAULT_SIZES);
     sss->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -481,7 +617,7 @@ shm_scan_access_mtd(ScanState *ss)
 
         /* 1. Stream the whole relation into SHM (pre-buffer) + EOS, under the
          *    executor snapshot for correct MVCC visibility. */
-        pgch_stream_relation_to_shm(ss->ss_currentRelation, estate->es_snapshot,
+        pgch_stream_relation_to_shm(sss->heap_rel, estate->es_snapshot,
                                     sss->cols, sss->ncols, sss->producer, 65536);
 
         /* 2. Dispatch the ClickHouse query; CH attaches to the (now fully
@@ -535,6 +671,12 @@ shm_end_custom_scan(CustomScanState *node)
     {
         shm_producer_destroy(sss->producer);
         sss->producer = NULL;
+    }
+    if (sss->opened_rel && sss->heap_rel)
+    {
+        table_close(sss->heap_rel, AccessShareLock);
+        sss->heap_rel = NULL;
+        sss->opened_rel = false;
     }
 }
 
@@ -597,6 +739,9 @@ pgch_register_customscan_and_hooks(void)
 
     prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = shm_set_rel_pathlist;
+
+    prev_create_upper_paths_hook = create_upper_paths_hook;
+    create_upper_paths_hook = shm_create_upper_paths;
 
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = shm_ExecutorStart;
