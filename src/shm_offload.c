@@ -33,6 +33,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -59,10 +60,51 @@ PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 /* --------------------------------------------------------------------- */
 
 bool
-pgch_pg_type_to_ch_wire(Oid pg_type, ShmOffloadColumn *out)
+pgch_pg_type_to_ch_wire(Oid pg_type, int32 typmod, ShmOffloadColumn *out)
 {
     ShmWireType wire;
     const char *ch_type;
+
+    /*
+     * numeric(P, S) -> a fixed ClickHouse Decimal(P, S). The wire width is
+     * chosen by precision (Decimal32 for P<=9, Decimal64 for P<=18, Decimal128
+     * for P<=38). An unconstrained `numeric` (typmod -1, no fixed precision /
+     * scale), a negative scale, a scale greater than the precision, or a
+     * precision wider than 38 (which the adopted-column path does not cover) is
+     * declined so the offload falls back to a normal plan rather than streaming
+     * a value it cannot represent exactly. The typmod bit layout matches
+     * PostgreSQL's internal numeric typmod encoding (precision in the high 16
+     * bits; an 11-bit, sign-extended scale in the low bits).
+     */
+    if (pg_type == NUMERICOID)
+    {
+        int precision;
+        int scale;
+
+        if (typmod < (int32) VARHDRSZ)
+            return false;       /* unconstrained numeric: decline (fail closed) */
+
+        precision = ((typmod - VARHDRSZ) >> 16) & 0xffff;
+        scale = (((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024;
+
+        if (precision < 1 || precision > 38 || scale < 0 || scale > precision)
+            return false;
+
+        if (precision <= 9)
+            wire = SHM_WIRE_DECIMAL32;
+        else if (precision <= 18)
+            wire = SHM_WIRE_DECIMAL64;
+        else
+            wire = SHM_WIRE_DECIMAL128;
+
+        out->wire = wire;
+        out->pg_type = pg_type;
+        out->scale = scale;
+        /* Matches ClickHouse's canonical DataTypeDecimal::getName ("Decimal(P, S)")
+         * so the consumer's handshake equals-check on the parsed type passes. */
+        snprintf(out->ch_type, sizeof(out->ch_type), "Decimal(%d, %d)", precision, scale);
+        return true;
+    }
 
     switch (pg_type)
     {
@@ -82,6 +124,7 @@ pgch_pg_type_to_ch_wire(Oid pg_type, ShmOffloadColumn *out)
 
     out->wire = wire;
     out->pg_type = pg_type;
+    out->scale = 0;
     strlcpy(out->ch_type, ch_type, sizeof(out->ch_type));
     return true;
 }
@@ -116,6 +159,117 @@ typedef struct ColBuf {
     StringInfoData chars;       /* string chars */
     uint64_t    *offsets;       /* rows_per_block end-offsets */
 } ColBuf;
+
+/*
+ * Convert a PostgreSQL numeric Datum to a ClickHouse Decimal wire value: the
+ * unscaled integer round(value * 10^scale) as a two's-complement signed
+ * little-endian integer of `width` bytes (4/8/16 for Decimal32/64/128), written
+ * to `out`. Fails closed (raises ERROR) on NaN/Infinity and on any magnitude
+ * that does not fit the signed `width` range — which, for a column typed
+ * numeric(P, S) whose wire width was chosen from P, means a value outside the
+ * declared precision. A value already stored in a numeric(P, S) column is always
+ * representable, so this never wrongly rejects valid stored data.
+ *
+ * The conversion goes through `numeric_out` (exact decimal text), so the result
+ * is bit-exact: no float intermediate. The text is parsed digit-by-digit into a
+ * 256-bit magnitude (ample headroom for the <=38-digit values we accept), then
+ * range-checked and folded into the requested width.
+ */
+static void
+numeric_to_decimal_wire(Datum num_datum, uint32 scale, size_t width,
+                        char *out, const char *colname)
+{
+    Numeric     num = DatumGetNumeric(num_datum);
+    char       *s;
+    const char *p;
+    const char *dot;
+    const char *frac;
+    bool        neg = false;
+    size_t      ilen;
+    size_t      flen;
+    size_t      ndig;
+    size_t      i;
+    uint32      mag[8] = {0};            /* up to 256-bit accumulator */
+    size_t      limit_words = width / 4; /* 1 / 2 / 4 for Decimal32 / 64 / 128 */
+
+    if (numeric_is_nan(num) || numeric_is_inf(num))
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_clickhouse: column \"%s\" holds NaN/Infinity, which is not "
+                        "representable as a ClickHouse Decimal", colname)));
+
+    s = DatumGetCString(DirectFunctionCall1(numeric_out, num_datum));
+
+    p = s;
+    if (*p == '-') { neg = true; p++; }
+    else if (*p == '+') { p++; }
+
+    dot = strchr(p, '.');
+    ilen = dot ? (size_t) (dot - p) : strlen(p);
+    frac = dot ? dot + 1 : "";
+    flen = strlen(frac);
+    ndig = ilen + scale;
+
+    /* Accumulate |value| * 10^scale, padding/truncating the fraction to `scale`. */
+    for (i = 0; i < ndig; i++)
+    {
+        char     c = (i < ilen) ? p[i]
+                                : ((i - ilen) < flen ? frac[i - ilen] : '0');
+        uint64_t carry;
+        size_t   b;
+
+        if (c < '0' || c > '9')
+            ereport(ERROR,
+                    (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                     errmsg("pg_clickhouse: column \"%s\" value \"%s\" is not representable "
+                            "as a ClickHouse Decimal", colname, s)));
+
+        carry = (uint64_t) (c - '0');
+        for (b = 0; b < 8; b++)
+        {
+            uint64_t v = (uint64_t) mag[b] * 10 + carry;
+            mag[b] = (uint32) v;
+            carry = v >> 32;
+        }
+    }
+
+    /*
+     * Overflow / precision guard: the magnitude must be < 2^(8*width-1) so it
+     * fits the signed `width` range with room for the sign. Require every word
+     * at or above the width to be zero AND the top in-width word's sign bit to
+     * be clear. (10^38 < 2^127, so a valid numeric(38, S) value always passes.)
+     */
+    for (i = limit_words; i < 8; i++)
+        if (mag[i] != 0)
+            goto overflow;
+    if (limit_words > 0 && (mag[limit_words - 1] & 0x80000000u) != 0)
+        goto overflow;
+
+    if (neg)
+    {
+        uint64_t carry = 1;
+        size_t   b;
+
+        for (b = 0; b < limit_words; b++)
+            mag[b] = ~mag[b];
+        for (b = 0; b < limit_words && carry; b++)
+        {
+            uint64_t v = (uint64_t) mag[b] + carry;
+            mag[b] = (uint32) v;
+            carry = v >> 32;
+        }
+    }
+
+    memcpy(out, mag, width);
+    pfree(s);
+    return;
+
+overflow:
+    ereport(ERROR,
+            (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+             errmsg("pg_clickhouse: column \"%s\" value \"%s\" exceeds the declared "
+                    "ClickHouse Decimal precision/range", colname, s)));
+}
 
 static void
 write_fixed_value(ColBuf *cb, const ShmOffloadColumn *col, size_t row, Datum d)
@@ -165,6 +319,13 @@ write_fixed_value(ColBuf *cb, const ShmOffloadColumn *col, size_t row, Datum d)
             memcpy(slot, &ch_days, sizeof(ch_days));
             break;
         }
+        case SHM_WIRE_DECIMAL32:
+        case SHM_WIRE_DECIMAL64:
+        case SHM_WIRE_DECIMAL128:
+            /* `d` is a numeric Datum; `cb->elem` is the wire width (4/8/16) and
+             * `col->scale` the declared decimal scale (not on the wire). */
+            numeric_to_decimal_wire(d, (uint32) col->scale, cb->elem, slot, col->name);
+            break;
         default:
             ereport(ERROR, (errmsg("pg_clickhouse: column '%s' has no fixed-width writer for wire tag %d",
                                    col->name, (int) col->wire)));
@@ -354,7 +515,7 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
 
         if (att->attisdropped)
             continue;
-        if (!pgch_pg_type_to_ch_wire(att->atttypid, &cols[ncols]))
+        if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &cols[ncols]))
             ereport(ERROR,
                     (errmsg("pg_clickhouse: column '%s' has type %u which is not supported by "
                             "the streamed_table() offload",

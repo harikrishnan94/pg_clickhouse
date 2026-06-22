@@ -48,14 +48,18 @@ typedef struct ShmOffloadColumn {
     char       ch_type[64];      /* ClickHouse type string for the schema */
     ShmWireType wire;
     Oid        pg_type;
+    int32      scale;            /* decimal scale for Decimal/DateTime64 wire types; 0 otherwise */
 } ShmOffloadColumn;
 
 /*
- * Map a PostgreSQL type OID to the ClickHouse wire type + type string.
- * Returns true and fills *out on success; false for any type outside the
- * supported set (caller must then decline the offload, not error).
+ * Map a PostgreSQL type OID (+ its atttypmod) to the ClickHouse wire type and
+ * type string. `typmod` carries precision/scale for parametrized types such as
+ * numeric; pass the column's atttypmod (or -1 if unknown). Returns true and
+ * fills *out on success; false for any type outside the supported set (the
+ * caller must then decline the offload, not error). An unconstrained `numeric`
+ * (typmod -1, no fixed precision/scale) is declined so the offload fails closed.
  */
-extern bool pgch_pg_type_to_ch_wire(Oid pg_type, ShmOffloadColumn *out);
+extern bool pgch_pg_type_to_ch_wire(Oid pg_type, int32 typmod, ShmOffloadColumn *out);
 
 /*
  * Build the comma-separated ClickHouse columns string ("name Type, ...") for a

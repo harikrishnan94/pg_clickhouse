@@ -33,12 +33,14 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
 #include "optimizer/optimizer.h"
@@ -213,7 +215,7 @@ shm_consider_offload(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
             table_close(heap_rel, NoLock);
             return;                     /* NULLs unsupported in phase 1 -> decline */
         }
-        if (!pgch_pg_type_to_ch_wire(att->atttypid, &col))
+        if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &col))
         {
             table_close(heap_rel, NoLock);
             return;                     /* unsupported type -> decline */
@@ -357,6 +359,31 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
     {
         output_rel->fdw_private = NULL;
         return;
+    }
+
+    /*
+     * Decimal aggregates: keep the math in PostgreSQL for bit-identical results.
+     * A pushed aggregate that RETURNS a numeric value is not reproducible across
+     * the two engines -- ClickHouse formats a Decimal without PostgreSQL's
+     * display-scale trailing zeros (e.g. "0.5" vs "0.50") and avg() over a
+     * Decimal yields Float64. So decline the grouped push-down whenever any
+     * output column is numeric: the base scan still offloads (ClickHouse adopts
+     * the Decimal columns zero-copy and read_rows still covers the whole table)
+     * and PostgreSQL computes the exact decimal aggregate over the streamed rows.
+     * Non-numeric outputs (count, integer/float aggregates, and HAVING-only
+     * decimal comparisons that return a bool) are unaffected and still push down.
+     */
+    {
+        ListCell *lc;
+
+        foreach (lc, output_rel->reltarget->exprs)
+        {
+            if (exprType((Node *) lfirst(lc)) == NUMERICOID)
+            {
+                output_rel->fdw_private = NULL;
+                return;
+            }
+        }
     }
 
     cpath = makeNode(CustomPath);
@@ -516,7 +543,7 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
         AttrNumber attno = (AttrNumber) lfirst_int(lc);
         Form_pg_attribute att = TupleDescAttr(heap_tupdesc, attno - 1);
 
-        if (!pgch_pg_type_to_ch_wire(att->atttypid, &sss->cols[i]))
+        if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &sss->cols[i]))
             ereport(ERROR, (errmsg("pg_clickhouse: column '%s' became unsupported for SHM offload",
                                    NameStr(att->attname))));
         sss->cols[i].attno = attno;

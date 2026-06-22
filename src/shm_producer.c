@@ -154,8 +154,10 @@ shm_wire_fixed_width_size(ShmWireType t)
         case SHM_WIRE_INT8:  case SHM_WIRE_UINT8:  return 1;
         case SHM_WIRE_INT16: case SHM_WIRE_UINT16: case SHM_WIRE_DATE: return 2;
         case SHM_WIRE_INT32: case SHM_WIRE_UINT32: case SHM_WIRE_FLOAT32:
-        case SHM_WIRE_DATETIME: case SHM_WIRE_DATE32: return 4;
-        case SHM_WIRE_INT64: case SHM_WIRE_UINT64: case SHM_WIRE_FLOAT64: return 8;
+        case SHM_WIRE_DATETIME: case SHM_WIRE_DATE32: case SHM_WIRE_DECIMAL32: return 4;
+        case SHM_WIRE_INT64: case SHM_WIRE_UINT64: case SHM_WIRE_FLOAT64:
+        case SHM_WIRE_DECIMAL64: case SHM_WIRE_DATETIME64: return 8;
+        case SHM_WIRE_DECIMAL128: return 16;
         case SHM_WIRE_STRING: return 0;
     }
     return 0;
@@ -607,7 +609,12 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         {
             size_t elem = shm_wire_fixed_width_size(wire);
             size_t vbytes = is_eos ? 0 : row_count * elem;
-            size_t voff = align_up(cursor, 8);     /* 8-aligned => any elem alignment */
+            /* Align the value buffer to the element's natural alignment so the
+             * consumer's `value_offset % elem_size == 0` check holds for every
+             * width. Only Decimal128 (16) exceeds 8; smaller widths keep >=8. The
+             * per-slot region base (per_slot_capacity, payload offset) is already
+             * 64-aligned, so a 16-aligned cursor stays within the slot. */
+            size_t voff = align_up(cursor, elem > 8 ? elem : 8);
 
             cursor = voff + vbytes + SHM_PADDING_FOR_SIMD;
             if (cursor > slot_end)

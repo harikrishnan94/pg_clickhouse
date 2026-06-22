@@ -47,6 +47,16 @@ typedef enum ShmWireType {
     SHM_WIRE_DATE = 12,     /* UInt16 storage */
     SHM_WIRE_DATETIME = 13, /* UInt32 storage */
     SHM_WIRE_DATE32 = 14,   /* Int32 storage  */
+    /*
+     * Fixed-width decimals. The on-wire value is the unscaled two's-complement
+     * little-endian integer; the SCALE is carried only in the type string
+     * ("Decimal(P, S)") that the ClickHouse consumer parses, never in the value
+     * buffer. SHM_WIRE_DECIMAL128's value buffer must be 16-byte aligned.
+     */
+    SHM_WIRE_DECIMAL32 = 15,  /* Int32 storage  */
+    SHM_WIRE_DECIMAL64 = 16,  /* Int64 storage  */
+    SHM_WIRE_DECIMAL128 = 17, /* Int128 storage, 16-byte aligned */
+    SHM_WIRE_DATETIME64 = 18, /* Int64 storage (Decimal64 ticks) */
 } ShmWireType;
 
 /* Returns the fixed-width element size in bytes, or 0 for String. */
