@@ -37,15 +37,13 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include "shm_deform.h"          /* PGCH_DATE_EPOCH_DIFF (shared with the C++ deform TU) */
 #include "shm_offload.h"
 #include "shm_page_reader.h"
 #include "shm_producer.h"
 
 #include <stdint.h>
 #include <string.h>
-
-/* PostgreSQL DATE epoch is 2000-01-01; ClickHouse Date epoch is 1970-01-01. */
-#define PGCH_DATE_EPOCH_DIFF (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) /* 10957 */
 
 /* GUCs */
 bool  pgch_enable_shm_offload = false;
@@ -526,73 +524,16 @@ pgch_columnizer_advance(ShmColumnizer *cz, size_t nrows)
         columnizer_publish_block(cz);
 }
 
-void
-pgch_columnizer_fill_fixed(ShmColumnizer *cz, int col, size_t dst_row,
-                           char *const *restrict cur, uint32 disp, size_t nrows)
+/*
+ * Base pointer of a fixed-width column's per-block staging buffer (the output
+ * the C++ column-major deform kernels write into). Stable for the stream's
+ * lifetime: allocated once in pgch_columnizer_begin and overwritten in place per
+ * block. Indexed by element from dst_row in the kernel.
+ */
+void *
+pgch_columnizer_fixed_base(ShmColumnizer *cz, int col)
 {
-    ColBuf *cb = &cz->bufs[col];
-    size_t  r;
-
-    /* Dispatch on wire type ONCE; each branch is a tight type-monomorphic loop
-     * the compiler can autovectorize the store side of. Loads are gathers from
-     * the per-row cursors (scalar on NEON). Byte-identical to write_fixed_value. */
-    switch (cz->cols[col].wire)
-    {
-        case SHM_WIRE_UINT8:
-        {
-            uint8_t *restrict o = (uint8_t *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = (*(const char *) (cur[r] + disp)) ? 1 : 0;
-            break;
-        }
-        case SHM_WIRE_INT16:
-        {
-            int16 *restrict o = (int16 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = *(const int16 *) (cur[r] + disp);
-            break;
-        }
-        case SHM_WIRE_INT32:
-        {
-            int32 *restrict o = (int32 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = *(const int32 *) (cur[r] + disp);
-            break;
-        }
-        case SHM_WIRE_INT64:
-        {
-            int64 *restrict o = (int64 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = *(const int64 *) (cur[r] + disp);
-            break;
-        }
-        case SHM_WIRE_FLOAT32:
-        {
-            float4 *restrict o = (float4 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = *(const float4 *) (cur[r] + disp);
-            break;
-        }
-        case SHM_WIRE_FLOAT64:
-        {
-            float8 *restrict o = (float8 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = *(const float8 *) (cur[r] + disp);
-            break;
-        }
-        case SHM_WIRE_DATE:
-        {
-            /* Rebase PostgreSQL 2000-epoch days to ClickHouse 1970-epoch days. */
-            uint16 *restrict o = (uint16 *) cb->fixed;
-            for (r = 0; r < nrows; r++)
-                o[dst_row + r] = (uint16) (*(const int32 *) (cur[r] + disp) + PGCH_DATE_EPOCH_DIFF);
-            break;
-        }
-        default:
-            ereport(ERROR,
-                    (errmsg("pg_clickhouse: column '%s' has no columnar fixed writer for wire tag %d",
-                            cz->cols[col].name, (int) cz->cols[col].wire)));
-    }
+    return cz->bufs[col].fixed;
 }
 
 void

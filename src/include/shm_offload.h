@@ -16,6 +16,7 @@
 
 #include "nodes/pg_list.h"
 #include "utils/relcache.h"
+#include "utils/snapshot.h"
 
 #include "shm_producer.h"
 
@@ -106,8 +107,7 @@ extern uint64 pgch_columnizer_finish(ShmColumnizer *cz);
  */
 extern size_t pgch_columnizer_block_avail(const ShmColumnizer *cz);
 extern size_t pgch_columnizer_cur_row(const ShmColumnizer *cz);
-extern void pgch_columnizer_fill_fixed(ShmColumnizer *cz, int col, size_t dst_row,
-                                       char *const *cur, uint32 disp, size_t nrows);
+extern void *pgch_columnizer_fixed_base(ShmColumnizer *cz, int col);
 extern void pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
                                         char *const *cur, size_t nrows);
 extern void pgch_columnizer_advance(ShmColumnizer *cz, size_t nrows);

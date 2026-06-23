@@ -370,6 +370,7 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
      * Non-numeric outputs (count, integer/float aggregates, and HAVING-only
      * decimal comparisons that return a bool) are unaffected and still push down.
      */
+    if (false)  /* TEMP repro: decline disabled to expose agg-pushdown bug */
     {
         ListCell *lc;
 

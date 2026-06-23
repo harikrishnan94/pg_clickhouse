@@ -18,6 +18,8 @@ ARCH         = $(shell uname -m)
 
 # Collect all the C files to compile into MODULE_big.
 OBJS = $(subst .c,.o, $(wildcard src/*.c src/*/*.c))
+# C++ translation units (templated column-major deform kernels + extern "C" driver).
+OBJS += $(patsubst %.cpp,%.o, $(wildcard src/*.cpp src/*/*.cpp))
 
 # clickhouse-c is a header-only single-header library. Override
 # CH_C_DIR to point elsewhere when developing against a local checkout.
@@ -39,6 +41,10 @@ endif
 
 # Suppress annoying pre-c99 warning, error on other warnings, include curl.
 PG_CFLAGS = -Wno-declaration-after-statement -Wall -Werror $(shell $(CURL_CONFIG) --cflags)
+
+# C++ TU (src/shm_deform.cpp): C++20, no exceptions/RTTI (allocation-free,
+# trivial-destructor templated kernels), same -Wall -Werror discipline.
+PG_CXXFLAGS = -std=c++20 -fno-exceptions -fno-rtti -Wall -Werror
 
 # Clean up generated files.
 EXTRA_CLEAN = sql/$(EXTENSION)--$(EXTVERSION).sql src/include/version.h compile_commands.json test/schedule $(EXTENSION)-$(DISTVERSION).zip

@@ -46,9 +46,41 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include "shm_deform.h"
 #include "shm_offload.h"
 #include "shm_page_reader.h"
 #include "shm_producer.h"
+
+/*
+ * Per-page visibility splice: visible tuples are partitioned into three buckets
+ * as the collector emits them (the header is already hot), so the reader can
+ * route each to the deform path optimized for it.
+ *   A (cur_simple): NULL-free, full-natts  -> column-major C++ driver (no nulls)
+ *   B (complex_tup): HEAP_HASNULL, full-natts -> column-major C++ driver (nulls)
+ *   C (fallback_tup): short (natts < max_attno) -> row-major C path
+ * With the columnar GUC off, every tuple is routed to C (exact row-major behavior).
+ * The three arrays are scan-owned, each sized MaxHeapTuplesPerPage.
+ */
+typedef struct PgchVisSplit
+{
+    AttrNumber       max_attno;
+    bool             columnar;       /* false -> route everything to fallback (C) */
+    char           **cur_simple;     /* A: data-start (htup + t_hoff) */
+    HeapTupleHeader *complex_tup;    /* B */
+    HeapTupleHeader *fallback_tup;   /* C */
+    int              na, nb, nc;
+} PgchVisSplit;
+
+static pg_attribute_always_inline void
+pgch_route(HeapTupleHeader htup, PgchVisSplit *s)
+{
+    if (!s->columnar || HeapTupleHeaderGetNatts(htup) < s->max_attno)
+        s->fallback_tup[s->nc++] = htup;                       /* group C (or GUC off: all) */
+    else if (htup->t_infomask & HEAP_HASNULL)
+        s->complex_tup[s->nb++] = htup;                        /* group B */
+    else
+        s->cur_simple[s->na++] = (char *) htup + htup->t_hoff; /* group A */
+}
 
 /* Three-way per-tuple visibility verdict from the branch-light kernel. */
 typedef enum PgchVisVerdict
@@ -132,51 +164,50 @@ pgch_classify_tuple(uint16 infomask, TransactionId xmin, TransactionId xmax,
     return PGCH_VIS_UNDECIDED;              /* no xmax hint -> fall back */
 }
 
-/* Collect every LP_NORMAL offset on an all-visible page (no per-tuple work). */
-static int
-pgch_collect_all_visible(Page page, OffsetNumber *vis)
+/* Splice every LP_NORMAL tuple on an all-visible page into the buckets. The
+ * header deref here is the same one the deform needs next (hot in cache). */
+static void
+pgch_collect_all_visible(Page page, PgchVisSplit *s)
 {
     OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
     OffsetNumber off;
-    int          n = 0;
 
     for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
     {
         ItemId lp = PageGetItemId(page, off);
 
         if (ItemIdIsNormal(lp))
-            vis[n++] = off;
+            pgch_route((HeapTupleHeader) PageGetItem(page, lp), s);
     }
-    return n;
 }
 
 /*
- * Collect the snapshot-visible LP_NORMAL offsets on a not-all-visible page.
- * Three passes: gather header fields into parallel (SoA) arrays, run the
- * branch-light classifier over them, then resolve UNDECIDED tuples through the
- * MVCC oracle. The buffer must be share-locked for the whole call (the fallback
- * may set hint bits, which dirties the buffer and requires the lock).
+ * Splice the snapshot-visible LP_NORMAL tuples on a not-all-visible page into
+ * the buckets. Three passes: gather header fields into parallel (SoA) arrays,
+ * run the branch-light classifier over them, then route VISIBLE tuples (and
+ * MVCC-oracle-confirmed UNDECIDED ones). The buffer must be share-locked for the
+ * whole call (the fallback may set hint bits, which dirties the buffer).
  */
-static int
+static void
 pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page page,
-                             Snapshot snapshot, OffsetNumber *vis)
+                             Snapshot snapshot, PgchVisSplit *s)
 {
-    OffsetNumber  maxoff = PageGetMaxOffsetNumber(page);
-    OffsetNumber  off;
-    TransactionId snap_xmin = snapshot->xmin;
-    TransactionId snap_xmax = snapshot->xmax;
-    int           n = 0;
-    int           m = 0;
-    int           j;
+    OffsetNumber    maxoff = PageGetMaxOffsetNumber(page);
+    OffsetNumber    off;
+    TransactionId   snap_xmin = snapshot->xmin;
+    TransactionId   snap_xmax = snapshot->xmax;
+    int             m = 0;
+    int             j;
 
     /* SoA scratch, sized for the worst case (one page's worth of tuples). */
-    OffsetNumber  soa_off[MaxHeapTuplesPerPage];
-    uint16        soa_im[MaxHeapTuplesPerPage];
-    TransactionId soa_xmin[MaxHeapTuplesPerPage];
-    TransactionId soa_xmax[MaxHeapTuplesPerPage];
-    uint8         verdict[MaxHeapTuplesPerPage];
+    OffsetNumber    soa_off[MaxHeapTuplesPerPage];
+    HeapTupleHeader soa_htup[MaxHeapTuplesPerPage];
+    uint16          soa_im[MaxHeapTuplesPerPage];
+    TransactionId   soa_xmin[MaxHeapTuplesPerPage];
+    TransactionId   soa_xmax[MaxHeapTuplesPerPage];
+    uint8           verdict[MaxHeapTuplesPerPage];
 
-    /* Pass A: gather hint bits + raw xmin/xmax for each LP_NORMAL tuple. */
+    /* Pass A: gather header pointer + hint bits + raw xmin/xmax per LP_NORMAL. */
     for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
     {
         ItemId          lp = PageGetItemId(page, off);
@@ -187,6 +218,7 @@ pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page pag
 
         htup = (HeapTupleHeader) PageGetItem(page, lp);
         soa_off[m] = off;
+        soa_htup[m] = htup;
         soa_im[m] = htup->t_infomask;
         soa_xmin[m] = HeapTupleHeaderGetRawXmin(htup);
         soa_xmax[m] = HeapTupleHeaderGetRawXmax(htup);
@@ -198,30 +230,28 @@ pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page pag
         verdict[j] = (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
                                                  snap_xmin, snap_xmax);
 
-    /* Pass C: emit VISIBLE; resolve UNDECIDED via the exact MVCC oracle. */
+    /* Pass C: route VISIBLE; resolve UNDECIDED via the exact MVCC oracle. */
     for (j = 0; j < m; j++)
     {
         if (verdict[j] == PGCH_VIS_VISIBLE)
         {
-            vis[n++] = soa_off[j];
+            pgch_route(soa_htup[j], s);
         }
         else if (verdict[j] == PGCH_VIS_UNDECIDED)
         {
             ItemId        lp = PageGetItemId(page, soa_off[j]);
             HeapTupleData loctup;
 
-            loctup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+            loctup.t_data = soa_htup[j];
             loctup.t_len = ItemIdGetLength(lp);
             loctup.t_tableOid = RelationGetRelid(rel);
             ItemPointerSet(&loctup.t_self, blk, soa_off[j]);
 
             if (HeapTupleSatisfiesVisibility(&loctup, snapshot, buf))
-                vis[n++] = soa_off[j];
+                pgch_route(soa_htup[j], s);
         }
         /* PGCH_VIS_INVISIBLE: skip */
     }
-
-    return n;
 }
 
 /* --------------------------------------------------------------------- */
@@ -422,80 +452,80 @@ pgch_vectorized_reader_eligible(Relation rel, Snapshot snapshot,
 }
 
 /*
- * Column-major (struct-of-arrays) deform of a page's NULL-free, full-natts
- * tuples (group A from the visibility splice). `cur[r]` points at each tuple's
- * data area (= htup + t_hoff). Loops columns-outer / rows-inner: projected
- * fixed-prefix columns are filled at a constant displacement off the cursor; the
- * tail advances the cursor per row (single pointer, no separate offset array).
- * Sub-batches respect the columnizer's block boundary.
+ * C string-fill callback handed to the C++ deform driver. String columns can't
+ * be filled in the (allocation-free) C++ kernels because StringInfo append may
+ * repalloc; the driver positions the per-row cursors at the varlena datum and
+ * calls back here. Signature matches PgchStringFill.
  */
 static void
-pgch_deform_simple_columnar(ShmColumnizer *cz, const ShmOffloadColumn *cols,
-                            const PgchDeformPlan *plan, const int *col_of,
-                            char **cur_simple, int na)
+pgch_str_fill_cb(void *cz, int col_index, size_t dst_row, char *const *cur, size_t nrows)
 {
-    int done = 0;
+    pgch_columnizer_fill_string((ShmColumnizer *) cz, col_index, dst_row, cur, nrows);
+}
 
-    while (done < na)
+/*
+ * Build the per-column deform descriptor for the C++ driver, once per scan.
+ * `col` is sized max_attno (indexed by attno-1). Computes the group-A prefix
+ * (leading fixed-width run) and the group-B prefix (leading fixed-width AND
+ * NOT NULL run) and each prefix column's constant byte offset.
+ */
+static void
+pgch_build_deform_desc(Relation rel, ShmColumnizer *cz, const ShmOffloadColumn *cols,
+                       const int *col_of, AttrNumber max_attno,
+                       PgchDeformCol *col, PgchDeformDesc *desc)
+{
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    uint32    cum = 0;
+    int       pa = 0;
+    int       pb;
+    int       i;
+
+    for (i = 0; i < max_attno; i++)
     {
-        size_t  dst = pgch_columnizer_cur_row(cz);
-        size_t  avail = pgch_columnizer_block_avail(cz);
-        int     navail = (int) Min((size_t) (na - done), avail);
-        char  **cur = cur_simple + done;
-        int     k;
-        int     i;
-        int     r;
+        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+        int               cix = col_of[i];
 
-        /* Prefix: projected fixed-width columns at constant displacement. */
-        for (k = 0; k < plan->n_fixed; k++)
+        col[i].attlen = att->attlen;
+        col[i].attalign = att->attalign;
+        col[i].nullable = !att->attnotnull;
+        col[i].is_needed = (cix >= 0);
+        col[i].disp = 0;
+        if (cix >= 0)
         {
-            const PgchFixedFetch *f = &plan->fixed[k];
-
-            pgch_columnizer_fill_fixed(cz, col_of[f->idx], dst, cur, f->off, (size_t) navail);
+            col[i].wire = cols[cix].wire;
+            col[i].is_string = (cols[cix].wire == SHM_WIRE_STRING);
+            col[i].col_index = cix;
+            col[i].dst_base = col[i].is_string ? NULL : pgch_columnizer_fixed_base(cz, cix);
         }
-
-        /* Tail: advance the single cursor per row through the varlena region. */
-        if (plan->has_tail)
+        else
         {
-            for (r = 0; r < navail; r++)
-                cur[r] += plan->walk_start_off;
-
-            for (i = plan->prefix_len; i < plan->max_attno; i++)
-            {
-                const PgchAttrMeta *a = &plan->meta[i];
-
-                /* align */
-                if (a->attlen == -1)
-                    for (r = 0; r < navail; r++)
-                        cur[r] = (char *) att_align_pointer((uintptr_t) cur[r], a->attalign, -1, cur[r]);
-                else
-                    for (r = 0; r < navail; r++)
-                        cur[r] = (char *) att_align_nominal((uintptr_t) cur[r], a->attalign);
-
-                /* fill if projected */
-                if (a->is_needed)
-                {
-                    int col = col_of[i];
-
-                    if (cols[col].wire == SHM_WIRE_STRING)
-                        pgch_columnizer_fill_string(cz, col, dst, cur, (size_t) navail);
-                    else
-                        pgch_columnizer_fill_fixed(cz, col, dst, cur, 0, (size_t) navail);
-                }
-
-                /* advance */
-                if (a->attlen == -1)
-                    for (r = 0; r < navail; r++)
-                        cur[r] = (char *) att_addlength_pointer((uintptr_t) cur[r], -1, cur[r]);
-                else
-                    for (r = 0; r < navail; r++)
-                        cur[r] += a->attlen;
-            }
+            col[i].wire = SHM_WIRE_STRING;     /* unused */
+            col[i].is_string = false;
+            col[i].col_index = -1;
+            col[i].dst_base = NULL;
         }
-
-        pgch_columnizer_advance(cz, (size_t) navail);
-        done += navail;
     }
+
+    /* Group-A prefix: leading run of fixed-width columns, constant offsets. */
+    for (i = 0; i < max_attno; i++)
+    {
+        if (col[i].attlen <= 0)            /* first varlena/cstring ends the run */
+            break;
+        cum = (uint32) att_align_nominal(cum, col[i].attalign);
+        col[i].disp = cum;
+        cum += (uint32) col[i].attlen;
+        pa = i + 1;
+    }
+    desc->col = col;
+    desc->max_attno = max_attno;
+    desc->prefix_len_a = pa;
+    desc->walk_start_off_a = cum;
+
+    /* Group-B prefix: leading run of fixed-width AND NOT NULL columns (<= A). */
+    for (pb = 0; pb < pa && !col[pb].nullable; pb++)
+        /* advance */ ;
+    desc->prefix_len_b = pb;
+    desc->walk_start_off_b = (pb < pa) ? col[pb].disp : desc->walk_start_off_a;
 }
 
 uint64
@@ -510,14 +540,18 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     BlockNumber          blk;
     AttrNumber           max_attno = 0;
     PgchAttrMeta        *meta;
-    PgchDeformPlan       plan;
+    PgchDeformPlan       plan;          /* group C / GUC-off row-major path */
+    PgchDeformCol       *col;           /* group A/B C++ driver descriptor */
+    PgchDeformDesc       desc;
     uint32               cum;
     Datum               *values;
     bool                *isnull;
-    OffsetNumber        *vis;
     int                 *col_of;        /* attno-1 -> projected column index, else -1 */
-    char               **cur_simple;    /* group A: data-start cursors (NULL-free tuples) */
-    OffsetNumber        *complex_off;   /* group B: offsets of tuples with NULLs / short */
+    char               **cur_simple;    /* group A cursors; reused as group B scratch */
+    HeapTupleHeader     *complex_tup;   /* group B tuples (HEAP_HASNULL, full natts) */
+    HeapTupleHeader     *fallback_tup;  /* group C tuples (short) / all when GUC off */
+    const bits8        **bits;          /* group B NULL-bitmap pointers */
+    PgchVisSplit         s;
     int                  c;
     int                  i;
 
@@ -525,7 +559,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
         if (cols[c].attno > max_attno)
             max_attno = cols[c].attno;
 
-    /* Build attno-indexed deform metadata for attnos 1..max_attno. */
+    /* Build attno-indexed deform metadata for the row-major path (group C / off). */
     meta = (PgchAttrMeta *) palloc0(sizeof(PgchAttrMeta) * max_attno);
     for (i = 0; i < max_attno; i++)
     {
@@ -539,10 +573,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     for (c = 0; c < ncols; c++)
         meta[cols[c].attno - 1].is_needed = true;
 
-    /* Build the deform plan: precompute constant offsets for the leading
-     * fixed-width run so projected prefix columns are direct loads (no per-tuple
-     * walk over the non-projected prefix attrs), and the tail (varlena region
-     * up to max_attno) is walked from its constant start offset. */
+    /* Row-major plan: constant-offset fixed prefix + tail walk (pgch_deform_fast). */
     plan.max_attno = max_attno;
     plan.meta = meta;
     plan.fixed = (PgchFixedFetch *) palloc(sizeof(PgchFixedFetch) * ncols);
@@ -569,7 +600,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     plan.walk_start_off = cum;
     plan.has_tail = (max_attno > plan.prefix_len);
 
-    /* attno-1 -> projected column index, for the columnar fill calls. */
+    /* attno-1 -> projected column index. */
     col_of = (int *) palloc(sizeof(int) * max_attno);
     for (i = 0; i < max_attno; i++)
         col_of[i] = -1;
@@ -578,11 +609,22 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
 
     values = (Datum *) palloc(sizeof(Datum) * max_attno);
     isnull = (bool *) palloc(sizeof(bool) * max_attno);
-    vis = (OffsetNumber *) palloc(sizeof(OffsetNumber) * MaxHeapTuplesPerPage);
+    col = (PgchDeformCol *) palloc0(sizeof(PgchDeformCol) * max_attno);
     cur_simple = (char **) palloc(sizeof(char *) * MaxHeapTuplesPerPage);
-    complex_off = (OffsetNumber *) palloc(sizeof(OffsetNumber) * MaxHeapTuplesPerPage);
+    complex_tup = (HeapTupleHeader *) palloc(sizeof(HeapTupleHeader) * MaxHeapTuplesPerPage);
+    fallback_tup = (HeapTupleHeader *) palloc(sizeof(HeapTupleHeader) * MaxHeapTuplesPerPage);
+    bits = (const bits8 **) palloc(sizeof(bits8 *) * MaxHeapTuplesPerPage);
 
     cz = pgch_columnizer_begin(cols, ncols, producer, rows_per_block);
+
+    /* C++ driver descriptor (needs cz for the per-column output buffers). */
+    pgch_build_deform_desc(rel, cz, cols, col_of, max_attno, col, &desc);
+
+    s.max_attno = max_attno;
+    s.columnar = pgch_use_columnar_deform;
+    s.cur_simple = cur_simple;
+    s.complex_tup = complex_tup;
+    s.fallback_tup = fallback_tup;
 
     /* Match a stock seqscan: BAS_BULKREAD keeps a large scan from evicting the
      * shared-buffer working set. */
@@ -593,8 +635,9 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     {
         Buffer buf;
         Page   page;
-        int    n;
-        int    k;
+        int    done;
+        int    j;
+        int    r;
 
         CHECK_FOR_INTERRUPTS();
 
@@ -602,71 +645,71 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buf);
 
+        /* Splice visible tuples into the A/B/C buckets (under the share lock). */
+        s.na = s.nb = s.nc = 0;
         if (PageIsAllVisible(page) && !snapshot->takenDuringRecovery)
-            n = pgch_collect_all_visible(page, vis);
+            pgch_collect_all_visible(page, &s);
         else
-            n = pgch_collect_with_visibility(rel, buf, blk, page, snapshot, vis);
+            pgch_collect_with_visibility(rel, buf, blk, page, snapshot, &s);
 
         /* Visibility decisions (and any hint-bit writes by the fallback) are
          * done; drop the lock and deform the visible tuples under the pin. */
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
-        if (pgch_use_columnar_deform)
+        /* Group A: NULL-free tuples, column-major C++ driver. (Emitting A then
+         * B then C reorders within the page, which is fine: the offload feeds
+         * order-independent aggregates; the oracle compares results.) */
+        for (done = 0; done < s.na; )
         {
-            int na = 0;
-            int nb = 0;
-            int j;
+            size_t dst = pgch_columnizer_cur_row(cz);
+            size_t avail = pgch_columnizer_block_avail(cz);
+            int    navail = (int) Min((size_t) (s.na - done), avail);
 
-            /* Splice the visible tuples: NULL-free + full-natts -> group A
-             * (column-major SoA); everything else -> group B (row-major). The
-             * tuple header read here is hot (the deform reads it next). */
-            for (k = 0; k < n; k++)
-            {
-                ItemId          lp = PageGetItemId(page, vis[k]);
-                HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(page, lp);
-
-                if (!(htup->t_infomask & HEAP_HASNULL) &&
-                    HeapTupleHeaderGetNatts(htup) >= max_attno)
-                    cur_simple[na++] = (char *) htup + htup->t_hoff;
-                else
-                    complex_off[nb++] = vis[k];
-            }
-
-            /* Group A: column-major. (Emits before B -> reorders within the
-             * page, which is fine: the offload feeds order-independent
-             * aggregates and the oracle compares results, not block layout.) */
-            if (na > 0)
-                pgch_deform_simple_columnar(cz, cols, &plan, col_of, cur_simple, na);
-
-            /* Group B: the unchanged row-major path (handles NULLs / short). */
-            for (j = 0; j < nb; j++)
-            {
-                ItemId          lp = PageGetItemId(page, complex_off[j]);
-                HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(page, lp);
-
-                pgch_deform_needed((const HeapTupleHeaderData *) htup, &plan, values, isnull);
-                pgch_columnizer_add_row(cz, values, isnull);
-            }
+            pgch_columnar_deform_simple(&desc, cur_simple + done, (size_t) navail,
+                                        dst, cz, pgch_str_fill_cb);
+            pgch_columnizer_advance(cz, (size_t) navail);
+            done += navail;
         }
-        else
-        {
-            for (k = 0; k < n; k++)
-            {
-                ItemId          lp = PageGetItemId(page, vis[k]);
-                HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(page, lp);
 
-                pgch_deform_needed((const HeapTupleHeaderData *) htup, &plan, values, isnull);
-                pgch_columnizer_add_row(cz, values, isnull);
+        /* Group B: tuples with NULLs, NULL-aware column-major C++ driver. cur_simple
+         * is reused as the per-sub-batch cursor scratch (group A is done). */
+        for (done = 0; done < s.nb; )
+        {
+            size_t dst = pgch_columnizer_cur_row(cz);
+            size_t avail = pgch_columnizer_block_avail(cz);
+            int    navail = (int) Min((size_t) (s.nb - done), avail);
+
+            for (r = 0; r < navail; r++)
+            {
+                HeapTupleHeader h = complex_tup[done + r];
+
+                cur_simple[r] = (char *) h + h->t_hoff;
+                bits[r] = (const bits8 *) ((char *) h + SizeofHeapTupleHeader);
             }
+            pgch_columnar_deform_nullable(&desc, cur_simple, bits, (size_t) navail,
+                                          dst, cz, pgch_str_fill_cb);
+            pgch_columnizer_advance(cz, (size_t) navail);
+            done += navail;
+        }
+
+        /* Group C: short/missing-attr tuples (and everything when the GUC is
+         * off) via the proven row-major path. */
+        for (j = 0; j < s.nc; j++)
+        {
+            pgch_deform_needed((const HeapTupleHeaderData *) fallback_tup[j], &plan,
+                               values, isnull);
+            pgch_columnizer_add_row(cz, values, isnull);
         }
 
         ReleaseBuffer(buf);
     }
 
     FreeAccessStrategy(strategy);
-    pfree(complex_off);
+    pfree(bits);
+    pfree(fallback_tup);
+    pfree(complex_tup);
     pfree(cur_simple);
-    pfree(vis);
+    pfree(col);
     pfree(isnull);
     pfree(values);
     pfree(col_of);
