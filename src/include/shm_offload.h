@@ -37,6 +37,7 @@ extern int   pgch_shm_ring_depth_k;
 extern int   pgch_shm_data_region_mb;
 extern int   pgch_shm_min_rows;
 extern bool  pgch_use_vectorized_reader;
+extern bool  pgch_use_columnar_deform;
 extern bool  pgch_log_stream_stats;
 
 /*
@@ -95,5 +96,20 @@ extern ShmColumnizer *pgch_columnizer_begin(const ShmOffloadColumn *cols, int nc
 extern void pgch_columnizer_add_row(ShmColumnizer *cz,
                                     const Datum *values, const bool *isnulls);
 extern uint64 pgch_columnizer_finish(ShmColumnizer *cz);
+
+/*
+ * Column-major (struct-of-arrays) batch fill: fill projected column `col` for
+ * rows [dst_row, dst_row+nrows) from per-row source cursors, then call
+ * pgch_columnizer_advance(nrows) once after every column is filled. Output is
+ * byte-identical to pgch_columnizer_add_row. block_avail reports how many rows
+ * fit before the next flush (split larger batches on this boundary).
+ */
+extern size_t pgch_columnizer_block_avail(const ShmColumnizer *cz);
+extern size_t pgch_columnizer_cur_row(const ShmColumnizer *cz);
+extern void pgch_columnizer_fill_fixed(ShmColumnizer *cz, int col, size_t dst_row,
+                                       char *const *cur, uint32 disp, size_t nrows);
+extern void pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
+                                        char *const *cur, size_t nrows);
+extern void pgch_columnizer_advance(ShmColumnizer *cz, size_t nrows);
 
 #endif /* PG_CLICKHOUSE_SHM_OFFLOAD_H */

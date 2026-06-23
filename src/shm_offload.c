@@ -54,6 +54,7 @@ int   pgch_shm_ring_depth_k = 4;
 int   pgch_shm_data_region_mb = 64;
 int   pgch_shm_min_rows = 100000;
 bool  pgch_use_vectorized_reader = true;
+bool  pgch_use_columnar_deform = true;
 bool  pgch_log_stream_stats = false;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
@@ -487,6 +488,130 @@ pgch_columnizer_finish(ShmColumnizer *cz)
 }
 
 /* --------------------------------------------------------------------- */
+/* Columnizer batch fill API (column-major / struct-of-arrays deform) */
+/* --------------------------------------------------------------------- */
+/*
+ * These let a reader fill the per-column staging buffers column-at-a-time for a
+ * batch of rows: fill every projected column for rows [dst_row, dst_row+nrows)
+ * via the type-specialized kernels below (wire type dispatched once, not per
+ * row), then call pgch_columnizer_advance(nrows) once to move the shared
+ * in_block counter and flush a full block. The produced bytes are identical to
+ * pgch_columnizer_add_row -- the per-wire encoding here mirrors write_fixed_value
+ * and the string path exactly. Caller guarantees dst_row + nrows <=
+ * rows_per_block (split a larger batch with pgch_columnizer_block_avail).
+ *
+ * `cur[r]` points at the source value for row r: for a fixed-prefix column at a
+ * constant displacement, pass the tuple-data cursor with `disp` = that offset;
+ * for a tail column, pass the per-row cursor already positioned at the value
+ * with `disp` = 0.
+ */
+
+size_t
+pgch_columnizer_block_avail(const ShmColumnizer *cz)
+{
+    return cz->rows_per_block - cz->in_block;
+}
+
+size_t
+pgch_columnizer_cur_row(const ShmColumnizer *cz)
+{
+    return cz->in_block;
+}
+
+void
+pgch_columnizer_advance(ShmColumnizer *cz, size_t nrows)
+{
+    cz->in_block += nrows;
+    if (cz->in_block == cz->rows_per_block)
+        columnizer_publish_block(cz);
+}
+
+void
+pgch_columnizer_fill_fixed(ShmColumnizer *cz, int col, size_t dst_row,
+                           char *const *restrict cur, uint32 disp, size_t nrows)
+{
+    ColBuf *cb = &cz->bufs[col];
+    size_t  r;
+
+    /* Dispatch on wire type ONCE; each branch is a tight type-monomorphic loop
+     * the compiler can autovectorize the store side of. Loads are gathers from
+     * the per-row cursors (scalar on NEON). Byte-identical to write_fixed_value. */
+    switch (cz->cols[col].wire)
+    {
+        case SHM_WIRE_UINT8:
+        {
+            uint8_t *restrict o = (uint8_t *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = (*(const char *) (cur[r] + disp)) ? 1 : 0;
+            break;
+        }
+        case SHM_WIRE_INT16:
+        {
+            int16 *restrict o = (int16 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = *(const int16 *) (cur[r] + disp);
+            break;
+        }
+        case SHM_WIRE_INT32:
+        {
+            int32 *restrict o = (int32 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = *(const int32 *) (cur[r] + disp);
+            break;
+        }
+        case SHM_WIRE_INT64:
+        {
+            int64 *restrict o = (int64 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = *(const int64 *) (cur[r] + disp);
+            break;
+        }
+        case SHM_WIRE_FLOAT32:
+        {
+            float4 *restrict o = (float4 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = *(const float4 *) (cur[r] + disp);
+            break;
+        }
+        case SHM_WIRE_FLOAT64:
+        {
+            float8 *restrict o = (float8 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = *(const float8 *) (cur[r] + disp);
+            break;
+        }
+        case SHM_WIRE_DATE:
+        {
+            /* Rebase PostgreSQL 2000-epoch days to ClickHouse 1970-epoch days. */
+            uint16 *restrict o = (uint16 *) cb->fixed;
+            for (r = 0; r < nrows; r++)
+                o[dst_row + r] = (uint16) (*(const int32 *) (cur[r] + disp) + PGCH_DATE_EPOCH_DIFF);
+            break;
+        }
+        default:
+            ereport(ERROR,
+                    (errmsg("pg_clickhouse: column '%s' has no columnar fixed writer for wire tag %d",
+                            cz->cols[col].name, (int) cz->cols[col].wire)));
+    }
+}
+
+void
+pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
+                            char *const *restrict cur, size_t nrows)
+{
+    ColBuf *cb = &cz->bufs[col];
+    size_t  r;
+
+    for (r = 0; r < nrows; r++)
+    {
+        text *t = DatumGetTextP(PointerGetDatum(cur[r]));   /* detoasts */
+
+        appendBinaryStringInfo(&cb->chars, VARDATA(t), VARSIZE(t) - VARHDRSZ);
+        cb->offsets[dst_row + r] = (uint64_t) cb->chars.len;
+    }
+}
+
+/* --------------------------------------------------------------------- */
 /* Heap-scan readers */
 /* --------------------------------------------------------------------- */
 
@@ -663,6 +788,12 @@ pgch_shm_offload_init(void)
                              "Use the page-at-a-time vectorized columnar heap reader for SHM "
                              "offload (off forces the tuple-at-a-time table-AM scan).",
                              NULL, &pgch_use_vectorized_reader, true,
+                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_clickhouse.shm_columnar_deform",
+                             "Within the vectorized reader, deform a page's NULL-free tuples "
+                             "column-at-a-time (struct-of-arrays) instead of row-at-a-time.",
+                             NULL, &pgch_use_columnar_deform, true,
                              PGC_USERSET, 0, NULL, NULL, NULL);
 
     DefineCustomBoolVariable("pg_clickhouse.shm_log_stream_stats",

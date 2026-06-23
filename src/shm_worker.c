@@ -73,6 +73,7 @@ typedef struct ShmWorkerHeader
     Size        data_region_size;
     int         rows_per_block;
     bool        use_vectorized;      /* honor the backend session's shm_vectorized_reader GUC */
+    bool        columnar_deform;     /* honor the backend session's shm_columnar_deform GUC */
     bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
@@ -142,6 +143,7 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     /* Snapshot the session GUCs here (backend side) so the worker, a fresh
      * bgworker that would otherwise see only the defaults, honors them. */
     hdr->use_vectorized = pgch_use_vectorized_reader;
+    hdr->columnar_deform = pgch_use_columnar_deform;
     hdr->log_stream_stats = pgch_log_stream_stats;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
@@ -342,8 +344,9 @@ pgch_shm_worker_main(Datum main_arg)
         pg_atomic_write_u32(&hdr->state, PGCH_WS_READY);
         SetLatch(&hdr->backend_proc->procLatch);
 
-        /* Apply the backend session's vectorized-reader choice in this worker. */
+        /* Apply the backend session's reader choices in this worker. */
         pgch_use_vectorized_reader = hdr->use_vectorized;
+        pgch_use_columnar_deform = hdr->columnar_deform;
 
         /* Stream the relation into the ring (ring backpressure applies; the
          * ClickHouse consumer drains concurrently), then signal end-of-stream.
