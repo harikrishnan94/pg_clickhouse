@@ -39,6 +39,7 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 #include "shm_offload.h"
@@ -46,6 +47,7 @@
 #include "shm_worker.h"
 
 #include <signal.h>
+#include <sys/resource.h>
 
 /* Worker lifecycle state, in the DSM status word (atomic). */
 typedef enum ShmWorkerState
@@ -70,6 +72,8 @@ typedef struct ShmWorkerHeader
     int         ring_depth_k;
     Size        data_region_size;
     int         rows_per_block;
+    bool        use_vectorized;      /* honor the backend session's shm_vectorized_reader GUC */
+    bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     Size        attnos_offset;
@@ -135,6 +139,10 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->ring_depth_k = ring_depth_k;
     hdr->data_region_size = data_region_size;
     hdr->rows_per_block = rows_per_block;
+    /* Snapshot the session GUCs here (backend side) so the worker, a fresh
+     * bgworker that would otherwise see only the defaults, honors them. */
+    hdr->use_vectorized = pgch_use_vectorized_reader;
+    hdr->log_stream_stats = pgch_log_stream_stats;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
     hdr->attnos_offset = hdr_sz;
@@ -334,10 +342,43 @@ pgch_shm_worker_main(Datum main_arg)
         pg_atomic_write_u32(&hdr->state, PGCH_WS_READY);
         SetLatch(&hdr->backend_proc->procLatch);
 
+        /* Apply the backend session's vectorized-reader choice in this worker. */
+        pgch_use_vectorized_reader = hdr->use_vectorized;
+
         /* Stream the relation into the ring (ring backpressure applies; the
-         * ClickHouse consumer drains concurrently), then signal end-of-stream. */
-        (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                           producer, (size_t) hdr->rows_per_block);
+         * ClickHouse consumer drains concurrently), then signal end-of-stream.
+         * Optionally measure the producer in isolation: CPU time excludes the
+         * ring-backpressure wait (pg_usleep), so it is the pure scan + visibility
+         * + deform + columnize cost independent of consumer speed. */
+        if (hdr->log_stream_stats)
+        {
+            struct rusage r0, r1;
+            TimestampTz    w0, w1;
+            uint64         rows;
+            double         cpu_ms, wall_ms;
+
+            getrusage(RUSAGE_SELF, &r0);
+            w0 = GetCurrentTimestamp();
+            rows = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
+                                               producer, (size_t) hdr->rows_per_block);
+            w1 = GetCurrentTimestamp();
+            getrusage(RUSAGE_SELF, &r1);
+
+            cpu_ms = (r1.ru_utime.tv_sec - r0.ru_utime.tv_sec) * 1000.0
+                   + (r1.ru_utime.tv_usec - r0.ru_utime.tv_usec) / 1000.0
+                   + (r1.ru_stime.tv_sec - r0.ru_stime.tv_sec) * 1000.0
+                   + (r1.ru_stime.tv_usec - r0.ru_stime.tv_usec) / 1000.0;
+            wall_ms = (double) (w1 - w0) / 1000.0;
+
+            elog(LOG,
+                 "pg_clickhouse shm stream: reader=%s rows=" UINT64_FORMAT
+                 " wall=%.1fms cpu=%.1fms producer_throughput=%.2f Mrows/s(cpu)",
+                 hdr->use_vectorized ? "vectorized" : "scalar", rows, wall_ms, cpu_ms,
+                 cpu_ms > 0 ? (double) rows / cpu_ms / 1000.0 : 0.0);
+        }
+        else
+            (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
+                                               producer, (size_t) hdr->rows_per_block);
 
         /* Producer-outlives-consumer: wait for every retained block to release,
          * then unlink the SHM object + socket. */

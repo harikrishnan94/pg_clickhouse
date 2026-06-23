@@ -36,6 +36,8 @@ extern char *pgch_local_ch_server;
 extern int   pgch_shm_ring_depth_k;
 extern int   pgch_shm_data_region_mb;
 extern int   pgch_shm_min_rows;
+extern bool  pgch_use_vectorized_reader;
+extern bool  pgch_log_stream_stats;
 
 /*
  * One projected column to stream. `attno` is the 1-based heap attribute number;
@@ -77,5 +79,21 @@ extern char *pgch_build_shm_schema_string(const ShmOffloadColumn *cols, int ncol
 extern uint64 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                                           const ShmOffloadColumn *cols, int ncols,
                                           ShmProducer *producer, size_t rows_per_block);
+
+/*
+ * Per-stream columnizer shared by the scalar and vectorized heap readers. A
+ * reader calls pgch_columnizer_begin, then pgch_columnizer_add_row once per
+ * snapshot-visible row (with `values`/`isnulls` indexed by attno-1, covering at
+ * least every projected attno), then pgch_columnizer_finish to flush the
+ * trailing block and signal end-of-stream. Output SHM blocks are identical
+ * regardless of which reader fed it.
+ */
+typedef struct ShmColumnizer ShmColumnizer;
+
+extern ShmColumnizer *pgch_columnizer_begin(const ShmOffloadColumn *cols, int ncols,
+                                            ShmProducer *producer, size_t rows_per_block);
+extern void pgch_columnizer_add_row(ShmColumnizer *cz,
+                                    const Datum *values, const bool *isnulls);
+extern uint64 pgch_columnizer_finish(ShmColumnizer *cz);
 
 #endif /* PG_CLICKHOUSE_SHM_OFFLOAD_H */

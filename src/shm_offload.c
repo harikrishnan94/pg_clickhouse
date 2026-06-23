@@ -38,6 +38,7 @@
 #include "utils/snapmgr.h"
 
 #include "shm_offload.h"
+#include "shm_page_reader.h"
 #include "shm_producer.h"
 
 #include <stdint.h>
@@ -52,6 +53,8 @@ char *pgch_local_ch_server = NULL;
 int   pgch_shm_ring_depth_k = 4;
 int   pgch_shm_data_region_mb = 64;
 int   pgch_shm_min_rows = 100000;
+bool  pgch_use_vectorized_reader = true;
+bool  pgch_log_stream_stats = false;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -332,48 +335,176 @@ write_fixed_value(ColBuf *cb, const ShmOffloadColumn *col, size_t row, Datum d)
     }
 }
 
-uint64
-pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
-                            const ShmOffloadColumn *cols, int ncols,
-                            ShmProducer *producer, size_t rows_per_block)
+/* --------------------------------------------------------------------- */
+/* Columnizer state (shared by the scalar and vectorized readers) */
+/* --------------------------------------------------------------------- */
+
+/*
+ * Per-stream columnizer: owns the per-block staging buffers, the assembled
+ * payload array, the block memory context, and the running counters. Both the
+ * scalar (table-AM) reader and the vectorized page reader feed it one
+ * already-deformed row at a time via pgch_columnizer_add_row, so the published
+ * SHM blocks are byte-identical regardless of how the rows were produced.
+ */
+struct ShmColumnizer
 {
-    TableScanDesc scan;
-    TupleTableSlot *slot;
-    MemoryContext block_cxt;
-    MemoryContext old;
-    ColBuf *bufs;
-    ShmColumnPayload *payloads;
-    size_t in_block = 0;
-    uint64 total = 0;
-    int c;
+    const ShmOffloadColumn *cols;
+    int                     ncols;
+    ShmProducer            *producer;
+    size_t                  rows_per_block;
+    MemoryContext           block_cxt;
+    ColBuf                 *bufs;
+    ShmColumnPayload       *payloads;
+    size_t                  in_block;
+    uint64                  total;
+};
+
+ShmColumnizer *
+pgch_columnizer_begin(const ShmOffloadColumn *cols, int ncols,
+                      ShmProducer *producer, size_t rows_per_block)
+{
+    ShmColumnizer *cz;
+    MemoryContext  old;
+    int            c;
 
     if (rows_per_block == 0 || rows_per_block > (1u << 20))
         rows_per_block = 65536;
 
-    block_cxt = AllocSetContextCreate(CurrentMemoryContext,
-                                      "pg_clickhouse shm block",
-                                      ALLOCSET_DEFAULT_SIZES);
-
-    payloads = palloc0(sizeof(ShmColumnPayload) * ncols);
-    bufs = palloc0(sizeof(ColBuf) * ncols);
+    cz = palloc0(sizeof(ShmColumnizer));
+    cz->cols = cols;
+    cz->ncols = ncols;
+    cz->producer = producer;
+    cz->rows_per_block = rows_per_block;
+    cz->in_block = 0;
+    cz->total = 0;
+    cz->block_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                          "pg_clickhouse shm block",
+                                          ALLOCSET_DEFAULT_SIZES);
+    cz->payloads = palloc0(sizeof(ShmColumnPayload) * ncols);
+    cz->bufs = palloc0(sizeof(ColBuf) * ncols);
 
     /* Allocate per-column staging in the block context (reset per block). */
-    old = MemoryContextSwitchTo(block_cxt);
+    old = MemoryContextSwitchTo(cz->block_cxt);
     for (c = 0; c < ncols; c++)
     {
-        bufs[c].is_string = (cols[c].wire == SHM_WIRE_STRING);
-        if (bufs[c].is_string)
+        cz->bufs[c].is_string = (cols[c].wire == SHM_WIRE_STRING);
+        if (cz->bufs[c].is_string)
         {
-            initStringInfo(&bufs[c].chars);
-            bufs[c].offsets = palloc(sizeof(uint64_t) * rows_per_block);
+            initStringInfo(&cz->bufs[c].chars);
+            cz->bufs[c].offsets = palloc(sizeof(uint64_t) * rows_per_block);
         }
         else
         {
-            bufs[c].elem = shm_wire_fixed_width_size(cols[c].wire);
-            bufs[c].fixed = palloc(bufs[c].elem * rows_per_block);
+            cz->bufs[c].elem = shm_wire_fixed_width_size(cols[c].wire);
+            cz->bufs[c].fixed = palloc(cz->bufs[c].elem * rows_per_block);
         }
     }
     MemoryContextSwitchTo(old);
+
+    return cz;
+}
+
+/* Assemble payloads from the staged block, publish it, and reset for the next. */
+static void
+columnizer_publish_block(ShmColumnizer *cz)
+{
+    int c;
+
+    for (c = 0; c < cz->ncols; c++)
+    {
+        if (cz->bufs[c].is_string)
+        {
+            cz->payloads[c].value_buf = cz->bufs[c].chars.data;
+            cz->payloads[c].value_len = (size_t) cz->bufs[c].chars.len;
+            cz->payloads[c].offsets_buf = cz->bufs[c].offsets;
+            cz->payloads[c].offsets_count = cz->in_block;
+        }
+        else
+        {
+            cz->payloads[c].value_buf = cz->bufs[c].fixed;
+            cz->payloads[c].value_len = cz->bufs[c].elem * cz->in_block;
+            cz->payloads[c].offsets_buf = NULL;
+            cz->payloads[c].offsets_count = 0;
+        }
+    }
+    shm_producer_publish(cz->producer, cz->payloads, cz->ncols, cz->in_block);
+    cz->total += cz->in_block;
+    cz->in_block = 0;
+    /* Reset string accumulators (fixed buffers are overwritten in place). */
+    for (c = 0; c < cz->ncols; c++)
+        if (cz->bufs[c].is_string)
+            resetStringInfo(&cz->bufs[c].chars);
+}
+
+void
+pgch_columnizer_add_row(ShmColumnizer *cz, const Datum *values, const bool *isnulls)
+{
+    int c;
+
+    for (c = 0; c < cz->ncols; c++)
+    {
+        int   attidx = cz->cols[c].attno - 1;
+        Datum d = values[attidx];
+
+        if (isnulls[attidx])
+            ereport(ERROR,
+                    (errmsg("pg_clickhouse: NULL in column '%s' is not supported by the "
+                            "phase-1 streamed_table() offload", cz->cols[c].name)));
+
+        if (cz->bufs[c].is_string)
+        {
+            text *t = DatumGetTextP(d);     /* detoasts */
+            appendBinaryStringInfo(&cz->bufs[c].chars, VARDATA(t), VARSIZE(t) - VARHDRSZ);
+            cz->bufs[c].offsets[cz->in_block] = (uint64_t) cz->bufs[c].chars.len;
+        }
+        else
+        {
+            write_fixed_value(&cz->bufs[c], &cz->cols[c], cz->in_block, d);
+        }
+    }
+
+    if (++cz->in_block == cz->rows_per_block)
+        columnizer_publish_block(cz);
+}
+
+uint64
+pgch_columnizer_finish(ShmColumnizer *cz)
+{
+    uint64 total;
+
+    /* Flush the trailing partial block, then signal end-of-stream. */
+    if (cz->in_block > 0)
+        columnizer_publish_block(cz);
+
+    shm_producer_signal_eos(cz->producer);
+
+    total = cz->total;
+    MemoryContextDelete(cz->block_cxt);
+    pfree(cz->bufs);
+    pfree(cz->payloads);
+    pfree(cz);
+    return total;
+}
+
+/* --------------------------------------------------------------------- */
+/* Heap-scan readers */
+/* --------------------------------------------------------------------- */
+
+/*
+ * Scalar (tuple-at-a-time) reader: the original table-AM scan path. Retained as
+ * the permanent fail-closed fallback for the vectorized reader and as the
+ * correctness reference for the on==off offload oracle.
+ */
+static uint64
+pgch_stream_relation_scalar(Relation rel, Snapshot snapshot,
+                            const ShmOffloadColumn *cols, int ncols,
+                            ShmProducer *producer, size_t rows_per_block)
+{
+    ShmColumnizer  *cz;
+    TableScanDesc   scan;
+    TupleTableSlot *slot;
+
+    cz = pgch_columnizer_begin(cols, ncols, producer, rows_per_block);
 
     slot = table_slot_create(rel, NULL);
     scan = table_beginscan(rel, snapshot, 0, NULL);
@@ -382,88 +513,32 @@ pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
     {
         CHECK_FOR_INTERRUPTS();
         slot_getallattrs(slot);
-
-        for (c = 0; c < ncols; c++)
-        {
-            int attidx = cols[c].attno - 1;
-            Datum d = slot->tts_values[attidx];
-
-            if (slot->tts_isnull[attidx])
-                ereport(ERROR,
-                        (errmsg("pg_clickhouse: NULL in column '%s' is not supported by the "
-                                "phase-1 streamed_table() offload", cols[c].name)));
-
-            if (bufs[c].is_string)
-            {
-                text *t = DatumGetTextP(d);     /* detoasts */
-                appendBinaryStringInfo(&bufs[c].chars, VARDATA(t), VARSIZE(t) - VARHDRSZ);
-                bufs[c].offsets[in_block] = (uint64_t) bufs[c].chars.len;
-            }
-            else
-            {
-                write_fixed_value(&bufs[c], &cols[c], in_block, d);
-            }
-        }
-
-        if (++in_block == rows_per_block)
-        {
-            for (c = 0; c < ncols; c++)
-            {
-                if (bufs[c].is_string)
-                {
-                    payloads[c].value_buf = bufs[c].chars.data;
-                    payloads[c].value_len = (size_t) bufs[c].chars.len;
-                    payloads[c].offsets_buf = bufs[c].offsets;
-                    payloads[c].offsets_count = in_block;
-                }
-                else
-                {
-                    payloads[c].value_buf = bufs[c].fixed;
-                    payloads[c].value_len = bufs[c].elem * in_block;
-                    payloads[c].offsets_buf = NULL;
-                    payloads[c].offsets_count = 0;
-                }
-            }
-            shm_producer_publish(producer, payloads, ncols, in_block);
-            total += in_block;
-            in_block = 0;
-            /* Reset string accumulators (fixed buffers are overwritten in place). */
-            for (c = 0; c < ncols; c++)
-                if (bufs[c].is_string)
-                    resetStringInfo(&bufs[c].chars);
-        }
+        pgch_columnizer_add_row(cz, slot->tts_values, slot->tts_isnull);
     }
-
-    /* Flush the trailing partial block. */
-    if (in_block > 0)
-    {
-        for (c = 0; c < ncols; c++)
-        {
-            if (bufs[c].is_string)
-            {
-                payloads[c].value_buf = bufs[c].chars.data;
-                payloads[c].value_len = (size_t) bufs[c].chars.len;
-                payloads[c].offsets_buf = bufs[c].offsets;
-                payloads[c].offsets_count = in_block;
-            }
-            else
-            {
-                payloads[c].value_buf = bufs[c].fixed;
-                payloads[c].value_len = bufs[c].elem * in_block;
-                payloads[c].offsets_buf = NULL;
-                payloads[c].offsets_count = 0;
-            }
-        }
-        shm_producer_publish(producer, payloads, ncols, in_block);
-        total += in_block;
-    }
-
-    shm_producer_signal_eos(producer);
 
     table_endscan(scan);
     ExecDropSingleTupleTableSlot(slot);
-    MemoryContextDelete(block_cxt);
-    return total;
+
+    return pgch_columnizer_finish(cz);
+}
+
+/*
+ * Dispatcher: use the vectorized page reader when enabled and the relation /
+ * snapshot / projection are eligible; otherwise the scalar path. The choice is
+ * made once, before any block is published, so a stream never mixes the two.
+ */
+uint64
+pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
+                            const ShmOffloadColumn *cols, int ncols,
+                            ShmProducer *producer, size_t rows_per_block)
+{
+    if (pgch_use_vectorized_reader &&
+        pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
+        return pgch_stream_relation_vectorized(rel, snapshot, cols, ncols,
+                                               producer, rows_per_block);
+
+    return pgch_stream_relation_scalar(rel, snapshot, cols, ncols,
+                                       producer, rows_per_block);
 }
 
 /* --------------------------------------------------------------------- */
@@ -583,6 +658,18 @@ pgch_shm_offload_init(void)
                             "Minimum estimated row count for a scan to be eligible for SHM offload.",
                             NULL, &pgch_shm_min_rows, 100000, 0, INT_MAX,
                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_clickhouse.shm_vectorized_reader",
+                             "Use the page-at-a-time vectorized columnar heap reader for SHM "
+                             "offload (off forces the tuple-at-a-time table-AM scan).",
+                             NULL, &pgch_use_vectorized_reader, true,
+                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_clickhouse.shm_log_stream_stats",
+                             "Log the SHM producer's rows, wall time, and CPU time (LOG level) "
+                             "after each streamed relation, for benchmarking the heap reader.",
+                             NULL, &pgch_log_stream_stats, false,
+                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
      * last_query_used_clickhouse observability GUC. */
