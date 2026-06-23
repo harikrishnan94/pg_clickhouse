@@ -370,7 +370,6 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
      * Non-numeric outputs (count, integer/float aggregates, and HAVING-only
      * decimal comparisons that return a bool) are unaffected and still push down.
      */
-    if (false)  /* TEMP repro: decline disabled to expose agg-pushdown bug */
     {
         ListCell *lc;
 
@@ -403,6 +402,54 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 /* --------------------------------------------------------------------- */
 /* Planner: build the CustomScan plan node */
 /* --------------------------------------------------------------------- */
+
+/*
+ * Build the custom_scan_tlist for a base SHM-offload scan.
+ *
+ * A base scan streams only the projected columns, not the whole heap row, so
+ * the scan tuple must be described by an explicit target list rather than the
+ * heap relation's descriptor. Relying on the relation descriptor (scanrelid > 0,
+ * custom_scan_tlist == NIL) leaves un-projected columns as phantom NULLs in the
+ * formed heap tuple; because such a column may be declared NOT NULL, JIT-compiled
+ * tuple deforming (slot_compile_deform) treats it as guaranteed-present and skips
+ * its null-bitmap check, then reads every following column at the wrong offset --
+ * silently corrupting results (the interpreted deform path reads the bitmap and is
+ * unaffected, so the bug only appears once JIT kicks in above its cost threshold).
+ *
+ * ExecTypeFromTL() builds the scan tuple descriptor from this list with attnotnull
+ * cleared, so deforming is always correct. The Vars carry varno = scanrelid so
+ * setrefs.c maps the plan's targetlist/qual onto the scan tuple via INDEX_VAR.
+ *
+ * On entry *retrieved_attrs lists the heap attnos in the order the deparsed SELECT
+ * fetches them; we emit one Var per fetched column in that order and rewrite
+ * *retrieved_attrs to the matching 1-based positions in the new descriptor.
+ */
+static List *
+shm_build_base_scan_tlist(Oid heap_relid, Index scanrelid, List **retrieved_attrs)
+{
+    List *tlist = NIL;
+    List *seq = NIL;
+    Relation heap_rel = table_open(heap_relid, NoLock); /* planner already holds a lock */
+    TupleDesc tupdesc = RelationGetDescr(heap_rel);
+    ListCell *lc;
+    int pos = 0;
+
+    foreach (lc, *retrieved_attrs)
+    {
+        AttrNumber attno = (AttrNumber) lfirst_int(lc);
+        Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+        Var *var = makeVar(scanrelid, attno, att->atttypid, att->atttypmod,
+                           att->attcollation, 0);
+
+        pos++;
+        tlist = lappend(tlist, makeTargetEntry((Expr *) var, pos, NULL, false));
+        seq = lappend_int(seq, pos);
+    }
+    table_close(heap_rel, NoLock);
+
+    *retrieved_attrs = seq;
+    return tlist;
+}
 
 static Plan *
 shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -455,6 +502,17 @@ shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
     chfdw_deparse_select_stmt_for_rel(&sql, root, rel, fdw_scan_tlist, remote_exprs, NIL,
                                       false, false, false,
                                       &retrieved_attrs, &params_list);
+
+    /*
+     * Base scan: describe the projected scan tuple with an explicit
+     * custom_scan_tlist (see shm_build_base_scan_tlist) so the scan tuple
+     * descriptor has no NOT NULL flags on un-streamed columns, which would
+     * otherwise make JIT tuple deforming misread the row. The upper/aggregate
+     * path already supplies its grouped tlist above.
+     */
+    if (!IS_UPPER_REL(rel))
+        fdw_scan_tlist = shm_build_base_scan_tlist(fpinfo->heap_relid, scan_relid,
+                                                   &retrieved_attrs);
 
     cscan->scan.plan.targetlist = tlist;
     cscan->scan.plan.qual = local_exprs;
