@@ -415,6 +415,19 @@ pgch_build_deform_plans(const PgchDeformDesc *desc,
                         PgchStep *step_a, PgchHop *hop_a, PgchDeformPlan *plan_a,
                         PgchStep *step_b, PgchHop *hop_b, PgchDeformPlan *plan_b)
 {
+    /*
+     * Load-bearing invariant: the FILL kernels never consult the NULL bitmap for
+     * projected columns, because the planner gate (shm_customscan.c declines any
+     * query that references a nullable column) guarantees every projected column
+     * is NOT NULL. The columnar path therefore has no per-row fail-closed check
+     * (unlike the row-major columnizer). If phase-2 ever admits NULL projections,
+     * the FILL kernels must gain a NULL check before this assert is relaxed.
+     */
+#ifdef USE_ASSERT_CHECKING
+    for (int i = 0; i < desc->max_attno; ++i)
+        Assert(!(desc->col[i].is_needed && desc->col[i].nullable));
+#endif
+
     build_plan(desc, desc->prefix_len_a, desc->walk_start_off_a, /*nullable=*/false,
                step_a, hop_a, plan_a);
     build_plan(desc, desc->prefix_len_b, desc->walk_start_off_b, /*nullable=*/true,
