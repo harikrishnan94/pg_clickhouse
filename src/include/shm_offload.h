@@ -15,11 +15,26 @@
 #include "postgres.h"
 
 #include "nodes/pg_list.h"
+#include "port/atomics.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
 #include "shm_producer.h"
 #include "shm_visibility.h"     /* PgchVisStats */
+
+/*
+ * Shared, cross-process heap-block work allocator for the parallel vectorized
+ * reader. Lives in the streaming workers' shared DSM. Each worker atomically
+ * claims the next chunk of blocks (next_block fetch-add) so the W workers cover
+ * blocks [0, nblocks) exactly once, with no gaps or overlap, under one shared
+ * snapshot -- the same exactly-once guarantee a parallel seq scan provides.
+ *
+ * Pass NULL to the reader for the single-threaded path: it then scans the whole
+ * relation [0, nblocks) sequentially, byte-identical to the original loop.
+ */
+typedef struct ShmBlockCursor {
+    pg_atomic_uint32 next_block;    /* next unclaimed heap block number */
+} ShmBlockCursor;
 
 /* Registers the pg_clickhouse.* SHM-offload GUCs. Called from the extension's
  * _PG_init (option.c) before MarkGUCPrefixReserved. */
@@ -84,19 +99,25 @@ extern char *pgch_build_shm_schema_string(const ShmOffloadColumn *cols, int ncol
  *
  * If `out_stats` is non-NULL it is filled with the visibility-path counters
  * (zeroed for the scalar table-AM reader, which does no page-level classify).
+ *
+ * `bcursor` is the shared cross-process block allocator for the parallel
+ * vectorized reader; pass NULL for a single-threaded whole-relation scan. The
+ * end-of-stream marker is NOT published here -- the caller signals it (once,
+ * after all cooperating workers finish) via shm_producer_signal_eos.
  */
 extern uint64 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                                           const ShmOffloadColumn *cols, int ncols,
                                           ShmProducer *producer, size_t rows_per_block,
-                                          PgchVisStats *out_stats);
+                                          ShmBlockCursor *bcursor, PgchVisStats *out_stats);
 
 /*
  * Per-stream columnizer shared by the scalar and vectorized heap readers. A
  * reader calls pgch_columnizer_begin, then pgch_columnizer_add_row once per
  * snapshot-visible row (with `values`/`isnulls` indexed by attno-1, covering at
  * least every projected attno), then pgch_columnizer_finish to flush the
- * trailing block and signal end-of-stream. Output SHM blocks are identical
- * regardless of which reader fed it.
+ * trailing block. Output SHM blocks are identical regardless of which reader fed
+ * it. End-of-stream is published separately by the caller (shm_producer_signal_eos),
+ * once, after all cooperating producers have finished.
  */
 typedef struct ShmColumnizer ShmColumnizer;
 

@@ -118,8 +118,14 @@ struct ShmProducer {
     size_t      per_slot_capacity;
     size_t      per_slot_payload_offset;
 
-    uint64_t   *next_sequence;   /* per slot */
-    uint32_t    next_slot;
+    /*
+     * Cross-process publish coordination (slot-claim cursor + global block
+     * sequence). Points at `private_coord` for a single-producer ring, or at a
+     * shared DSM-resident coord when W workers cooperate on one ring.
+     */
+    ShmPublishCoord *coord;
+    ShmPublishCoord  private_coord;
+    bool        is_owner;        /* owns the SHM object + control socket + pump */
     bool        eos_published;
     bool        cleaned;
 
@@ -345,10 +351,17 @@ producer_cleanup(ShmProducer *p)
         p->mapping = NULL;
     }
     if (p->shm_fd >= 0) { close(p->shm_fd); p->shm_fd = -1; }
-    if (p->shm_name)
-        shm_unlink(p->shm_name);
-    if (p->socket_path)
-        unlink(p->socket_path);
+    /* Only the owner unlinks the SHM object + control socket; a secondary
+     * (attached) producer just drops its own mapping/fds. shm_unlink removes the
+     * name only -- any still-mapped peer keeps a valid view -- so owner teardown
+     * never crashes a lingering secondary writer. */
+    if (p->is_owner)
+    {
+        if (p->shm_name)
+            shm_unlink(p->shm_name);
+        if (p->socket_path)
+            unlink(p->socket_path);
+    }
 }
 
 static void
@@ -361,7 +374,7 @@ ShmProducer *
 shm_producer_create(const char *name,
                     const ShmColumnSchema *schema, int n_columns,
                     uint32_t ring_depth_k, size_t data_region_size,
-                    MemoryContext owner_cxt)
+                    ShmPublishCoord *coord, MemoryContext owner_cxt)
 {
     MemoryContext old = MemoryContextSwitchTo(owner_cxt);
     ShmProducer *p = palloc0(sizeof(ShmProducer));
@@ -375,6 +388,17 @@ shm_producer_create(const char *name,
     p->shm_fd = p->event_fd = p->listen_fd = -1;
     p->mapping = NULL;
     p->owner_cxt = owner_cxt;
+    p->is_owner = true;
+    /* Single-producer ring: a private coord (uncontended). A shared ring passes
+     * a DSM-resident coord so all W cooperating producers share the cursor. */
+    if (coord == NULL)
+    {
+        pg_atomic_init_u64(&p->private_coord.next_slot, 0);
+        pg_atomic_init_u64(&p->private_coord.global_seq, 0);
+        p->coord = &p->private_coord;
+    }
+    else
+        p->coord = coord;
 
     if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
         ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
@@ -465,8 +489,6 @@ shm_producer_create(const char *name,
     if (p->per_slot_capacity < SHM_PADDING_FOR_SIMD * 4)
         ereport(ERROR, (errmsg("pg_clickhouse: shm data region too small for %u slots", ring_depth_k)));
     p->per_slot_payload_offset = align_up((size_t) n_columns * sizeof(ShmColumnDescriptor), 64);
-    p->next_sequence = palloc0(sizeof(uint64_t) * ring_depth_k);
-    p->next_slot = 0;
 
     for (i = 0; i < (int) ring_depth_k; i++)
         slot_at(p, (uint32_t) i)->slot_index = (uint32_t) i;
@@ -536,7 +558,12 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ereport(ERROR, (errmsg("pg_clickhouse: shm row_count %zu exceeds limit %u",
                                row_count, SHM_IMPL_MAX_ROWS)));
 
-    slot_pos = p->next_slot % p->ring_depth_k;
+    /* Atomically claim the next ring slot. With one producer this is an
+     * uncontended increment; with W cooperating producers the shared DSM coord
+     * hands each a distinct slot index, so per slot there is still exactly one
+     * writer and the EMPTY->WRITING->PUBLISHED state machine below is unchanged. */
+    slot_pos = (uint32_t) (pg_atomic_fetch_add_u64(&p->coord->next_slot, 1)
+                           % p->ring_depth_k);
     slot = slot_at(p, slot_pos);
 
     /* Wait for the slot to be reusable. The consumer drives PUBLISHED->EMPTY on
@@ -632,7 +659,12 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
     slot->per_column_descriptors_offset = slot_data_base;
     slot->row_count = row_count;
     __atomic_store_n(&slot->eos_marker, is_eos ? 1 : 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&slot->sequence, ++p->next_sequence[slot_pos], __ATOMIC_RELAXED);
+    /* Global (not per-slot) sequence: the EOS block, published last, gets the
+     * highest sequence, so the consumer (which drains lowest unconsumed sequence
+     * first) processes it strictly last. Still strictly per-slot monotonic. */
+    __atomic_store_n(&slot->sequence,
+                     pg_atomic_add_fetch_u64(&p->coord->global_seq, 1),
+                     __ATOMIC_RELAXED);
 
     /* WRITING -> PUBLISHED (counter bump before the state store, both release). */
     __atomic_fetch_add(&slot->transition_counter, 1, __ATOMIC_RELEASE);
@@ -644,8 +676,6 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ssize_t w = write(p->event_fd, &one, sizeof(one));
         (void) w;   /* EAGAIN on a full counter is harmless: consumer still polls */
     }
-
-    p->next_slot++;
     return;
 
 overflow:
@@ -679,6 +709,15 @@ shm_producer_destroy(ShmProducer *p)
 
     if (p->cleaned)
         return;
+
+    /* A secondary (attached) producer does not own the consumer relationship and
+     * must not drain or unlink: just drop its own mapping + fds. The owner does
+     * the drain wait below before unlinking. */
+    if (!p->is_owner)
+    {
+        producer_cleanup(p);
+        return;
+    }
 
     /* Producer must outlive every consumer retain. Wait (cooperatively, bounded)
      * until all slots are released (consumer drove them back to EMPTY). Keep

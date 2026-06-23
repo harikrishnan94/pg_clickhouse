@@ -627,11 +627,18 @@ pgch_plan_jit_beneficial(const PgchDeformPlan *p)
     return false;
 }
 
+/*
+ * Heap blocks claimed per atomic fetch-add from the shared parallel cursor.
+ * A small chunk keeps the workers' block ranges balanced while making the
+ * atomic contention negligible relative to per-block scan + deform cost.
+ */
+#define PGCH_PARALLEL_BLOCK_CHUNK 16
+
 uint64
 pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                                 const ShmOffloadColumn *cols, int ncols,
                                 ShmProducer *producer, size_t rows_per_block,
-                                PgchVisStats *out_stats)
+                                ShmBlockCursor *bcursor, PgchVisStats *out_stats)
 {
     ShmColumnizer       *cz;
     TupleDesc            tupdesc = RelationGetDescr(rel);
@@ -791,8 +798,33 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
              (jit_a || jit_b) ? "engaged" : "not used",
              jit_a != NULL, jit_b != NULL, RelationGetRelationName(rel));
 
-    for (blk = 0; blk < nblocks; blk++)
+    /*
+     * Block loop. Single-threaded (bcursor == NULL): scan the whole relation
+     * [0, nblocks) once. Parallel (bcursor != NULL): cooperatively claim chunks
+     * of blocks from the shared cross-process cursor until the relation is
+     * exhausted; the atomic fetch-add guarantees each block is scanned by exactly
+     * one worker, with no gaps or overlap, under the one shared snapshot.
+     */
+    for (;;)
     {
+      BlockNumber blk_lo, blk_hi;
+
+      if (bcursor == NULL)
+      {
+          blk_lo = 0;
+          blk_hi = nblocks;
+      }
+      else
+      {
+          blk_lo = (BlockNumber) pg_atomic_fetch_add_u32(&bcursor->next_block,
+                                                         PGCH_PARALLEL_BLOCK_CHUNK);
+          if (blk_lo >= nblocks)
+              break;
+          blk_hi = Min(blk_lo + PGCH_PARALLEL_BLOCK_CHUNK, nblocks);
+      }
+
+      for (blk = blk_lo; blk < blk_hi; blk++)
+      {
         Buffer buf;
         Page   page;
         int    done;
@@ -869,7 +901,11 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
         }
 
         ReleaseBuffer(buf);
-    }
+      }   /* inner: blocks in this claimed range */
+
+      if (bcursor == NULL)
+          break;            /* serial: the whole relation was one range */
+    }   /* outer: claim the next range (parallel) */
 
     FreeAccessStrategy(strategy);
     if (dst_bases)

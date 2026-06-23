@@ -44,9 +44,13 @@ extern bool pgch_vectorized_reader_eligible(Relation rel, Snapshot snapshot,
 
 /*
  * Stream `rel` under `snapshot` with the vectorized page reader, projecting
- * `cols`, into SHM blocks of up to `rows_per_block` rows via `producer`, then
- * signal end-of-stream. Returns the number of rows streamed. Caller must have
- * confirmed pgch_vectorized_reader_eligible first.
+ * `cols`, into SHM blocks of up to `rows_per_block` rows via `producer`. Returns
+ * the number of rows streamed. Caller must have confirmed
+ * pgch_vectorized_reader_eligible first, and signals end-of-stream itself.
+ *
+ * `bcursor` is the shared cross-process block allocator: when non-NULL the reader
+ * claims block ranges from it (cooperating with other workers on the same ring);
+ * when NULL it scans the whole relation [0, nblocks) sequentially.
  *
  * If `out_stats` is non-NULL it is filled with the per-scan visibility-path
  * counters (which page paths ran, and the per-verdict tuple tallies).
@@ -54,6 +58,6 @@ extern bool pgch_vectorized_reader_eligible(Relation rel, Snapshot snapshot,
 extern uint64 pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                                               const ShmOffloadColumn *cols, int ncols,
                                               ShmProducer *producer, size_t rows_per_block,
-                                              PgchVisStats *out_stats);
+                                              ShmBlockCursor *bcursor, PgchVisStats *out_stats);
 
 #endif /* PG_CLICKHOUSE_SHM_PAGE_READER_H */

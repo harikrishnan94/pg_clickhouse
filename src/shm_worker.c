@@ -343,7 +343,7 @@ pgch_shm_worker_main(Datum main_arg)
          * producer's reset callback. */
         producer = shm_producer_create(hdr->shm_name, schema, ncols,
                                        (uint32_t) hdr->ring_depth_k,
-                                       hdr->data_region_size, CurTransactionContext);
+                                       hdr->data_region_size, NULL, CurTransactionContext);
 
         /* Tell the backend it may now dispatch the ClickHouse query (the consumer
          * can attach to the control socket). */
@@ -375,7 +375,7 @@ pgch_shm_worker_main(Datum main_arg)
             getrusage(RUSAGE_SELF, &r0);
             w0 = GetCurrentTimestamp();
             rows = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, &vis);
+                                               producer, (size_t) hdr->rows_per_block, NULL, &vis);
             w1 = GetCurrentTimestamp();
             getrusage(RUSAGE_SELF, &r1);
 
@@ -408,7 +408,11 @@ pgch_shm_worker_main(Datum main_arg)
         }
         else
             (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, NULL);
+                                               producer, (size_t) hdr->rows_per_block, NULL, NULL);
+
+        /* Single producer: signal end-of-stream now that the relation is fully
+         * streamed. (The W>1 path signals EOS from the last worker to finish.) */
+        shm_producer_signal_eos(producer);
 
         /* Producer-outlives-consumer: wait for every retained block to release,
          * then unlink the SHM object + socket. */

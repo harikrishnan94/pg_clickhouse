@@ -474,11 +474,11 @@ pgch_columnizer_finish(ShmColumnizer *cz)
 {
     uint64 total;
 
-    /* Flush the trailing partial block, then signal end-of-stream. */
+    /* Flush the trailing partial block. End-of-stream is published by the caller
+     * (once, after every cooperating producer has finished), not here, so W
+     * workers sharing one ring emit exactly one EOS. */
     if (cz->in_block > 0)
         columnizer_publish_block(cz);
-
-    shm_producer_signal_eos(cz->producer);
 
     total = cz->total;
     MemoryContextDelete(cz->block_cxt);
@@ -569,6 +569,9 @@ pgch_stream_relation_scalar(Relation rel, Snapshot snapshot,
                             const ShmOffloadColumn *cols, int ncols,
                             ShmProducer *producer, size_t rows_per_block)
 {
+    /* The scalar table-AM reader is always single-threaded (the parallel block
+     * cursor applies only to the eligible vectorized path); it scans the whole
+     * relation under its own table_beginscan. */
     ShmColumnizer  *cz;
     TableScanDesc   scan;
     TupleTableSlot *slot;
@@ -600,12 +603,12 @@ uint64
 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                             const ShmOffloadColumn *cols, int ncols,
                             ShmProducer *producer, size_t rows_per_block,
-                            PgchVisStats *out_stats)
+                            ShmBlockCursor *bcursor, PgchVisStats *out_stats)
 {
     if (pgch_use_vectorized_reader &&
         pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
         return pgch_stream_relation_vectorized(rel, snapshot, cols, ncols,
-                                               producer, rows_per_block, out_stats);
+                                               producer, rows_per_block, bcursor, out_stats);
 
     /* The scalar table-AM reader does no page-level visibility classify. */
     if (out_stats)
@@ -688,11 +691,13 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
     producer = shm_producer_create(shm_name, schema, ncols,
                                    (uint32_t) pgch_shm_ring_depth_k,
                                    (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                   CurrentMemoryContext);
+                                   NULL, CurrentMemoryContext);
 
-    /* Stream under the active (query) snapshot for correct MVCC visibility. */
+    /* Stream under the active (query) snapshot for correct MVCC visibility
+     * (single producer: no shared block cursor), then signal end-of-stream. */
     total = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                        producer, (size_t) rows_per_block, NULL);
+                                        producer, (size_t) rows_per_block, NULL, NULL);
+    shm_producer_signal_eos(producer);
 
     shm_producer_destroy(producer);
     table_close(rel, AccessShareLock);

@@ -22,10 +22,31 @@
 #define PG_CLICKHOUSE_SHM_PRODUCER_H
 
 #include "postgres.h"
+#include "port/atomics.h"
 #include "utils/palloc.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * Cross-process publish coordination for a single shared ring written by W
+ * cooperating producers (one per streaming worker). Lives in the workers'
+ * shared DSM so the slot-claim cursor and the block sequence are atomic across
+ * processes. `next_slot` is the monotonically increasing slot-claim counter
+ * (slot index = next_slot % ring_depth_k); `global_seq` is the per-block
+ * sequence stamped into ShmSlot.sequence -- a SINGLE global counter (not
+ * per-slot), so the end-of-stream block, published last, always carries the
+ * highest sequence and the consumer drains it strictly last (the consumer only
+ * requires per-slot monotonicity, which global monotonicity satisfies).
+ *
+ * For the single-producer paths (the W=1 worker and the clickhouse_stream_relation
+ * SQL function) callers pass NULL and the producer allocates a private coord, so
+ * behavior is identical to the original per-producer cursor.
+ */
+typedef struct ShmPublishCoord {
+    pg_atomic_uint64 next_slot;
+    pg_atomic_uint64 global_seq;
+} ShmPublishCoord;
 
 /*
  * Wire column type tags. Values MUST match ClickHouse's
@@ -97,12 +118,35 @@ typedef struct ShmProducer ShmProducer;
  * missing). The producer is registered for cleanup on `owner_cxt` reset/delete
  * so an aborted query never leaks the /dev/shm object or the socket.
  *
+ * `coord` is the shared cross-process publish coordination (slot-claim cursor +
+ * global block sequence). Pass NULL for a single-producer ring and the producer
+ * allocates a private coord in `owner_cxt` (identical to the original behavior).
+ *
  * Raises a PostgreSQL ERROR (ereport) on any setup failure.
  */
 extern ShmProducer *shm_producer_create(const char *name,
                                         const ShmColumnSchema *schema, int n_columns,
                                         uint32_t ring_depth_k, size_t data_region_size,
-                                        MemoryContext owner_cxt);
+                                        ShmPublishCoord *coord, MemoryContext owner_cxt);
+
+/*
+ * Attach a SECONDARY producer to an existing ring created by shm_producer_create
+ * in another process (a cooperating streaming worker). Maps the named SHM object
+ * (spinning with CHECK_FOR_INTERRUPTS until the owner has published the handshake
+ * magic), validates the ABI-v1 handshake against `schema`, and obtains the shared
+ * readiness eventfd from the owner's control socket via the existing SCM_RIGHTS
+ * handshake. `coord` (required, non-NULL) is the shared publish coordination.
+ *
+ * The returned producer publishes into the shared ring exactly like the owner but
+ * owns neither the control socket / pump thread nor the SHM object: shm_producer_destroy
+ * on it only unmaps and closes its fds (it never unlinks the ring or socket).
+ *
+ * Raises a PostgreSQL ERROR (ereport) on schema mismatch or setup failure.
+ */
+extern ShmProducer *shm_producer_attach(const char *name,
+                                        const ShmColumnSchema *schema, int n_columns,
+                                        uint32_t ring_depth_k, size_t data_region_size,
+                                        ShmPublishCoord *coord, MemoryContext owner_cxt);
 
 /*
  * Publish one block of `row_count` rows (one ShmColumnPayload per schema
