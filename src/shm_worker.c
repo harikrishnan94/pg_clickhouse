@@ -76,6 +76,8 @@ typedef struct ShmWorkerHeader
     bool        columnar_deform;     /* honor the backend session's shm_columnar_deform GUC */
     bool        vectorized_visibility; /* honor the backend session's shm_vectorized_visibility GUC */
     bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
+    bool        enable_jit_deform;   /* honor the backend session's enable_jit_deform GUC */
+    int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     Size        attnos_offset;
@@ -147,6 +149,8 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->columnar_deform = pgch_use_columnar_deform;
     hdr->vectorized_visibility = pgch_use_vectorized_visibility;
     hdr->log_stream_stats = pgch_log_stream_stats;
+    hdr->enable_jit_deform = pgch_enable_jit_deform;
+    hdr->jit_row_threshold = pgch_jit_row_threshold;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
     hdr->attnos_offset = hdr_sz;
@@ -350,6 +354,9 @@ pgch_shm_worker_main(Datum main_arg)
         pgch_use_vectorized_reader = hdr->use_vectorized;
         pgch_use_columnar_deform = hdr->columnar_deform;
         pgch_use_vectorized_visibility = hdr->vectorized_visibility;
+        pgch_log_stream_stats = hdr->log_stream_stats;
+        pgch_enable_jit_deform = hdr->enable_jit_deform;
+        pgch_jit_row_threshold = hdr->jit_row_threshold;
 
         /* Stream the relation into the ring (ring backpressure applies; the
          * ClickHouse consumer drains concurrently), then signal end-of-stream.

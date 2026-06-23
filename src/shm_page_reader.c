@@ -46,11 +46,14 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include "fmgr.h"            /* load_external_function (lazy JIT module load) */
+
 #include "shm_deform.h"
 #include "shm_offload.h"
 #include "shm_page_reader.h"
 #include "shm_producer.h"
 #include "shm_visibility.h"
+#include "pgch_jit.h"        /* PgchJitDeform / PgchJitGetFn (optional module) */
 
 /*
  * Per-page visibility splice: visible tuples are partitioned into three buckets
@@ -576,6 +579,54 @@ pgch_build_deform_desc(Relation rel, ShmColumnizer *cz, const ShmOffloadColumn *
     desc->walk_start_off_b = (pb < pa) ? col[pb].disp : desc->walk_start_off_a;
 }
 
+/*
+ * Lazily resolve the optional JIT module's entry point. Returns NULL (and stays
+ * NULL) if pg_clickhouse_jit is not installed, so callers transparently fall
+ * back to the AOT step-plan driver (pgch_columnar_deform_run). The dlopen (which
+ * pulls in libLLVM) therefore happens only on the first scan that actually wants
+ * JIT -- backends with JIT disabled never map LLVM.
+ */
+static PgchJitGetFn
+pgch_jit_loader(void)
+{
+    static bool         tried = false;
+    static PgchJitGetFn fn = NULL;
+
+    if (!tried)
+    {
+        tried = true;
+        fn = (PgchJitGetFn) load_external_function("$libdir/pg_clickhouse_jit",
+                                                   "pgch_jit_get", false, NULL);
+    }
+    return fn;
+}
+
+/*
+ * JIT pays off only when a WALK step still interprets MANY hops per row -- enough
+ * for the baked/branchless walk to beat the AOT kernel by more than the fused
+ * loop's fixed overhead (scalar fills vs the AOT's vectorized SoA FILL_CONST,
+ * plus the dst_bases indirection). After the AOT hop-run folder, runs of fixed
+ * skips collapse to one hop, so a high hop count means many *data-dependent*
+ * hops the fold cannot remove -- group-B nullable skips (the experiment's only
+ * residual JIT win) or a long varlena chain. Thin walks (e.g. a single nullable
+ * hop, or 1-2 varlena skips like Q6) regress under JIT, so we decline them.
+ *
+ * Threshold from dev/bench/LLVM-DEFORM-JIT-RESULTS.md: nullable runs win ~2x at
+ * 8 hops; the crossover sits well below that. 6 keeps a safety margin.
+ */
+#define PGCH_JIT_MIN_WALK_HOPS 6
+
+static bool
+pgch_plan_jit_beneficial(const PgchDeformPlan *p)
+{
+    int i;
+
+    for (i = 0; i < p->n_step; i++)
+        if (p->step[i].kind == PGCH_STEP_WALK && p->step[i].nhop >= PGCH_JIT_MIN_WALK_HOPS)
+            return true;
+    return false;
+}
+
 uint64
 pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                                 const ShmOffloadColumn *cols, int ncols,
@@ -595,6 +646,9 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     PgchStep            *step_a, *step_b;   /* compiled columnar deform step plans */
     PgchHop             *hop_a, *hop_b;
     PgchDeformPlan       plan_a, plan_b;    /* group A / group B */
+    PgchJitDeform        jit_a = NULL;      /* JIT'd fused deform, or NULL -> AOT */
+    PgchJitDeform        jit_b = NULL;
+    void               **dst_bases = NULL;  /* [col_index] -> columnizer fixed base (JIT arg) */
     PgchVisDesc          visdesc;       /* per-scan snapshot bounds for the classify kernel */
     PgchVisStats         vis;           /* per-scan visibility-path counters */
     uint32               cum;
@@ -700,6 +754,43 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     strategy = GetAccessStrategy(BAS_BULKREAD);
     nblocks = RelationGetNumberOfBlocks(rel);
 
+    /*
+     * Optional JIT: for large scans of fixed-width projections, compile a fused
+     * per-scan deform (cursor in a register, folded skips, branchless null-bit
+     * select). Gated on the GUC + an estimated-row threshold + a plan that still
+     * has a cursor walk to specialize. dst_bases hands the JIT the columnizer's
+     * per-column fixed buffers (scan-stable, same bases the AOT plan baked). The
+     * module returns NULL for any plan it cannot handle (e.g. projected strings),
+     * leaving jit_a/jit_b NULL so the loop uses the AOT driver.
+     */
+    if (pgch_enable_jit_deform)
+    {
+        double est = rel->rd_rel->reltuples;
+
+        if (est < 0)
+            est = (double) nblocks * 200.0;     /* unanalyzed: rough tuples/page */
+        if (est >= (double) pgch_jit_row_threshold)
+        {
+            PgchJitGetFn jget = pgch_jit_loader();
+
+            if (jget)
+            {
+                dst_bases = (void **) palloc0(sizeof(void *) * ncols);
+                for (i = 0; i < max_attno; i++)
+                    if (col[i].is_needed && col[i].col_index >= 0)
+                        dst_bases[col[i].col_index] = col[i].dst_base;
+                if (pgch_plan_jit_beneficial(&plan_a))
+                    jit_a = jget(&desc, false);
+                if (pgch_plan_jit_beneficial(&plan_b))
+                    jit_b = jget(&desc, true);
+            }
+        }
+    }
+    if (pgch_log_stream_stats)
+        elog(LOG, "pg_clickhouse: JIT deform %s (A=%d B=%d) for \"%s\"",
+             (jit_a || jit_b) ? "engaged" : "not used",
+             jit_a != NULL, jit_b != NULL, RelationGetRelationName(rel));
+
     for (blk = 0; blk < nblocks; blk++)
     {
         Buffer buf;
@@ -735,8 +826,11 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
             size_t avail = pgch_columnizer_block_avail(cz);
             int    navail = (int) Min((size_t) (s.na - done), avail);
 
-            pgch_columnar_deform_run(&plan_a, cur_simple + done, NULL, (size_t) navail,
-                                     dst, cz, pgch_str_fill_cb);
+            if (jit_a)
+                jit_a(cur_simple + done, NULL, (size_t) navail, dst, dst_bases);
+            else
+                pgch_columnar_deform_run(&plan_a, cur_simple + done, NULL, (size_t) navail,
+                                         dst, cz, pgch_str_fill_cb);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }
@@ -756,8 +850,11 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                 cur_simple[r] = (char *) h + h->t_hoff;
                 bits[r] = (const bits8 *) ((char *) h + SizeofHeapTupleHeader);
             }
-            pgch_columnar_deform_run(&plan_b, cur_simple, bits, (size_t) navail,
-                                     dst, cz, pgch_str_fill_cb);
+            if (jit_b)
+                jit_b(cur_simple, bits, (size_t) navail, dst, dst_bases);
+            else
+                pgch_columnar_deform_run(&plan_b, cur_simple, bits, (size_t) navail,
+                                         dst, cz, pgch_str_fill_cb);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }
@@ -775,6 +872,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     }
 
     FreeAccessStrategy(strategy);
+    if (dst_bases)
+        pfree(dst_bases);
     pfree(bits);
     pfree(fallback_tup);
     pfree(complex_tup);

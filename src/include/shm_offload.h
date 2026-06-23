@@ -42,6 +42,8 @@ extern bool  pgch_use_vectorized_reader;
 extern bool  pgch_use_columnar_deform;
 extern bool  pgch_use_vectorized_visibility;
 extern bool  pgch_log_stream_stats;
+extern bool  pgch_enable_jit_deform;
+extern int   pgch_jit_row_threshold;
 
 /*
  * One projected column to stream. `attno` is the 1-based heap attribute number;

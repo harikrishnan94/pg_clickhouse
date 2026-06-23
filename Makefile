@@ -16,10 +16,12 @@ CURL_CONFIG ?= curl-config
 OS 	        ?= $(shell uname -s | tr A-Z a-z)
 ARCH         = $(shell uname -m)
 
-# Collect all the C files to compile into MODULE_big.
-OBJS = $(subst .c,.o, $(wildcard src/*.c src/*/*.c))
+# Collect all the C files to compile into MODULE_big. src/jit/ is the OPTIONAL
+# LLVM-JIT module (pg_clickhouse_jit.so), built separately with LLVM flags and
+# linked on its own -- it must NOT be swept into the LLVM-free base extension.
+OBJS = $(subst .c,.o, $(filter-out src/jit/%, $(wildcard src/*.c src/*/*.c)))
 # C++ translation units (templated column-major deform kernels + extern "C" driver).
-OBJS += $(patsubst %.cpp,%.o, $(wildcard src/*.cpp src/*/*.cpp))
+OBJS += $(patsubst %.cpp,%.o, $(filter-out src/jit/%, $(wildcard src/*.cpp src/*/*.cpp)))
 
 # clickhouse-c is a header-only single-header library. Override
 # CH_C_DIR to point elsewhere when developing against a local checkout.
@@ -52,6 +54,33 @@ EXTRA_CLEAN = sql/$(EXTENSION)--$(EXTVERSION).sql src/include/version.h compile_
 # Import PGXS.
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# ---- Optional LLVM-JIT deform module (pg_clickhouse_jit) ----------------
+# Built ONLY when an llvm-config is found. The base extension never links LLVM;
+# it loads this module lazily (load_external_function) and falls back to the AOT
+# step plan when it is absent. Self-contained: links libLLVM + libstdc++ only
+# (reuses the system libLLVM that postgresql-NN-jit already ships). Kept out of
+# MODULE_big's OBJS so the main .so stays LLVM-free.
+LLVM_CONFIG ?= $(shell command -v llvm-config-21 llvm-config 2>/dev/null | head -n1)
+ifneq ($(LLVM_CONFIG),)
+JIT_MODULE   := pg_clickhouse_jit$(DLSUFFIX)
+JIT_CXXFLAGS := -O2 -fno-exceptions -fno-rtti -fPIC -fvisibility=hidden \
+  $(shell $(LLVM_CONFIG) --cxxflags | sed 's/-std=c++[0-9]*//') -std=c++17 \
+  -I./src/include -I$(shell $(PG_CONFIG) --includedir-server) -I$(shell $(PG_CONFIG) --includedir)
+JIT_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) -Wl,-rpath,$(shell $(LLVM_CONFIG) --libdir) \
+  $(shell $(LLVM_CONFIG) --libs orcjit native) $(shell $(LLVM_CONFIG) --system-libs)
+
+all: $(JIT_MODULE)
+$(JIT_MODULE): src/jit/pgch_jit.cpp src/include/pgch_jit.h src/include/shm_deform.h
+	clang++ $(JIT_CXXFLAGS) -shared -o $@ $< $(JIT_LDFLAGS)
+
+install: install-pgch-jit
+.PHONY: install-pgch-jit
+install-pgch-jit: $(JIT_MODULE)
+	$(INSTALL_SHLIB) $(JIT_MODULE) '$(DESTDIR)$(pkglibdir)/$(JIT_MODULE)'
+
+EXTRA_CLEAN += $(JIT_MODULE)
+endif
 
 # Clone clickhouse-c submodule.
 $(CH_C_DIR)/clickhouse.h: .gitmodules

@@ -74,6 +74,22 @@ align_bytes(char a)
     }
 }
 
+/*
+ * Power-of-two alignment of a cursor that is `align`-aligned and then advanced by
+ * a constant `width` bytes: min(align, largest power of two dividing width). Used
+ * by the plan builder to fold a run of consecutive skipped fixed-width hops into a
+ * single hop -- once the cursor is A-aligned, a later fixed column whose alignment
+ * is already satisfied adds no realignment, so the per-hop TYPEALIGN+addlen
+ * collapses to one TYPEALIGN + a summed constant. Holds for any attlen (no
+ * attlen-multiple-of-align assumption): width's low bit tracks the true residue.
+ */
+static inline uint8
+run_align_after(uint8 align, uint32 width)
+{
+    uint32 lowbit = width & (0u - width);   /* largest pow2 dividing width (width > 0) */
+    return (uint8) (lowbit < align ? lowbit : align);
+}
+
 template <int Align, int Nhop>
 static inline char *
 walk_uv_one(char *c)
@@ -478,6 +494,8 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
     {
         uint32 lead = walk_start_off;
         int    hop_start = nh;
+        int    run_idx = -1;        /* open fixed-run hop being folded into, or -1 */
+        uint8  run_align = 1;       /* pow2 alignment of the cursor at the run's end */
 
         for (i = prefix_len; i < d->max_attno; ++i)
         {
@@ -485,10 +503,39 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
 
             if (!c->is_needed)
             {
-                hop[nh].attlen = c->attlen;
-                hop[nh].align = align_bytes(c->attalign);
-                hop[nh].null_bit = (nullable_group && c->nullable) ? (int16) i : -1;
-                nh++;
+                uint8 a = align_bytes(c->attalign);
+                bool  null_hop = (nullable_group && c->nullable);
+
+                /*
+                 * Fold a run of consecutive skipped fixed-width hops into ONE hop.
+                 * Once the cursor is A-aligned, a later fixed column whose alignment
+                 * is already satisfied (a <= run_align) needs no realignment, so
+                 *   TYPEALIGN(A,c)+L1 ... TYPEALIGN(ak,c)+Lk == TYPEALIGN(A,c)+(L1+..+Lk).
+                 * The walk kernels interpret the merged hop unchanged. Varlena and
+                 * (group B) nullable hops are data-dependent and break the run.
+                 */
+                if (c->attlen > 0 && !null_hop && run_idx >= 0 && a <= run_align)
+                {
+                    hop[run_idx].attlen += c->attlen;
+                    run_align = run_align_after(hop[run_idx].align, (uint32) hop[run_idx].attlen);
+                }
+                else
+                {
+                    hop[nh].attlen = c->attlen;
+                    hop[nh].align = a;
+                    hop[nh].null_bit = null_hop ? (int16) i : -1;
+                    if (c->attlen > 0 && !null_hop)
+                    {
+                        run_idx = nh;
+                        run_align = run_align_after(a, (uint32) c->attlen);
+                    }
+                    else
+                    {
+                        run_idx = -1;   /* varlena / nullable breaks the fixed run */
+                        run_align = 1;
+                    }
+                    nh++;
+                }
                 continue;
             }
 
@@ -508,6 +555,7 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
 
                     lead = run_width;           /* cur is the fixed-run base */
                     hop_start = nh;
+                    run_idx = -1; run_align = 1; /* new segment: close the fold */
                     i = run_end - 1;
                     continue;
                 }
@@ -541,6 +589,7 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
             /* the fill advanced cur past this column; start a fresh segment */
             lead = 0;
             hop_start = nh;
+            run_idx = -1; run_align = 1; /* close the fold */
         }
         /* any skipped columns after the last projected one are irrelevant */
     }

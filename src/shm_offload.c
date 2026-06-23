@@ -55,6 +55,8 @@ bool  pgch_use_vectorized_reader = true;
 bool  pgch_use_columnar_deform = true;
 bool  pgch_use_vectorized_visibility = true;
 bool  pgch_log_stream_stats = false;
+bool  pgch_enable_jit_deform = false;
+int   pgch_jit_row_threshold = 2000000;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -756,6 +758,21 @@ pgch_shm_offload_init(void)
                              "after each streamed relation, for benchmarking the heap reader.",
                              NULL, &pgch_log_stream_stats, false,
                              PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_clickhouse.enable_jit_deform",
+                             "Within the vectorized reader, JIT-compile a fused per-scan deform "
+                             "for fixed-width projections via the optional pg_clickhouse_jit "
+                             "module. Falls back to the AOT step plan when the module is absent "
+                             "or declines the plan (e.g. a projected string column).",
+                             NULL, &pgch_enable_jit_deform, false,
+                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.jit_row_threshold",
+                            "Minimum estimated row count for a scan to JIT-compile its deform "
+                            "(amortizes the one-time compile cost; subsequent scans of the same "
+                            "shape reuse the cached code).",
+                            NULL, &pgch_jit_row_threshold, 2000000, 0, INT_MAX,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
      * last_query_used_clickhouse observability GUC. */
