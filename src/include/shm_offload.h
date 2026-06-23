@@ -19,6 +19,7 @@
 #include "utils/snapshot.h"
 
 #include "shm_producer.h"
+#include "shm_visibility.h"     /* PgchVisStats */
 
 /* Registers the pg_clickhouse.* SHM-offload GUCs. Called from the extension's
  * _PG_init (option.c) before MarkGUCPrefixReserved. */
@@ -39,6 +40,7 @@ extern int   pgch_shm_data_region_mb;
 extern int   pgch_shm_min_rows;
 extern bool  pgch_use_vectorized_reader;
 extern bool  pgch_use_columnar_deform;
+extern bool  pgch_use_vectorized_visibility;
 extern bool  pgch_log_stream_stats;
 
 /*
@@ -77,10 +79,14 @@ extern char *pgch_build_shm_schema_string(const ShmOffloadColumn *cols, int ncol
  * heap rows into SHM blocks of up to `rows_per_block` rows, publishing each via
  * `producer`, and finally publishing end-of-stream. Raises ERROR on conversion
  * failure (e.g. an unexpected NULL in a non-null column).
+ *
+ * If `out_stats` is non-NULL it is filled with the visibility-path counters
+ * (zeroed for the scalar table-AM reader, which does no page-level classify).
  */
 extern uint64 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                                           const ShmOffloadColumn *cols, int ncols,
-                                          ShmProducer *producer, size_t rows_per_block);
+                                          ShmProducer *producer, size_t rows_per_block,
+                                          PgchVisStats *out_stats);
 
 /*
  * Per-stream columnizer shared by the scalar and vectorized heap readers. A

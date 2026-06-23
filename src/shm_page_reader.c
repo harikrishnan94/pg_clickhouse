@@ -50,6 +50,7 @@
 #include "shm_offload.h"
 #include "shm_page_reader.h"
 #include "shm_producer.h"
+#include "shm_visibility.h"
 
 /*
  * Per-page visibility splice: visible tuples are partitioned into three buckets
@@ -65,6 +66,7 @@ typedef struct PgchVisSplit
 {
     AttrNumber       max_attno;
     bool             columnar;       /* false -> route everything to fallback (C) */
+    bool             vis_vectorized; /* classify not-all-visible pages with the SoA kernel */
     char           **cur_simple;     /* A: data-start (htup + t_hoff) */
     HeapTupleHeader *complex_tup;    /* B */
     HeapTupleHeader *fallback_tup;   /* C */
@@ -81,14 +83,6 @@ pgch_route(HeapTupleHeader htup, PgchVisSplit *s)
     else
         s->cur_simple[s->na++] = (char *) htup + htup->t_hoff; /* group A */
 }
-
-/* Three-way per-tuple visibility verdict from the branch-light kernel. */
-typedef enum PgchVisVerdict
-{
-    PGCH_VIS_INVISIBLE = 0,
-    PGCH_VIS_VISIBLE = 1,
-    PGCH_VIS_UNDECIDED = 2,
-} PgchVisVerdict;
 
 /*
  * Precomputed, attno-indexed deform metadata (index = attno - 1, for
@@ -114,6 +108,11 @@ typedef struct PgchAttrMeta
  * snapshot-bound checks resolve exactly as HeapTupleSatisfiesMVCC would; every
  * other case is UNDECIDED and routed to the MVCC fallback. Assumes a normal
  * MVCC snapshot (guaranteed by pgch_vectorized_reader_eligible).
+ *
+ * This is the scalar REFERENCE classifier: it is the shm_vectorized_visibility=off
+ * path, and the oracle the branch-free SoA kernel (pgch_vis_classify) is
+ * cross-checked against verdict-for-verdict under USE_ASSERT_CHECKING. The two
+ * must always agree; this one is the authority.
  */
 static pg_attribute_always_inline PgchVisVerdict
 pgch_classify_tuple(uint16 infomask, TransactionId xmin, TransactionId xmax,
@@ -167,7 +166,7 @@ pgch_classify_tuple(uint16 infomask, TransactionId xmin, TransactionId xmax,
 /* Splice every LP_NORMAL tuple on an all-visible page into the buckets. The
  * header deref here is the same one the deform needs next (hot in cache). */
 static void
-pgch_collect_all_visible(Page page, PgchVisSplit *s)
+pgch_collect_all_visible(Page page, PgchVisSplit *s, PgchVisStats *stats)
 {
     OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
     OffsetNumber off;
@@ -179,25 +178,34 @@ pgch_collect_all_visible(Page page, PgchVisSplit *s)
         if (ItemIdIsNormal(lp))
             pgch_route((HeapTupleHeader) PageGetItem(page, lp), s);
     }
+
+    stats->pages_all_visible++;
 }
 
 /*
  * Splice the snapshot-visible LP_NORMAL tuples on a not-all-visible page into
- * the buckets. Three passes: gather header fields into parallel (SoA) arrays,
- * run the branch-light classifier over them, then route VISIBLE tuples (and
- * MVCC-oracle-confirmed UNDECIDED ones). The buffer must be share-locked for the
- * whole call (the fallback may set hint bits, which dirties the buffer).
+ * the buckets. Three phases:
+ *   gather   -- header fields into parallel (SoA) arrays (heap-format walk);
+ *   classify -- the branch-free SoA kernel (or the scalar reference when
+ *               shm_vectorized_visibility is off) writes a verdict per tuple and
+ *               compacts the VISIBLE / UNDECIDED tuple indices into worklists;
+ *   route    -- emit the VISIBLE worklist, then resolve the UNDECIDED worklist
+ *               through the exact MVCC oracle and emit the survivors.
+ * The buffer must be share-locked for the whole call (the oracle may set hint
+ * bits, which dirties the buffer). The classify result is byte-for-byte the same
+ * either way; the kernel and the reference are cross-checked under assertions.
  */
 static void
 pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page page,
-                             Snapshot snapshot, PgchVisSplit *s)
+                             Snapshot snapshot, const PgchVisDesc *visdesc,
+                             PgchVisSplit *s, PgchVisStats *stats)
 {
     OffsetNumber    maxoff = PageGetMaxOffsetNumber(page);
     OffsetNumber    off;
-    TransactionId   snap_xmin = snapshot->xmin;
-    TransactionId   snap_xmax = snapshot->xmax;
     int             m = 0;
-    int             j;
+    uint32          nvis = 0;
+    uint32          nund = 0;
+    uint32          k;
 
     /* SoA scratch, sized for the worst case (one page's worth of tuples). */
     OffsetNumber    soa_off[MaxHeapTuplesPerPage];
@@ -206,8 +214,10 @@ pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page pag
     TransactionId   soa_xmin[MaxHeapTuplesPerPage];
     TransactionId   soa_xmax[MaxHeapTuplesPerPage];
     uint8           verdict[MaxHeapTuplesPerPage];
+    uint16          vis_idx[MaxHeapTuplesPerPage];
+    uint16          und_idx[MaxHeapTuplesPerPage];
 
-    /* Pass A: gather header pointer + hint bits + raw xmin/xmax per LP_NORMAL. */
+    /* Gather: header pointer + hint bits + raw xmin/xmax per LP_NORMAL tuple. */
     for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
     {
         ItemId          lp = PageGetItemId(page, off);
@@ -225,33 +235,71 @@ pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page pag
         m++;
     }
 
-    /* Pass B: branch-light classification over the flat arrays. */
-    for (j = 0; j < m; j++)
-        verdict[j] = (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
-                                                 snap_xmin, snap_xmax);
-
-    /* Pass C: route VISIBLE; resolve UNDECIDED via the exact MVCC oracle. */
-    for (j = 0; j < m; j++)
+    /* Classify + partition: the SoA kernel, or the scalar reference. */
+    if (s->vis_vectorized)
     {
-        if (verdict[j] == PGCH_VIS_VISIBLE)
-        {
-            pgch_route(soa_htup[j], s);
-        }
-        else if (verdict[j] == PGCH_VIS_UNDECIDED)
-        {
-            ItemId        lp = PageGetItemId(page, soa_off[j]);
-            HeapTupleData loctup;
+        pgch_vis_classify(visdesc, soa_im, soa_xmin, soa_xmax, (size_t) m,
+                          verdict, vis_idx, und_idx, &nvis, &nund);
 
-            loctup.t_data = soa_htup[j];
-            loctup.t_len = ItemIdGetLength(lp);
-            loctup.t_tableOid = RelationGetRelid(rel);
-            ItemPointerSet(&loctup.t_self, blk, soa_off[j]);
+#ifdef USE_ASSERT_CHECKING
+        /* The branch-free kernel must agree with the reference on every tuple. */
+        {
+            int j;
 
-            if (HeapTupleSatisfiesVisibility(&loctup, snapshot, buf))
-                pgch_route(soa_htup[j], s);
+            for (j = 0; j < m; j++)
+                Assert(verdict[j] ==
+                       (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
+                                                   visdesc->snap_xmin, visdesc->snap_xmax));
         }
-        /* PGCH_VIS_INVISIBLE: skip */
+#endif
     }
+    else
+    {
+        int j;
+
+        for (j = 0; j < m; j++)
+            verdict[j] = (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
+                                                     visdesc->snap_xmin, visdesc->snap_xmax);
+        for (j = 0; j < m; j++)
+        {
+            uint8 v = verdict[j];
+
+            vis_idx[nvis] = (uint16) j;
+            nvis += (v == PGCH_VIS_VISIBLE);
+            und_idx[nund] = (uint16) j;
+            nund += (v == PGCH_VIS_UNDECIDED);
+        }
+    }
+
+    /* Route the definite-VISIBLE worklist into the A/B/C buckets. */
+    for (k = 0; k < nvis; k++)
+        pgch_route(soa_htup[vis_idx[k]], s);
+
+    /* Resolve the UNDECIDED worklist via the exact MVCC oracle (may set hint
+     * bits under the held share lock); emit the survivors. */
+    for (k = 0; k < nund; k++)
+    {
+        int           j = und_idx[k];
+        ItemId        lp = PageGetItemId(page, soa_off[j]);
+        HeapTupleData loctup;
+        bool          vis;
+
+        loctup.t_data = soa_htup[j];
+        loctup.t_len = ItemIdGetLength(lp);
+        loctup.t_tableOid = RelationGetRelid(rel);
+        ItemPointerSet(&loctup.t_self, blk, soa_off[j]);
+
+        vis = HeapTupleSatisfiesVisibility(&loctup, snapshot, buf);
+        if (vis)
+            pgch_route(soa_htup[j], s);
+        stats->n_slow_visible += vis;
+    }
+
+    stats->pages_classified++;
+    stats->tuples_gathered += (uint64) m;
+    stats->n_visible_fast += nvis;
+    stats->n_undecided += nund;
+    stats->n_invisible_fast += (uint64) (m - (int) nvis - (int) nund);
 }
 
 /* --------------------------------------------------------------------- */
@@ -531,7 +579,8 @@ pgch_build_deform_desc(Relation rel, ShmColumnizer *cz, const ShmOffloadColumn *
 uint64
 pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                                 const ShmOffloadColumn *cols, int ncols,
-                                ShmProducer *producer, size_t rows_per_block)
+                                ShmProducer *producer, size_t rows_per_block,
+                                PgchVisStats *out_stats)
 {
     ShmColumnizer       *cz;
     TupleDesc            tupdesc = RelationGetDescr(rel);
@@ -543,6 +592,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     PgchDeformPlan       plan;          /* group C / GUC-off row-major path */
     PgchDeformCol       *col;           /* group A/B C++ driver descriptor */
     PgchDeformDesc       desc;
+    PgchVisDesc          visdesc;       /* per-scan snapshot bounds for the classify kernel */
+    PgchVisStats         vis;           /* per-scan visibility-path counters */
     uint32               cum;
     Datum               *values;
     bool                *isnull;
@@ -622,9 +673,17 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
 
     s.max_attno = max_attno;
     s.columnar = pgch_use_columnar_deform;
+    s.vis_vectorized = pgch_use_vectorized_visibility;
     s.cur_simple = cur_simple;
     s.complex_tup = complex_tup;
     s.fallback_tup = fallback_tup;
+
+    /* Snapshot bounds are constant for the scan: build the classify descriptor
+     * once. The kernel needs nothing else (xip[]-range xids go to the oracle). */
+    visdesc.snap_xmin = snapshot->xmin;
+    visdesc.snap_xmax = snapshot->xmax;
+    memset(&vis, 0, sizeof(vis));
+    vis.vectorized = s.vis_vectorized;
 
     /* Match a stock seqscan: BAS_BULKREAD keeps a large scan from evicting the
      * shared-buffer working set. */
@@ -647,10 +706,11 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
 
         /* Splice visible tuples into the A/B/C buckets (under the share lock). */
         s.na = s.nb = s.nc = 0;
+        vis.pages_total++;
         if (PageIsAllVisible(page) && !snapshot->takenDuringRecovery)
-            pgch_collect_all_visible(page, &s);
+            pgch_collect_all_visible(page, &s, &vis);
         else
-            pgch_collect_with_visibility(rel, buf, blk, page, snapshot, &s);
+            pgch_collect_with_visibility(rel, buf, blk, page, snapshot, &visdesc, &s, &vis);
 
         /* Visibility decisions (and any hint-bit writes by the fallback) are
          * done; drop the lock and deform the visible tuples under the pin. */
@@ -715,6 +775,9 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     pfree(col_of);
     pfree(plan.fixed);
     pfree(meta);
+
+    if (out_stats)
+        *out_stats = vis;
 
     return pgch_columnizer_finish(cz);
 }

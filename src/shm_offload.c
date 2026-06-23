@@ -53,6 +53,7 @@ int   pgch_shm_data_region_mb = 64;
 int   pgch_shm_min_rows = 100000;
 bool  pgch_use_vectorized_reader = true;
 bool  pgch_use_columnar_deform = true;
+bool  pgch_use_vectorized_visibility = true;
 bool  pgch_log_stream_stats = false;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
@@ -596,12 +597,17 @@ pgch_stream_relation_scalar(Relation rel, Snapshot snapshot,
 uint64
 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                             const ShmOffloadColumn *cols, int ncols,
-                            ShmProducer *producer, size_t rows_per_block)
+                            ShmProducer *producer, size_t rows_per_block,
+                            PgchVisStats *out_stats)
 {
     if (pgch_use_vectorized_reader &&
         pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
         return pgch_stream_relation_vectorized(rel, snapshot, cols, ncols,
-                                               producer, rows_per_block);
+                                               producer, rows_per_block, out_stats);
+
+    /* The scalar table-AM reader does no page-level visibility classify. */
+    if (out_stats)
+        memset(out_stats, 0, sizeof(*out_stats));
 
     return pgch_stream_relation_scalar(rel, snapshot, cols, ncols,
                                        producer, rows_per_block);
@@ -684,7 +690,7 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
 
     /* Stream under the active (query) snapshot for correct MVCC visibility. */
     total = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                        producer, (size_t) rows_per_block);
+                                        producer, (size_t) rows_per_block, NULL);
 
     shm_producer_destroy(producer);
     table_close(rel, AccessShareLock);
@@ -735,6 +741,14 @@ pgch_shm_offload_init(void)
                              "Within the vectorized reader, deform a page's NULL-free tuples "
                              "column-at-a-time (struct-of-arrays) instead of row-at-a-time.",
                              NULL, &pgch_use_columnar_deform, true,
+                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_clickhouse.shm_vectorized_visibility",
+                             "Within the vectorized reader, classify a not-all-visible page's "
+                             "tuples with the branch-free struct-of-arrays visibility kernel "
+                             "(off uses the scalar reference classifier). The visible set is "
+                             "identical either way; undecided tuples always use the MVCC oracle.",
+                             NULL, &pgch_use_vectorized_visibility, true,
                              PGC_USERSET, 0, NULL, NULL, NULL);
 
     DefineCustomBoolVariable("pg_clickhouse.shm_log_stream_stats",

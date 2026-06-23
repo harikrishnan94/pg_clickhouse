@@ -74,6 +74,7 @@ typedef struct ShmWorkerHeader
     int         rows_per_block;
     bool        use_vectorized;      /* honor the backend session's shm_vectorized_reader GUC */
     bool        columnar_deform;     /* honor the backend session's shm_columnar_deform GUC */
+    bool        vectorized_visibility; /* honor the backend session's shm_vectorized_visibility GUC */
     bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
@@ -144,6 +145,7 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
      * bgworker that would otherwise see only the defaults, honors them. */
     hdr->use_vectorized = pgch_use_vectorized_reader;
     hdr->columnar_deform = pgch_use_columnar_deform;
+    hdr->vectorized_visibility = pgch_use_vectorized_visibility;
     hdr->log_stream_stats = pgch_log_stream_stats;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
@@ -347,6 +349,7 @@ pgch_shm_worker_main(Datum main_arg)
         /* Apply the backend session's reader choices in this worker. */
         pgch_use_vectorized_reader = hdr->use_vectorized;
         pgch_use_columnar_deform = hdr->columnar_deform;
+        pgch_use_vectorized_visibility = hdr->vectorized_visibility;
 
         /* Stream the relation into the ring (ring backpressure applies; the
          * ClickHouse consumer drains concurrently), then signal end-of-stream.
@@ -359,11 +362,13 @@ pgch_shm_worker_main(Datum main_arg)
             TimestampTz    w0, w1;
             uint64         rows;
             double         cpu_ms, wall_ms;
+            PgchVisStats   vis;
 
+            memset(&vis, 0, sizeof(vis));
             getrusage(RUSAGE_SELF, &r0);
             w0 = GetCurrentTimestamp();
             rows = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block);
+                                               producer, (size_t) hdr->rows_per_block, &vis);
             w1 = GetCurrentTimestamp();
             getrusage(RUSAGE_SELF, &r1);
 
@@ -378,10 +383,25 @@ pgch_shm_worker_main(Datum main_arg)
                  " wall=%.1fms cpu=%.1fms producer_throughput=%.2f Mrows/s(cpu)",
                  hdr->use_vectorized ? "vectorized" : "scalar", rows, wall_ms, cpu_ms,
                  cpu_ms > 0 ? (double) rows / cpu_ms / 1000.0 : 0.0);
+
+            /* Visibility-path breakdown: lets a test prove which path ran (a
+             * result match alone never proves the classifier/oracle executed).
+             * Only meaningful for the vectorized page reader. */
+            if (hdr->use_vectorized)
+                elog(LOG,
+                     "pg_clickhouse shm visibility: vis_engine=%s pages=" UINT64_FORMAT
+                     " all_visible=" UINT64_FORMAT " classified=" UINT64_FORMAT
+                     " gathered=" UINT64_FORMAT " visible_fast=" UINT64_FORMAT
+                     " invisible_fast=" UINT64_FORMAT " undecided=" UINT64_FORMAT
+                     " slow_visible=" UINT64_FORMAT,
+                     vis.vectorized ? "vectorized" : "scalar",
+                     vis.pages_total, vis.pages_all_visible, vis.pages_classified,
+                     vis.tuples_gathered, vis.n_visible_fast, vis.n_invisible_fast,
+                     vis.n_undecided, vis.n_slow_visible);
         }
         else
             (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block);
+                                               producer, (size_t) hdr->rows_per_block, NULL);
 
         /* Producer-outlives-consumer: wait for every retained block to release,
          * then unlink the SHM object + socket. */

@@ -1,106 +1,285 @@
 #!/usr/bin/env bash
-# Visibility-state correctness matrix for the vectorized SHM page reader.
+# Visibility-state correctness AND path-coverage matrix for the vectorized SHM
+# page reader (the branch-free SoA classify kernel + the MVCC slow path).
 #
-# For each representative tuple-visibility state, run the SAME aggregate with
-# pg_clickhouse.enable_shm_offload OFF (baseline PostgreSQL) and ON (vectorized
-# page reader), and assert byte-identical results. enable_shm_offload toggling
-# is the correctness oracle; with the reader ON these exercise the all-visible
-# page fast path, the branch-light hint-bit/xmin/xmax classifier, and the
-# HeapTupleSatisfiesMVCC fallback for undecided tuples.
+# The trap this suite is built to avoid: result-equivalence on all-visible data
+# passes WITHOUT ever running the classifier or the slow path. A freshly
+# VACUUM/FREEZE'd relation takes the all-visible page fast path and emits every
+# tuple, so the not-all-visible classifier and the MVCC oracle are never
+# entered, yet every result assertion goes green. So every case here PROVES the
+# intended path was taken, via two independent instruments:
+#
+#   1. pg_visibility -- proves the PAGE-STATE precondition (e.g. that the table
+#      is genuinely NOT all-visible, so the classify path is the only one that
+#      can run). Independent of our own code.
+#   2. The pg_clickhouse.shm_log_stream_stats "shm visibility:" LOG line -- the
+#      per-scan path/verdict counters (pages classified, per-verdict tuple
+#      tallies, slow-path resolutions). Proves which classifier lane and the
+#      MVCC oracle actually executed.
+#
+# Correctness oracle: every case asserts the offloaded result is byte-identical
+# with the blessed scalar scan (enable_shm_offload off) AND identical with the
+# scalar reference classifier (shm_vectorized_visibility off) -- so the kernel,
+# the reference, and PostgreSQL all agree on the visible set.
+#
+# autovacuum is DISABLED on the fixtures: an insert-triggered autovacuum will
+# otherwise asynchronously mark a table all-visible and silently defeat the
+# not-all-visible cases.
 #
 # Requires the ch_bench server running:
 #   RUN_ID=tpchcb dev/bench/ch-bench-server.sh start
 #
-# Env: PGDB (tpch_sf10), CH_SERVER (ch_bench)
+# Env: PGDB (tpch_sf10), CH_SERVER (ch_bench), PGLOG (postgres server log).
 set -uo pipefail
 
 PGDB="${PGDB:-tpch_sf10}"
 CH_SERVER="${CH_SERVER:-ch_bench}"
+PGLOG="${PGLOG:-/var/log/postgresql/postgresql-18-main.log}"
 PASS=0
 FAIL=0
 
 PSQL=(sudo -u postgres psql -d "$PGDB" -tAqX -v ON_ERROR_STOP=1)
 
-# Offload session settings (vectorized reader ON).
-OFFLOAD_ON="LOAD 'pg_clickhouse';
-SET pg_clickhouse.local_ch_server = '${CH_SERVER}';
-SET pg_clickhouse.shm_min_rows = 0;
-SET pg_clickhouse.session_settings = 'allow_experimental_streamed_table_function 1, max_threads 1';
-SET pg_clickhouse.shm_vectorized_reader = on;
-SET pg_clickhouse.enable_shm_offload = on;"
-
-# The query: a few aggregates + a filter, over the int/date/numeric-free columns
-# so the vectorized path is eligible (no Decimal).
 Q="SELECT count(*), sum(a), sum(b), min(d), max(d) FROM vis WHERE a >= 0;"
+RESULT=""          # query result of the most recent run_on
+VIS_LINE=""        # the "shm visibility:" LOG line from the most recent run_on
 
-run_off() { "${PSQL[@]}" -c "SET pg_clickhouse.enable_shm_offload = off; $Q"; }
-run_on()  { printf '%s\n%s\n' "$OFFLOAD_ON" "$Q" | "${PSQL[@]}"; }
-
-check() {
-  # $1 = label
-  local label="$1" off on
-  off="$(run_off)"
-  on="$(run_on)"
-  if [ "$off" = "$on" ]; then
-    PASS=$((PASS+1)); printf '  PASS  %-28s off==on  [%s]\n' "$label" "$on"
-  else
-    FAIL=$((FAIL+1)); printf '  FAIL  %-28s off=[%s] on=[%s]\n' "$label" "$off" "$on"
-  fi
+# ---- session settings for an offload run; $1 = shm_vectorized_visibility on/off
+on_prelude() {
+  printf '%s\n' \
+    "LOAD 'pg_clickhouse';" \
+    "SET pg_clickhouse.local_ch_server = '${CH_SERVER}';" \
+    "SET pg_clickhouse.shm_min_rows = 0;" \
+    "SET pg_clickhouse.session_settings = 'allow_experimental_streamed_table_function 1, max_threads 1';" \
+    "SET pg_clickhouse.shm_log_stream_stats = on;" \
+    "SET pg_clickhouse.shm_vectorized_reader = on;" \
+    "SET pg_clickhouse.shm_vectorized_visibility = $1;" \
+    "SET pg_clickhouse.enable_shm_offload = on;"
 }
 
-echo "=== vectorized reader visibility matrix (db=${PGDB}) ==="
+qx() { "${PSQL[@]}" -c "$1" >/dev/null 2>&1; }
 
-# Fixtures: a = int4 (sign drives the filter), b = float8, c = text (forces a
-# varlena before d), d = date. All NOT NULL so the table is offload-eligible.
-"${PSQL[@]}" -c "DROP TABLE IF EXISTS vis;" >/dev/null
-"${PSQL[@]}" -c "CREATE TABLE vis (a int NOT NULL, b float8 NOT NULL, c text NOT NULL, d date NOT NULL);" >/dev/null
-"${PSQL[@]}" -c "INSERT INTO vis SELECT g, g*1.5, 'row'||g, date '2000-01-01' + g FROM generate_series(1,5000) g;" >/dev/null
+# Run query $1 with offload OFF (the blessed scalar table scan). Echoes result.
+run_off() { "${PSQL[@]}" -c "SET pg_clickhouse.enable_shm_offload = off; $1"; }
 
-# 1) Freshly inserted + committed, hint bits NOT yet set -> classifier UNDECIDED
-#    -> HeapTupleSatisfiesMVCC fallback path.
-check "fresh_committed_unhinted"
+# Run query $1 offloaded with vectorized-visibility $2 (on=kernel, off=scalar
+# reference). Sets globals RESULT (query output) and VIS_LINE (the "shm
+# visibility:" LOG line emitted by the background streaming worker; that line can
+# land in the server log slightly after the client gets its result, so poll).
+# NB: call as a statement, never as $(run_on ...) -- a command-substitution
+# subshell would discard the VIS_LINE/RESULT globals.
+run_on() {
+  local mark i line
+  mark=$(sudo wc -l < "$PGLOG")
+  RESULT=$(printf '%s\n%s\n' "$(on_prelude "$2")" "$1" | "${PSQL[@]}")
+  VIS_LINE=""
+  for i in $(seq 1 25); do
+    line=$(sudo tail -n +"$((mark+1))" "$PGLOG" | grep -E "pg_clickhouse shm visibility:" | tail -1)
+    [ -n "$line" ] && { VIS_LINE="$line"; break; }
+    sleep 0.2
+  done
+}
 
-# 2) Hint bits now set (the OFF baseline run above scanned the heap and set
-#    HEAP_XMIN_COMMITTED) -> classifier fast VISIBLE lane (not yet all-visible).
-check "committed_hinted_not_allvisible"
+# A counter field from VIS_LINE (e.g. vf undecided).
+vf() { grep -oE "$1=[0-9]+" <<<"$VIS_LINE" | head -1 | cut -d= -f2; }
+# The vis_engine word (vectorized|scalar).
+veng() { grep -oE "vis_engine=[a-z]+" <<<"$VIS_LINE" | head -1 | cut -d= -f2; }
 
-# 3) VACUUM (FREEZE) -> page PD_ALL_VISIBLE -> all-visible page fast path
-#    (zero per-tuple visibility work).
-"${PSQL[@]}" -c "VACUUM (FREEZE, ANALYZE) vis;" >/dev/null
-check "all_visible_frozen"
+allvis_pages() { "${PSQL[@]}" -c "SELECT count(*) FILTER (WHERE all_visible) FROM pg_visibility('$1'::regclass);"; }
+total_pages()  { "${PSQL[@]}" -c "SELECT count(*) FROM pg_visibility('$1'::regclass);"; }
 
-# 4) Deleted + committed rows must NOT appear.
-"${PSQL[@]}" -c "DELETE FROM vis WHERE a % 7 = 0;" >/dev/null
-check "deleted_committed"
+ok()  { PASS=$((PASS+1)); printf '  PASS  %-34s %s\n' "$1" "$2"; }
+bad() { FAIL=$((FAIL+1)); printf '  FAIL  %-34s %s\n' "$1" "$2"; }
 
-# 5) HOT update (in-page new version; old version's xmax = updater) -> exercises
-#    the xmax classifier / fallback and HOT-chain handling (we only ever see the
-#    live LP_NORMAL version).
-"${PSQL[@]}" -c "UPDATE vis SET b = b + 1 WHERE a % 11 = 0;" >/dev/null
-check "hot_updated"
+# $1 label, $2 actual, $3 expected
+expect_eq() { [ "$2" = "$3" ] && ok "$1" "[$2]" || bad "$1" "got [$2] want [$3]"; }
+# $1 label, $2 actual, $3 threshold, $4 note
+expect_gt() { { [ -n "$2" ] && [ "$2" -gt "$3" ] 2>/dev/null; } && ok "$1" "$4 ($2 > $3)" || bad "$1" "$4: got [$2] want > $3"; }
+# $1 label, off, vec, scalar
+expect_3eq() { { [ "$2" = "$3" ] && [ "$2" = "$4" ]; } && ok "$1" "off==vec==scalar [$2]" || bad "$1" "off=[$2] vec=[$3] scalar=[$4]"; }
 
-# 6) Concurrent UNCOMMITTED insert in another session must NOT be visible to the
-#    offload scan (its snapshot predates the other xact). Session B holds an
-#    uncommitted INSERT open via pg_sleep while we run OFF then ON here.
-"${PSQL[@]}" -c "BEGIN; INSERT INTO vis SELECT 1000000+g, 0, 'u'||g, date '2000-01-01' FROM generate_series(1,3000) g; SELECT pg_sleep(12); ROLLBACK;" >/dev/null 2>&1 &
-BG=$!
-sleep 3   # let session B's INSERT land (still uncommitted)
-check "concurrent_uncommitted_insert"
-wait "$BG" 2>/dev/null || true
+recreate() {  # fresh, autovacuum-disabled fixture (a int, b float8, c text forces a varlena, d date)
+  qx "DROP TABLE IF EXISTS vis;"
+  qx "CREATE TABLE vis (a int NOT NULL, b float8 NOT NULL, c text NOT NULL, d date NOT NULL)
+        WITH (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+  # date kept within ClickHouse Date range (1970..2149) via % 3000 regardless of N
+  qx "INSERT INTO vis SELECT g, g*1.5, 'row'||g, date '2000-01-01' + (g % 3000) FROM generate_series(1,$1) g;"
+}
 
-# 7) Concurrent UNCOMMITTED delete in another session must STILL be visible
-#    (the delete is not visible to our snapshot).
-"${PSQL[@]}" -c "BEGIN; DELETE FROM vis WHERE a % 13 = 0; SELECT pg_sleep(12); ROLLBACK;" >/dev/null 2>&1 &
+echo "=== vectorized reader visibility path+result matrix (db=${PGDB}) ==="
+qx "CREATE EXTENSION IF NOT EXISTS pg_visibility;"
+
+# ---------------------------------------------------------------------------
+# 1) fresh_committed_unhinted -> UNDECIDED -> MVCC slow path.
+#    Freshly inserted+committed, no hint bits, not vacuumed. The kernel cannot
+#    prove visibility from hints, so every tuple is UNDECIDED and resolved by the
+#    oracle. Run the kernel FIRST (before any scan sets hint bits).
+# ---------------------------------------------------------------------------
+recreate 5000
+expect_eq "1.precondition_not_all_visible" "$(allvis_pages vis)" "0"
+run_on "$Q" on; on_vec=$RESULT           # kernel run while still unhinted
+expect_eq "1.vis_engine_vectorized"   "$(veng)"            "vectorized"
+expect_gt "1.classified_pages"        "$(vf classified)"   "0" "classify path ran"
+expect_gt "1.undecided_to_oracle"     "$(vf undecided)"    "0" "unhinted -> UNDECIDED"
+expect_gt "1.slow_path_visible"       "$(vf slow_visible)" "0" "oracle resolved visible"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "1.result_equiv" "$off" "$on_vec" "$on_sca"
+
+# ---------------------------------------------------------------------------
+# 2) committed_hinted_not_all_visible -> definite VISIBLE fast lane.
+#    The oracle above set HEAP_XMIN_COMMITTED; autovacuum is off so PD_ALL_VISIBLE
+#    is still unset. The kernel now proves VISIBLE from hints alone, no oracle.
+# ---------------------------------------------------------------------------
+expect_eq "2.precondition_not_all_visible" "$(allvis_pages vis)" "0"
+run_on "$Q" on; on_vec=$RESULT
+expect_gt "2.classified_pages"   "$(vf classified)"    "0" "classify path ran"
+expect_gt "2.visible_fast"       "$(vf visible_fast)"  "0" "hinted -> fast VISIBLE"
+expect_eq "2.no_undecided"       "$(vf undecided)"     "0"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "2.result_equiv" "$off" "$on_vec" "$on_sca"
+
+# ---------------------------------------------------------------------------
+# 3) all_visible_frozen -> all-visible page fast path (zero per-tuple work).
+# ---------------------------------------------------------------------------
+qx "VACUUM (FREEZE, ANALYZE) vis;"
+np=$(total_pages vis)
+expect_eq "3.precondition_all_visible" "$(allvis_pages vis)" "$np"
+run_on "$Q" on; on_vec=$RESULT
+expect_eq "3.all_visible_pages"  "$(vf all_visible)" "$np"
+expect_eq "3.no_classify"        "$(vf classified)" "0"
+expect_eq "3.no_gather"          "$(vf gathered)"   "0"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "3.result_equiv" "$off" "$on_vec" "$on_sca"
+
+# ---------------------------------------------------------------------------
+# 4) deleted_committed -> definite INVISIBLE fast lane (committed visible deleter).
+#    DELETE+commit on the frozen table clears PD_ALL_VISIBLE on touched pages.
+#    First kernel run finds the dead tuples' xmax unhinted (UNDECIDED -> oracle,
+#    which sets HEAP_XMAX_COMMITTED); the second run proves the INVISIBLE fast
+#    lane. Only offload scans touch the table in between (they never prune), so
+#    the dead tuples persist long enough to be classified.
+# ---------------------------------------------------------------------------
+qx "DELETE FROM vis WHERE a % 7 = 0;"
+expect_eq "4.precondition_not_all_visible" "$(allvis_pages vis)" "0"
+run_on "$Q" on                            # run #1: oracle hints xmax committed
+run_on "$Q" on; on_vec=$RESULT            # run #2: kernel proves INVISIBLE fast
+expect_gt "4.classified_pages"  "$(vf classified)"     "0" "classify path ran"
+expect_gt "4.invisible_fast"    "$(vf invisible_fast)" "0" "committed deleter -> fast INVISIBLE"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "4.result_equiv" "$off" "$on_vec" "$on_sca"
+
+# ---------------------------------------------------------------------------
+# 5) hot_updated -> old version xmax=committed updater, new version xmin=committed.
+#    Exercises both classifier sides on a not-all-visible page; the visible set
+#    is only the live versions.
+# ---------------------------------------------------------------------------
+qx "VACUUM (FREEZE, ANALYZE) vis;"          # reset to all-visible, then dirty it
+qx "UPDATE vis SET b = b + 1 WHERE a % 11 = 0;"
+expect_eq "5.precondition_not_all_visible" "$(allvis_pages vis)" "0"
+run_on "$Q" on                               # hint the updater xmax / new xmin
+run_on "$Q" on; on_vec=$RESULT
+expect_gt "5.classified_pages"  "$(vf classified)"   "0" "classify path ran"
+expect_gt "5.visible_fast"      "$(vf visible_fast)" "0" "live versions -> fast VISIBLE"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "5.result_equiv" "$off" "$on_vec" "$on_sca"
+
+# ---------------------------------------------------------------------------
+# Concurrency: a second session holds an xact open (pg_sleep) so our snapshot
+# cannot resolve its xid from hints -> the affected tuples are UNDECIDED and go
+# to the oracle. We assert undecided>0 (path proof) AND off==vec==scalar for the
+# SAME concurrent state. Fixtures are FREEZE'd first so only the concurrently
+# touched tuples are on not-all-visible pages.
+# ---------------------------------------------------------------------------
+run_under_concurrency() {  # $1 label, $2 bg-sql, $3 expect-undecided-note
+  qx "VACUUM (FREEZE, ANALYZE) vis;"
+  "${PSQL[@]}" -c "BEGIN; $2 SELECT pg_sleep(14); ROLLBACK;" >/dev/null 2>&1 &
+  local bg=$!
+  sleep 3                                   # let the bg statement land (uncommitted)
+  local on_vec on_sca off
+  run_on "$Q" on; on_vec=$RESULT
+  expect_gt "${1}.undecided_to_oracle" "$(vf undecided)" "0" "$3"
+  run_on "$Q" off; on_sca=$RESULT
+  off=$(run_off "$Q")
+  expect_3eq "${1}.result_equiv" "$off" "$on_vec" "$on_sca"
+  wait "$bg" 2>/dev/null || true
+}
+
+# 6) concurrent UNCOMMITTED insert: in-flight rows must NOT be visible to us.
+recreate 5000
+run_under_concurrency "6.concurrent_insert" \
+  "INSERT INTO vis SELECT 1000000+g, 0, 'u'||g, date '2000-01-01' FROM generate_series(1,3000) g;" \
+  "in-progress inserter -> UNDECIDED"
+
+# 7) concurrent UNCOMMITTED delete (rolled back): rows must STILL be visible.
+recreate 5000
+run_under_concurrency "7.concurrent_delete" \
+  "DELETE FROM vis WHERE a % 13 = 0;" \
+  "in-progress deleter -> UNDECIDED"
+
+# 8) concurrent in-flight UPDATE: old version's xmax is an in-progress updater.
+recreate 5000
+run_under_concurrency "8.concurrent_update" \
+  "UPDATE vis SET b = b + 1 WHERE a % 9 = 0;" \
+  "in-progress updater -> UNDECIDED"
+
+# 9) multixact (non-lock-only): a held FOR KEY SHARE locker + a concurrent UPDATE
+#    makes the tuple's xmax a MultiXactId that is NOT lock-only -> HEAP_XMAX_IS_MULTI
+#    -> UNDECIDED -> oracle resolves the update xid. Session B holds the key-share
+#    lock open; session C performs the update inside that window.
+recreate 5000
+qx "VACUUM (FREEZE, ANALYZE) vis;"
+"${PSQL[@]}" -c "BEGIN; SELECT * FROM vis WHERE a % 17 = 0 FOR KEY SHARE; SELECT pg_sleep(14); ROLLBACK;" >/dev/null 2>&1 &
 BG=$!
 sleep 3
-check "concurrent_uncommitted_delete"
+"${PSQL[@]}" -c "UPDATE vis SET b = b + 1 WHERE a % 17 = 0;" >/dev/null 2>&1   # creates the multixact
+run_on "$Q" on; on_vec=$RESULT
+expect_gt "9.multixact_undecided" "$(vf undecided)" "0" "HEAP_XMAX_IS_MULTI -> UNDECIDED"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "9.result_equiv" "$off" "$on_vec" "$on_sca"
 wait "$BG" 2>/dev/null || true
 
-# 8) Post-vacuum steady state again (mix of all-visible and not).
-"${PSQL[@]}" -c "VACUUM (ANALYZE) vis;" >/dev/null
-check "post_vacuum_mixed"
+# ---------------------------------------------------------------------------
+# 10) Mixed page: visible + invisible + undecided tuples on the same not-all-
+#     visible pages. Committed-hinted survivors (VISIBLE fast) + committed-deleted
+#     (INVISIBLE fast) + a concurrent in-flight delete (UNDECIDED) all at once.
+# ---------------------------------------------------------------------------
+recreate 5000
+qx "DELETE FROM vis WHERE a % 7 = 0;"           # committed deletes
+run_on "$Q" on                                   # hint xmin (survivors) + xmax (deleted)
+run_on "$Q" on                                   # ensure committed-deleted now hinted INVISIBLE-fast
+"${PSQL[@]}" -c "BEGIN; DELETE FROM vis WHERE a % 5 = 0; SELECT pg_sleep(14); ROLLBACK;" >/dev/null 2>&1 &
+BG=$!
+sleep 3
+run_on "$Q" on; on_vec=$RESULT
+expect_gt "10.mixed_visible_fast"   "$(vf visible_fast)"   "0" "survivors VISIBLE"
+expect_gt "10.mixed_invisible_fast" "$(vf invisible_fast)" "0" "committed-deleted INVISIBLE"
+expect_gt "10.mixed_undecided"      "$(vf undecided)"      "0" "in-flight delete UNDECIDED"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "10.mixed_result_equiv" "$off" "$on_vec" "$on_sca"
+wait "$BG" 2>/dev/null || true
 
-"${PSQL[@]}" -c "DROP TABLE IF EXISTS vis;" >/dev/null
+# ---------------------------------------------------------------------------
+# 11) Block-flush straddle on a not-all-visible relation: > rows_per_block (65536)
+#     visible rows, freshly inserted+unhinted, so the classify path (not the
+#     all-visible page path) feeds tuples across the 65536-row publish boundary.
+# ---------------------------------------------------------------------------
+recreate 200000
+expect_eq "11.precondition_not_all_visible" "$(allvis_pages vis)" "0"
+run_on "$Q" on; on_vec=$RESULT
+expect_gt "11.classified_pages" "$(vf classified)" "0" "classify path ran across blocks"
+expect_eq "11.gathered_all"     "$(vf gathered)"   "200000"
+run_on "$Q" off; on_sca=$RESULT
+off=$(run_off "$Q")
+expect_3eq "11.straddle_result_equiv" "$off" "$on_vec" "$on_sca"
+
+qx "DROP TABLE IF EXISTS vis;"
 
 echo "================================================================"
 echo "PASS=${PASS}  FAIL=${FAIL}"
