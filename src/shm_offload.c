@@ -57,6 +57,7 @@ bool  pgch_use_vectorized_visibility = true;
 bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
+int   pgch_shm_stream_workers = 0;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -132,6 +133,38 @@ pgch_pg_type_to_ch_wire(Oid pg_type, int32 typmod, ShmOffloadColumn *out)
     out->scale = 0;
     strlcpy(out->ch_type, ch_type, sizeof(out->ch_type));
     return true;
+}
+
+/*
+ * Build the ShmOffloadColumn projection (wire types + names) for the 1-based
+ * heap `attnos` of `rel`. Raises ERROR if a projected column's type is no longer
+ * SHM-supported. Shared by the streaming worker and the backend-side vectorized
+ * eligibility pre-check, so both see an identical projection.
+ */
+int
+pgch_build_offload_columns(Relation rel, List *attnos, ShmOffloadColumn **out_cols)
+{
+    TupleDesc         td = RelationGetDescr(rel);
+    int               ncols = list_length(attnos);
+    ShmOffloadColumn *cols = (ShmOffloadColumn *) palloc0(sizeof(ShmOffloadColumn) * ncols);
+    ListCell         *lc;
+    int               i = 0;
+
+    foreach (lc, attnos)
+    {
+        AttrNumber        attno = (AttrNumber) lfirst_int(lc);
+        Form_pg_attribute att = TupleDescAttr(td, attno - 1);
+
+        if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &cols[i]))
+            ereport(ERROR,
+                    (errmsg("pg_clickhouse: column \"%s\" became unsupported for SHM offload",
+                            NameStr(att->attname))));
+        cols[i].attno = attno;
+        strlcpy(cols[i].name, NameStr(att->attname), sizeof(cols[i].name));
+        i++;
+    }
+    *out_cols = cols;
+    return ncols;
 }
 
 char *
@@ -777,6 +810,15 @@ pgch_shm_offload_init(void)
                             "(amortizes the one-time compile cost; subsequent scans of the same "
                             "shape reuse the cached code).",
                             NULL, &pgch_jit_row_threshold, 2000000, 0, INT_MAX,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.shm_stream_workers",
+                            "Number of cooperating background workers that stream a heap relation "
+                            "into the shared-memory ring in parallel (the eligible vectorized "
+                            "reader only). 0 = auto (scale with the relation's size, capped by "
+                            "max_parallel_workers); 1 = the original single producer. The effective "
+                            "value is also forced as ClickHouse max_threads for the offload query.",
+                            NULL, &pgch_shm_stream_workers, 0, 0, PGCH_SHM_MAX_STREAM_WORKERS,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the

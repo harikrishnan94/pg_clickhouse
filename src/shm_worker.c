@@ -424,7 +424,6 @@ pgch_shm_worker_main(Datum main_arg)
     {
         Snapshot          snap;
         Relation          rel;
-        TupleDesc         td;
         ShmOffloadColumn *cols;
         ShmColumnSchema  *schema;
         ShmProducer      *producer;
@@ -442,21 +441,19 @@ pgch_shm_worker_main(Datum main_arg)
         PushActiveSnapshot(snap);
 
         rel = table_open(hdr->heap_relid, AccessShareLock);
-        td = RelationGetDescr(rel);
 
-        cols = (ShmOffloadColumn *) palloc0(sizeof(ShmOffloadColumn) * ncols);
+        {
+            List *attno_list = NIL;
+
+            for (i = 0; i < ncols; i++)
+                attno_list = lappend_int(attno_list, attnos[i]);
+            ncols = pgch_build_offload_columns(rel, attno_list, &cols);
+        }
+        /* The producer schema (names + CH type strings) follows from the columns. */
         schema = (ShmColumnSchema *) palloc0(sizeof(ShmColumnSchema) * ncols);
         for (i = 0; i < ncols; i++)
         {
-            Form_pg_attribute att = TupleDescAttr(td, attnos[i] - 1);
-
-            if (!pgch_pg_type_to_ch_wire(att->atttypid, att->atttypmod, &cols[i]))
-                ereport(ERROR,
-                        (errmsg("pg_clickhouse: column \"%s\" became unsupported for SHM offload",
-                                NameStr(att->attname))));
-            cols[i].attno = attnos[i];
-            strlcpy(cols[i].name, NameStr(att->attname), sizeof(cols[i].name));
-            strlcpy(schema[i].name, NameStr(att->attname), sizeof(schema[i].name));
+            strlcpy(schema[i].name, cols[i].name, sizeof(schema[i].name));
             strlcpy(schema[i].type_string, cols[i].ch_type, sizeof(schema[i].type_string));
             schema[i].wire = cols[i].wire;
         }

@@ -58,7 +58,9 @@
 
 #include "engine.h"
 #include "fdw.h"
+#include "kv_list.h"
 #include "shm_offload.h"
+#include "shm_page_reader.h"
 #include "shm_producer.h"
 #include "shm_worker.h"
 
@@ -631,6 +633,102 @@ shm_fetch_into_slot(ShmScanState *sss, TupleTableSlot *slot)
     return true;
 }
 
+/*
+ * Auto worker count when pg_clickhouse.shm_stream_workers = 0. Mirrors the core
+ * planner's geometric growth (compute_parallel_worker): one extra worker per ~3x
+ * over min_parallel_table_scan_size (~1024 blocks / 8 MB). Small relations get a
+ * single producer; large ones scale up to the cap.
+ */
+static int
+shm_auto_stream_workers(BlockNumber nblocks)
+{
+    int         w = 1;
+    BlockNumber threshold = 1024;
+
+    while (nblocks >= threshold * 3 && w < PGCH_SHM_MAX_STREAM_WORKERS)
+    {
+        threshold *= 3;
+        w++;
+    }
+    return w;
+}
+
+/*
+ * Decide how many cooperating streaming workers to launch for this offload.
+ * Fail-closed to 1 when the scan is not eligible for the parallel vectorized
+ * reader (the scalar fallback is single-producer), so parallelism is applied
+ * only where it is provably correct. Otherwise honor the GUC (0 = auto) clamped
+ * to [1, min(cap, max_parallel_workers, nblocks)].
+ */
+static int
+shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
+{
+    Relation          rel;
+    ShmOffloadColumn *cols;
+    int               ncols;
+    BlockNumber       nblocks;
+    int               w;
+    int               cap;
+
+    rel = table_open(heap_relid, AccessShareLock);
+    ncols = pgch_build_offload_columns(rel, attnos, &cols);
+
+    /* Not eligible for the vectorized reader -> scalar path -> single producer. */
+    if (!pgch_use_vectorized_reader
+        || !pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
+    {
+        table_close(rel, AccessShareLock);
+        return 1;
+    }
+
+    nblocks = RelationGetNumberOfBlocks(rel);
+    w = (pgch_shm_stream_workers > 0) ? pgch_shm_stream_workers
+                                      : shm_auto_stream_workers(nblocks);
+
+    /* Clamp: never more than the cap, the cluster's parallel-worker budget, or
+     * the number of blocks there are to scan; always at least 1. */
+    cap = PGCH_SHM_MAX_STREAM_WORKERS;
+    if (max_parallel_workers > 0 && cap > max_parallel_workers)
+        cap = max_parallel_workers;
+    if (w > cap)
+        w = cap;
+    if (nblocks > 0 && (BlockNumber) w > nblocks)
+        w = (int) nblocks;
+    if (w < 1)
+        w = 1;
+
+    table_close(rel, AccessShareLock);
+    return w;
+}
+
+/*
+ * Build the ClickHouse session settings for an SHM-offload query with
+ * max_threads forced to the producer worker count `nworkers`: copy every
+ * user-supplied setting except any existing max_threads, then append
+ * max_threads = nworkers. Documented precedence: shm_stream_workers
+ * unconditionally overrides a user-supplied session_settings max_threads, so the
+ * consumer's thread count always matches the producer parallelism.
+ */
+static const kv_list *
+shm_settings_force_max_threads(int nworkers)
+{
+    const kv_list *base = chfdw_get_session_settings();
+    List          *items = NIL;
+    kv_iter        it;
+
+    for (it = new_kv_iter(base); !kv_iter_done(&it); kv_iter_next(&it))
+    {
+        if (pg_strcasecmp(it.name, "max_threads") == 0)
+            continue;       /* drop: shm_stream_workers wins */
+        items = lappend(items, makeDefElem(pstrdup(it.name),
+                                           (Node *) makeString(pstrdup(it.value)), -1));
+    }
+    items = lappend(items, makeDefElem(pstrdup("max_threads"),
+                                       (Node *) makeString(psprintf("%d", nworkers)), -1));
+
+    return new_kv_list_from_pg_list(items, kv_pair_palloc);
+}
+
 /* ExecScan access method: produce the next raw scan tuple. On the first call it
  * launches the streaming background worker and dispatches the ClickHouse query;
  * the worker fills the bounded ring while ClickHouse drains it concurrently. */
@@ -645,22 +743,30 @@ shm_scan_access_mtd(ScanState *ss)
     {
         EState *estate = ss->ps.state;
         MemoryContext old;
+        int nworkers;
 
-        /* 1. Launch the worker to stream the relation into the bounded ring under
-         *    the query snapshot, and wait for it to create the SHM producer +
-         *    control socket so the ClickHouse consumer can attach. */
+        /* 1. Decide producer parallelism (fail-closed to 1 if the scan is not
+         *    eligible for the parallel vectorized reader), then launch that many
+         *    cooperating workers to stream the relation into ONE bounded ring
+         *    under the query snapshot, and wait for all of them to create/attach
+         *    the SHM producer so the ClickHouse consumer can attach. */
+        nworkers = shm_choose_stream_workers(sss->heap_relid, sss->attnos,
+                                             estate->es_snapshot);
         sss->worker = pgch_shm_worker_launch(sss->shm_name, sss->heap_relid, sss->attnos,
                                              estate->es_snapshot,
                                              pgch_shm_ring_depth_k,
                                              (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                             65536, 1);
+                                             65536, nworkers);
         pgch_shm_worker_wait_ready(sss->worker);
 
         /* 2. Dispatch the ClickHouse query; it attaches to the SHM stream and
-         *    drains it concurrently with the worker filling the ring. */
+         *    drains it concurrently with the workers filling the ring. Force the
+         *    consumer's max_threads to match the producer worker count. */
         old = MemoryContextSwitchTo(sss->batch_cxt);
         {
             ch_query query = new_query(sss->sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);
+
+            query.settings = shm_settings_force_max_threads(nworkers);
 
             sss->is_streaming = sss->fetch_size > 0 && sss->conn.methods->streaming_query != NULL;
             if (sss->is_streaming)

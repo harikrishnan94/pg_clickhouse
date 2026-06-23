@@ -59,6 +59,14 @@ extern bool  pgch_use_vectorized_visibility;
 extern bool  pgch_log_stream_stats;
 extern bool  pgch_enable_jit_deform;
 extern int   pgch_jit_row_threshold;
+extern int   pgch_shm_stream_workers;
+
+/*
+ * Hard cap on cooperating SHM streaming workers (the GUC's upper bound and the
+ * auto/clamp ceiling). Stays comfortably below the producer's MAX_PARKED_CONNS
+ * so every worker's control-socket connection can park alongside the consumer's.
+ */
+#define PGCH_SHM_MAX_STREAM_WORKERS 64
 
 /*
  * One projected column to stream. `attno` is the 1-based heap attribute number;
@@ -83,6 +91,13 @@ typedef struct ShmOffloadColumn {
  * (typmod -1, no fixed precision/scale) is declined so the offload fails closed.
  */
 extern bool pgch_pg_type_to_ch_wire(Oid pg_type, int32 typmod, ShmOffloadColumn *out);
+
+/*
+ * Build the ShmOffloadColumn projection (wire types + names) for the 1-based
+ * heap `attnos` of `rel` into a palloc'd array; returns the column count and
+ * sets *out_cols. Raises ERROR if a projected column is no longer SHM-supported.
+ */
+extern int pgch_build_offload_columns(Relation rel, List *attnos, ShmOffloadColumn **out_cols);
 
 /*
  * Build the comma-separated ClickHouse columns string ("name Type, ...") for a
