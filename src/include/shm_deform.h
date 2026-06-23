@@ -108,13 +108,22 @@ typedef struct PgchStep PgchStep;
 typedef void (*PgchStepFn) (const PgchStep *st, char **cur, const bits8 **bits,
                             size_t n, size_t dst_row, void *cz, PgchStringFill str_fill);
 
+typedef enum PgchStepKind
+{
+    PGCH_STEP_WALK = 1,
+    PGCH_STEP_FILL_CONST,
+    PGCH_STEP_FILL_WALK,
+    PGCH_STEP_FILL_STRING
+} PgchStepKind;
+
 struct PgchStep
 {
     PgchStepFn      run;        /* the specialized kernel (chosen at build time) */
     uint32          disp;       /* FILL_CONST: byte offset from data start; WALK: const lead */
     void           *dst_base;   /* fixed-fill target (ColBuf.fixed) */
     int             col_index;  /* columnizer column (string fill) */
-    uint8           align;      /* string-fill / generic-walk positioning alignment */
+    uint8           kind;       /* PgchStepKind, for diagnostics / test harness dumps */
+    uint8           align;      /* string-fill alignment, or WALK final fixed-run alignment */
     const PgchHop  *hops;       /* WALK: hop list (into the caller's hop buffer) */
     int             nhop;
 };

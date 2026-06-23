@@ -74,6 +74,67 @@ align_bytes(char a)
     }
 }
 
+template <int Align, int Nhop>
+static inline char *
+walk_uv_one(char *c)
+{
+    for (int j = 0; j < Nhop; ++j)
+    {
+        if (VARATT_NOT_PAD_BYTE(c))
+            c += VARSIZE_ANY(c);
+        else
+        {
+            c = (char *) TYPEALIGN(Align, (uintptr_t) c);
+            c += VARSIZE_ANY(c);
+        }
+    }
+    return c;
+}
+
+static inline char *
+walk_generic_one(char *c, const PgchHop *h, int m)
+{
+    for (int j = 0; j < m; ++j)
+    {
+        if (h[j].attlen < 0)
+        {
+            if (VARATT_NOT_PAD_BYTE(c))
+                c += VARSIZE_ANY(c);
+            else
+            {
+                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
+                c += VARSIZE_ANY(c);
+            }
+        }
+        else
+            c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
+    }
+    return c;
+}
+
+static inline char *
+walk_nullable_one(char *c, const PgchHop *h, int m, const bits8 *bp)
+{
+    for (int j = 0; j < m; ++j)
+    {
+        if (h[j].null_bit >= 0 && att_isnull(h[j].null_bit, bp))
+            continue;                          /* NULL: no data bytes, no advance */
+        if (h[j].attlen < 0)
+        {
+            if (VARATT_NOT_PAD_BYTE(c))
+                c += VARSIZE_ANY(c);
+            else
+            {
+                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
+                c += VARSIZE_ANY(c);
+            }
+        }
+        else
+            c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
+    }
+    return c;
+}
+
 /* ----------------------------------------------------------------------- */
 /* Specialized leaf kernels                                                */
 /* ----------------------------------------------------------------------- */
@@ -107,10 +168,11 @@ k_fill_walk(const PgchStep *st, char **__restrict cur, const bits8 **,
             size_t n, size_t dst_row, void *, PgchStringFill)
 {
     Dst *__restrict dst = (Dst *) st->dst_base;
+    uint32 disp = st->disp;
 
     for (size_t r = 0; r < n; ++r)
     {
-        char *c = (char *) TYPEALIGN(alignof(Src), (uintptr_t) cur[r]);
+        char *c = (char *) TYPEALIGN(alignof(Src), (uintptr_t) (cur[r] + disp));
         dst[dst_row + r] = Xform() (load<Src>(c));
         cur[r] = c + sizeof(Src);
     }
@@ -155,16 +217,9 @@ k_walk_uv(const PgchStep *st, char **__restrict cur, const bits8 **,
     for (size_t r = 0; r < n; ++r)
     {
         char *c = cur[r] + lead;
-        for (int j = 0; j < Nhop; ++j)
-        {
-            if (VARATT_NOT_PAD_BYTE(c))
-                c += VARSIZE_ANY(c);
-            else
-            {
-                c = (char *) TYPEALIGN(Align, (uintptr_t) c);
-                c += VARSIZE_ANY(c);
-            }
-        }
+        c = walk_uv_one<Align, Nhop>(c);
+        if (st->align)
+            c = (char *) TYPEALIGN(st->align, (uintptr_t) c);
         cur[r] = c;
     }
 }
@@ -177,26 +232,26 @@ k_walk_generic(const PgchStep *st, char **cur, const bits8 **,
     const PgchHop *h = st->hops;
     int            m = st->nhop;
     uint32         lead = st->disp;
+    uint8          final_align = st->align;
 
-    for (size_t r = 0; r < n; ++r)
+    if (final_align)
     {
-        char *c = cur[r] + lead;
-        for (int j = 0; j < m; ++j)
+        for (size_t r = 0; r < n; ++r)
         {
-            if (h[j].attlen < 0)
-            {
-                if (VARATT_NOT_PAD_BYTE(c))
-                    c += VARSIZE_ANY(c);
-                else
-                {
-                    c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
-                    c += VARSIZE_ANY(c);
-                }
-            }
-            else
-                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
+            char *c = cur[r] + lead;
+
+            c = walk_generic_one(c, h, m);
+            cur[r] = (char *) TYPEALIGN(final_align, (uintptr_t) c);
         }
-        cur[r] = c;
+    }
+    else
+    {
+        for (size_t r = 0; r < n; ++r)
+        {
+            char *c = cur[r] + lead;
+
+            cur[r] = walk_generic_one(c, h, m);
+        }
     }
 }
 
@@ -213,24 +268,9 @@ k_walk_nullable(const PgchStep *st, char **cur, const bits8 **bits,
     {
         char        *c = cur[r] + lead;
         const bits8 *bp = bits[r];
-
-        for (int j = 0; j < m; ++j)
-        {
-            if (h[j].null_bit >= 0 && att_isnull(h[j].null_bit, bp))
-                continue;                          /* NULL: no data bytes, no advance */
-            if (h[j].attlen < 0)
-            {
-                if (VARATT_NOT_PAD_BYTE(c))
-                    c += VARSIZE_ANY(c);
-                else
-                {
-                    c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
-                    c += VARSIZE_ANY(c);
-                }
-            }
-            else
-                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
-        }
+        c = walk_nullable_one(c, h, m, bp);
+        if (st->align)
+            c = (char *) TYPEALIGN(st->align, (uintptr_t) c);
         cur[r] = c;
     }
 }
@@ -298,18 +338,19 @@ pick_walk_uv(uint8 align, int nhop)
  * Emits nothing when there is no cursor movement (lead == 0 and no hops). */
 static void
 emit_walk(PgchStep *step, int *ns, uint32 lead,
-          const PgchHop *hops, int m, bool nullable_group)
+          const PgchHop *hops, int m, bool nullable_group, uint8 final_align)
 {
-    if (lead == 0 && m == 0)
+    if (lead == 0 && m == 0 && final_align == 0)
         return;
 
     PgchStep *s = &step[(*ns)++];
+    s->kind = PGCH_STEP_WALK;
     s->disp = lead;
     s->hops = hops;
     s->nhop = m;
     s->dst_base = nullptr;
     s->col_index = -1;
-    s->align = 0;
+    s->align = final_align;
 
     if (nullable_group)
     {
@@ -336,6 +377,78 @@ emit_walk(PgchStep *step, int *ns, uint32 lead,
     s->run = k_walk_generic;
 }
 
+/*
+ * Try to form a statically-addressable fixed-width tail run starting at a
+ * projected fixed column. The run is safe only while every later column's
+ * alignment is <= the first column's alignment; otherwise offsets would depend
+ * on the post-varlena cursor address. In group B, nullable skipped columns also
+ * terminate the run because NULLs occupy no bytes.
+ */
+static bool
+tail_fixed_run(const PgchDeformCol *col, int max_attno, int start, bool nullable_group,
+               int *run_end, uint8 *base_align, uint32 *run_width)
+{
+    const PgchDeformCol *first = &col[start];
+    uint8               ba;
+    uint32              off = 0;
+    int                 j;
+
+    if (!first->is_needed || first->is_string || first->attlen <= 0)
+        return false;
+
+    ba = align_bytes(first->attalign);
+    for (j = start; j < max_attno; ++j)
+    {
+        const PgchDeformCol *c = &col[j];
+        uint8               a;
+
+        if (c->attlen <= 0 || c->is_string)
+            break;
+        if (nullable_group && c->nullable && !c->is_needed)
+            break;
+
+        a = align_bytes(c->attalign);
+        if (a > ba)
+            break;
+
+        off = (uint32) att_align_nominal(off, c->attalign);
+        off += (uint32) c->attlen;
+    }
+
+    *run_end = j;
+    *base_align = ba;
+    *run_width = off;
+    return j > start;
+}
+
+static void
+emit_tail_fixed_fills(PgchStep *step, int *ns, const PgchDeformCol *col,
+                      int start, int run_end)
+{
+    uint32 off = 0;
+
+    for (int j = start; j < run_end; ++j)
+    {
+        const PgchDeformCol *c = &col[j];
+
+        off = (uint32) att_align_nominal(off, c->attalign);
+        if (c->is_needed)
+        {
+            PgchStep *s = &step[(*ns)++];
+
+            s->kind = PGCH_STEP_FILL_CONST;
+            s->run = pick_fill_const(c->wire);
+            s->disp = off;
+            s->dst_base = c->dst_base;
+            s->col_index = c->col_index;
+            s->hops = nullptr;
+            s->nhop = 0;
+            s->align = 0;
+        }
+        off += (uint32) c->attlen;
+    }
+}
+
 /* Build one group's plan. `prefix_len`/`walk_start_off` select the group; for
  * group B, nullable non-projected columns become NULL-checked hops. */
 static void
@@ -352,6 +465,7 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
         if (col[i].is_needed)
         {
             PgchStep *s = &step[ns++];
+            s->kind = PGCH_STEP_FILL_CONST;
             s->run = pick_fill_const(col[i].wire);     /* prefix is fixed-width, never string */
             s->disp = col[i].disp;
             s->dst_base = col[i].dst_base;
@@ -379,11 +493,37 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
             }
 
             /* projected column (group B: NOT NULL): walk to it, then fill. */
-            emit_walk(step, &ns, lead, &hop[hop_start], nh - hop_start, nullable_group);
+            if (!c->is_string && c->attlen > 0 && nh > hop_start)
+            {
+                int    run_end;
+                uint8  base_align;
+                uint32 run_width;
+
+                if (tail_fixed_run(col, d->max_attno, i, nullable_group,
+                                   &run_end, &base_align, &run_width))
+                {
+                    emit_walk(step, &ns, lead, &hop[hop_start], nh - hop_start,
+                              nullable_group, base_align);
+                    emit_tail_fixed_fills(step, &ns, col, i, run_end);
+
+                    lead = run_width;           /* cur is the fixed-run base */
+                    hop_start = nh;
+                    i = run_end - 1;
+                    continue;
+                }
+            }
+
+            uint32 fill_disp = 0;
+
+            if (!c->is_string && c->attlen > 0 && nh == hop_start)
+                fill_disp = lead;
+            else
+                emit_walk(step, &ns, lead, &hop[hop_start], nh - hop_start, nullable_group, 0);
 
             PgchStep *s = &step[ns++];
             if (c->is_string)
             {
+                s->kind = PGCH_STEP_FILL_STRING;
                 s->run = k_fill_string;
                 s->align = align_bytes(c->attalign);
                 s->col_index = c->col_index;
@@ -391,10 +531,11 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
             }
             else
             {
+                s->kind = PGCH_STEP_FILL_WALK;
                 s->run = pick_fill_walk(c->wire);
                 s->dst_base = c->dst_base;
                 s->col_index = c->col_index;
-                s->disp = 0; s->align = 0; s->hops = nullptr; s->nhop = 0;
+                s->disp = fill_disp; s->align = 0; s->hops = nullptr; s->nhop = 0;
             }
 
             /* the fill advanced cur past this column; start a fresh segment */
