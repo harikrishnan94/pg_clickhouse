@@ -29,22 +29,26 @@
 typedef struct ShmWorkerHandle ShmWorkerHandle;
 
 /*
- * Launch a background worker that creates the SHM producer named `shm_name`,
- * then streams `heap_relid` (projecting the 1-based `attnos`, an integer List)
- * under `snapshot` into a bounded ring of `ring_depth_k` slots over a
- * `data_region_size`-byte data region, in blocks of `rows_per_block` rows.
+ * Launch `nworkers` (>= 1) cooperating background workers that stream
+ * `heap_relid` (projecting the 1-based `attnos`, an integer List) under
+ * `snapshot` into ONE bounded shared ring named `shm_name` (`ring_depth_k` slots
+ * over a `data_region_size`-byte data region, `rows_per_block` rows per block).
+ * Worker 0 owns the ring; the rest attach as secondary producers and the W
+ * workers cooperatively cover the relation's blocks under the one shared
+ * snapshot. `nworkers == 1` reproduces the single-producer path.
  *
- * Returns a handle owned by the caller. Raises ERROR if the worker cannot be
- * registered or started. The returned worker has created neither the SHM object
- * nor the control socket yet -- call pgch_shm_worker_wait_ready before
- * dispatching the ClickHouse query.
+ * Returns a handle owning all W workers + the shared DSM. Raises ERROR (after
+ * reaping any already-started workers) if a worker cannot be registered or
+ * started. The workers have not necessarily created/attached the SHM object yet
+ * -- call pgch_shm_worker_wait_ready before dispatching the ClickHouse query.
  */
 extern ShmWorkerHandle *pgch_shm_worker_launch(const char *shm_name,
                                                Oid heap_relid, List *attnos,
                                                Snapshot snapshot,
                                                int ring_depth_k,
                                                Size data_region_size,
-                                               int rows_per_block);
+                                               int rows_per_block,
+                                               int nworkers);
 
 /*
  * Block until the worker has created the SHM object + control socket (so the

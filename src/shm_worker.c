@@ -59,8 +59,37 @@ typedef enum ShmWorkerState
 } ShmWorkerState;
 
 /*
- * DSM layout: this fixed header, followed by AttrNumber[ncols] at attnos_offset,
- * followed by the serialized snapshot at snapshot_offset.
+ * Per-worker status word + error buffer (worker -> backend). With W cooperating
+ * workers there is one of these per worker, in the shared DSM, so the backend can
+ * tell which worker is ready / done / failed.
+ */
+typedef struct ShmWorkerSlot
+{
+    pg_atomic_uint32 state;          /* ShmWorkerState */
+    char             errmsg[1024];
+} ShmWorkerSlot;
+
+/*
+ * Cross-process coordination shared by all W workers on one ring (in the DSM):
+ *   - publish: the ring slot-claim cursor + global block sequence (shm_producer);
+ *   - block:   the heap-block work allocator for the parallel vectorized reader;
+ *   - active_workers: initialized to W; each worker decrements when it finishes
+ *     streaming, and the worker that drives it to 0 publishes the single EOS.
+ */
+typedef struct ShmWorkerCoord
+{
+    ShmPublishCoord  publish;
+    ShmBlockCursor   block;
+    pg_atomic_uint32 active_workers;
+    pg_atomic_uint32 eos_done;       /* set 1 AFTER the single EOS block is published */
+    pg_atomic_uint32 aborted;        /* set 1 by any worker that errors out */
+} ShmWorkerCoord;
+
+/*
+ * DSM layout: this fixed header, then AttrNumber[ncols] at attnos_offset, then
+ * the serialized snapshot at snapshot_offset, then one ShmWorkerCoord at
+ * coord_offset, then ShmWorkerSlot[nworkers] at wslot_offset. All W workers
+ * attach the SAME segment; the originating backend's PGPROC pins the snapshot.
  */
 typedef struct ShmWorkerHeader
 {
@@ -69,6 +98,7 @@ typedef struct ShmWorkerHeader
     Oid         user_id;
     Oid         heap_relid;
     int         ncols;
+    int         nworkers;            /* number of cooperating streaming workers (W) */
     int         ring_depth_k;
     Size        data_region_size;
     int         rows_per_block;
@@ -83,17 +113,28 @@ typedef struct ShmWorkerHeader
     Size        attnos_offset;
     Size        snapshot_offset;
     Size        snapshot_len;
-
-    /* status (worker -> backend) */
-    pg_atomic_uint32 state;
-    char        errmsg[1024];
+    Size        coord_offset;        /* ShmWorkerCoord */
+    Size        wslot_offset;        /* ShmWorkerSlot[nworkers] */
 } ShmWorkerHeader;
+
+static inline ShmWorkerCoord *
+coord_of(ShmWorkerHeader *hdr)
+{
+    return (ShmWorkerCoord *) ((char *) hdr + hdr->coord_offset);
+}
+
+static inline ShmWorkerSlot *
+wslot_of(ShmWorkerHeader *hdr, int i)
+{
+    return &((ShmWorkerSlot *) ((char *) hdr + hdr->wslot_offset))[i];
+}
 
 struct ShmWorkerHandle
 {
     dsm_segment            *seg;
     ShmWorkerHeader        *hdr;
-    BackgroundWorkerHandle *bgw;
+    int                     nworkers;
+    BackgroundWorkerHandle **bgw;    /* [nworkers] */
     bool                    shut_down;
 };
 
@@ -104,32 +145,37 @@ struct ShmWorkerHandle
 ShmWorkerHandle *
 pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
                        Snapshot snapshot, int ring_depth_k,
-                       Size data_region_size, int rows_per_block)
+                       Size data_region_size, int rows_per_block, int nworkers)
 {
     ShmWorkerHandle *h;
     dsm_segment    *seg;
     ShmWorkerHeader *hdr;
+    ShmWorkerCoord *coord;
     AttrNumber     *attno_arr;
     Size            hdr_sz;
     Size            attnos_sz;
     Size            snap_sz;
+    Size            coord_sz;
     int             ncols = list_length(attnos);
     int             i;
+    int             w;
+    int             launched = 0;
     ListCell       *lc;
-    BackgroundWorker bgw;
-    BackgroundWorkerHandle *bgwhandle = NULL;
-    pid_t           pid;
 
     if (ncols <= 0)
         ereport(ERROR, (errmsg("pg_clickhouse: shm streaming worker needs at least one column")));
     if (strlen(shm_name) >= sizeof(hdr->shm_name))
         ereport(ERROR, (errmsg("pg_clickhouse: shm object name too long for the streaming worker")));
+    if (nworkers < 1)
+        nworkers = 1;
 
     hdr_sz = MAXALIGN(sizeof(ShmWorkerHeader));
     attnos_sz = MAXALIGN(sizeof(AttrNumber) * ncols);
-    snap_sz = EstimateSnapshotSpace(snapshot);
+    snap_sz = MAXALIGN(EstimateSnapshotSpace(snapshot));
+    coord_sz = MAXALIGN(sizeof(ShmWorkerCoord));
 
-    seg = dsm_create(hdr_sz + attnos_sz + snap_sz, 0);
+    seg = dsm_create(hdr_sz + attnos_sz + snap_sz + coord_sz
+                     + (Size) nworkers * MAXALIGN(sizeof(ShmWorkerSlot)), 0);
     /* Pin the mapping so the backend's resource owner does not detach it from
      * under us on a subtransaction boundary; we detach explicitly in shutdown. */
     dsm_pin_mapping(seg);
@@ -140,6 +186,7 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->user_id = GetUserId();
     hdr->heap_relid = heap_relid;
     hdr->ncols = ncols;
+    hdr->nworkers = nworkers;
     hdr->ring_depth_k = ring_depth_k;
     hdr->data_region_size = data_region_size;
     hdr->rows_per_block = rows_per_block;
@@ -156,7 +203,8 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->attnos_offset = hdr_sz;
     hdr->snapshot_offset = hdr_sz + attnos_sz;
     hdr->snapshot_len = snap_sz;
-    pg_atomic_init_u32(&hdr->state, PGCH_WS_INIT);
+    hdr->coord_offset = hdr_sz + attnos_sz + snap_sz;
+    hdr->wslot_offset = hdr->coord_offset + coord_sz;
 
     attno_arr = (AttrNumber *) ((char *) hdr + hdr->attnos_offset);
     i = 0;
@@ -165,77 +213,130 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
 
     SerializeSnapshot(snapshot, (char *) hdr + hdr->snapshot_offset);
 
-    memset(&bgw, 0, sizeof(bgw));
-    bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-    bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-    bgw.bgw_restart_time = BGW_NEVER_RESTART;
-    strncpy(bgw.bgw_library_name, "pg_clickhouse", BGW_MAXLEN);
-    strncpy(bgw.bgw_function_name, "pgch_shm_worker_main", BGW_MAXLEN);
-    snprintf(bgw.bgw_name, BGW_MAXLEN, "pg_clickhouse shm stream %u", heap_relid);
-    snprintf(bgw.bgw_type, BGW_MAXLEN, "pg_clickhouse shm stream");
-    bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
-    bgw.bgw_notify_pid = MyProcPid;
-
-    if (!RegisterDynamicBackgroundWorker(&bgw, &bgwhandle))
-        ereport(ERROR,
-                (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-                 errmsg("pg_clickhouse: could not register SHM streaming background worker"),
-                 errhint("Consider raising max_worker_processes.")));
-
-    if (WaitForBackgroundWorkerStartup(bgwhandle, &pid) != BGWH_STARTED)
-    {
-        pfree(bgwhandle);
-        dsm_detach(seg);
-        ereport(ERROR, (errmsg("pg_clickhouse: SHM streaming background worker failed to start")));
-    }
+    /* Initialize the shared coordination before any worker can start. */
+    coord = coord_of(hdr);
+    pg_atomic_init_u64(&coord->publish.next_slot, 0);
+    pg_atomic_init_u64(&coord->publish.global_seq, 0);
+    pg_atomic_init_u32(&coord->block.next_block, 0);
+    pg_atomic_init_u32(&coord->active_workers, (uint32) nworkers);
+    pg_atomic_init_u32(&coord->eos_done, 0);
+    pg_atomic_init_u32(&coord->aborted, 0);
+    for (w = 0; w < nworkers; w++)
+        pg_atomic_init_u32(&wslot_of(hdr, w)->state, PGCH_WS_INIT);
 
     h = (ShmWorkerHandle *) palloc0(sizeof(ShmWorkerHandle));
     h->seg = seg;
     h->hdr = hdr;
-    h->bgw = bgwhandle;
+    h->nworkers = nworkers;
+    h->bgw = (BackgroundWorkerHandle **) palloc0(sizeof(BackgroundWorkerHandle *) * nworkers);
     h->shut_down = false;
+
+    for (w = 0; w < nworkers; w++)
+    {
+        BackgroundWorker bgw;
+        BackgroundWorkerHandle *bgwhandle = NULL;
+        pid_t pid;
+
+        memset(&bgw, 0, sizeof(bgw));
+        bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+        bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+        bgw.bgw_restart_time = BGW_NEVER_RESTART;
+        strncpy(bgw.bgw_library_name, "pg_clickhouse", BGW_MAXLEN);
+        strncpy(bgw.bgw_function_name, "pgch_shm_worker_main", BGW_MAXLEN);
+        snprintf(bgw.bgw_name, BGW_MAXLEN, "pg_clickhouse shm stream %u/%d", heap_relid, w);
+        snprintf(bgw.bgw_type, BGW_MAXLEN, "pg_clickhouse shm stream");
+        bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+        bgw.bgw_notify_pid = MyProcPid;
+        /* Per-worker index (owner == 0) carried in bgw_extra. */
+        memcpy(bgw.bgw_extra, &w, sizeof(w));
+
+        if (!RegisterDynamicBackgroundWorker(&bgw, &bgwhandle))
+        {
+            /* Could not register the full set; reap whatever started and fail
+             * (fail-closed: do not silently run with fewer producers than the
+             * active_workers count, which would hang the consumer at EOS). */
+            h->shut_down = false;
+            pgch_shm_worker_shutdown(h);
+            ereport(ERROR,
+                    (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+                     errmsg("pg_clickhouse: could not register SHM streaming background worker %d/%d",
+                            w, nworkers),
+                     errhint("Consider raising max_worker_processes.")));
+        }
+        h->bgw[w] = bgwhandle;
+        launched++;
+
+        if (WaitForBackgroundWorkerStartup(bgwhandle, &pid) != BGWH_STARTED)
+        {
+            pgch_shm_worker_shutdown(h);
+            ereport(ERROR, (errmsg("pg_clickhouse: SHM streaming background worker %d/%d failed to start",
+                                   w, nworkers)));
+        }
+    }
+    (void) launched;
     return h;
 }
 
-/* Raise the worker's error (or a worker-death error) if it has failed. */
+/* Raise the error of any failed worker (or a worker-death error). Scans all W. */
 void
 pgch_shm_worker_check_error(ShmWorkerHandle *h)
 {
-    uint32 st;
-    pid_t  pid;
+    int w;
 
     if (h == NULL)
         return;
 
-    st = pg_atomic_read_u32(&h->hdr->state);
-    if (st == PGCH_WS_ERROR)
-        ereport(ERROR,
-                (errmsg("pg_clickhouse: shm streaming worker failed: %s", h->hdr->errmsg)));
-
-    if (st != PGCH_WS_DONE && GetBackgroundWorkerPid(h->bgw, &pid) == BGWH_STOPPED)
+    for (w = 0; w < h->nworkers; w++)
     {
-        /* Re-read in case the worker set the state just before exiting. */
-        st = pg_atomic_read_u32(&h->hdr->state);
+        uint32 st = pg_atomic_read_u32(&wslot_of(h->hdr, w)->state);
+        pid_t  pid;
+
         if (st == PGCH_WS_ERROR)
             ereport(ERROR,
-                    (errmsg("pg_clickhouse: shm streaming worker failed: %s", h->hdr->errmsg)));
-        if (st != PGCH_WS_DONE)
-            ereport(ERROR,
-                    (errmsg("pg_clickhouse: shm streaming worker stopped unexpectedly")));
+                    (errmsg("pg_clickhouse: shm streaming worker failed: %s",
+                            wslot_of(h->hdr, w)->errmsg)));
+
+        if (st != PGCH_WS_DONE && h->bgw[w] != NULL
+            && GetBackgroundWorkerPid(h->bgw[w], &pid) == BGWH_STOPPED)
+        {
+            /* Re-read in case the worker set the state just before exiting. */
+            st = pg_atomic_read_u32(&wslot_of(h->hdr, w)->state);
+            if (st == PGCH_WS_ERROR)
+                ereport(ERROR,
+                        (errmsg("pg_clickhouse: shm streaming worker failed: %s",
+                                wslot_of(h->hdr, w)->errmsg)));
+            if (st != PGCH_WS_DONE)
+                ereport(ERROR,
+                        (errmsg("pg_clickhouse: shm streaming worker %d/%d stopped unexpectedly",
+                                w, h->nworkers)));
+        }
     }
 }
 
+/* Block until EVERY worker has created/attached its producer (so the consumer
+ * can attach and all W producers are counted toward end-of-stream). */
 void
 pgch_shm_worker_wait_ready(ShmWorkerHandle *h)
 {
     for (;;)
     {
-        uint32 st = pg_atomic_read_u32(&h->hdr->state);
+        bool all_ready = true;
+        int  w;
 
-        if (st == PGCH_WS_READY || st == PGCH_WS_DONE)
+        for (w = 0; w < h->nworkers; w++)
+        {
+            uint32 st = pg_atomic_read_u32(&wslot_of(h->hdr, w)->state);
+
+            if (st != PGCH_WS_READY && st != PGCH_WS_DONE)
+            {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready)
             return;
 
-        /* Raises on PGCH_WS_ERROR or unexpected worker death. */
+        /* Raises on any worker's PGCH_WS_ERROR or unexpected death. */
         pgch_shm_worker_check_error(h);
 
         CHECK_FOR_INTERRUPTS();
@@ -249,19 +350,29 @@ pgch_shm_worker_wait_ready(ShmWorkerHandle *h)
 void
 pgch_shm_worker_shutdown(ShmWorkerHandle *h)
 {
+    int w;
+
     if (h == NULL || h->shut_down)
         return;
     h->shut_down = true;
 
+    /* SIGTERM every still-running worker (its CHECK_FOR_INTERRUPTS in the publish
+     * / drain / attach loops turns this into a clean FATAL that aborts its
+     * transaction; the owner's abort unlinks the SHM object + control socket).
+     * Then wait for each to be gone so no worker, fd, or /dev/shm object outlives
+     * the query. Issue all SIGTERMs first, then reap, so teardown is concurrent. */
     if (h->bgw != NULL)
     {
-        /* SIGTERM if still running (the worker's CHECK_FOR_INTERRUPTS in the
-         * publish / drain loops turns this into a clean FATAL that aborts its
-         * transaction and unlinks the SHM object + control socket); a no-op if
-         * it already exited. Then wait for it to be gone so no worker, fd, or
-         * /dev/shm object outlives the query. */
-        TerminateBackgroundWorker(h->bgw);
-        WaitForBackgroundWorkerShutdown(h->bgw);
+        for (w = 0; w < h->nworkers; w++)
+            if (h->bgw[w] != NULL)
+                TerminateBackgroundWorker(h->bgw[w]);
+        for (w = 0; w < h->nworkers; w++)
+            if (h->bgw[w] != NULL)
+            {
+                WaitForBackgroundWorkerShutdown(h->bgw[w]);
+                pfree(h->bgw[w]);
+                h->bgw[w] = NULL;
+            }
         pfree(h->bgw);
         h->bgw = NULL;
     }
@@ -281,9 +392,18 @@ pgch_shm_worker_main(Datum main_arg)
 {
     dsm_segment     *seg;
     ShmWorkerHeader *hdr;
+    ShmWorkerCoord  *coord;
+    ShmWorkerSlot   *me;
+    int              my_index = 0;
+    bool             is_owner;
 
     pqsignal(SIGTERM, die);
     BackgroundWorkerUnblockSignals();
+
+    /* This worker's index within the cooperating set (owner == 0), passed in
+     * bgw_extra by the launcher. */
+    memcpy(&my_index, MyBgworkerEntry->bgw_extra, sizeof(my_index));
+    is_owner = (my_index == 0);
 
     seg = dsm_attach(DatumGetUInt32(main_arg));
     if (seg == NULL)
@@ -293,6 +413,8 @@ pgch_shm_worker_main(Datum main_arg)
         return;
     }
     hdr = (ShmWorkerHeader *) dsm_segment_address(seg);
+    coord = coord_of(hdr);
+    me = wslot_of(hdr, my_index);
 
     BackgroundWorkerInitializeConnectionByOid(hdr->database_id, hdr->user_id, 0);
 
@@ -306,6 +428,7 @@ pgch_shm_worker_main(Datum main_arg)
         ShmOffloadColumn *cols;
         ShmColumnSchema  *schema;
         ShmProducer      *producer;
+        ShmBlockCursor   *bcursor;
         AttrNumber       *attnos = (AttrNumber *) ((char *) hdr + hdr->attnos_offset);
         int               ncols = hdr->ncols;
         int               i;
@@ -338,16 +461,45 @@ pgch_shm_worker_main(Datum main_arg)
             schema[i].wire = cols[i].wire;
         }
 
-        /* Create the SHM object + control socket. Owned by the transaction
-         * context so an abort (error / SIGTERM-FATAL) unlinks it via the
-         * producer's reset callback. */
-        producer = shm_producer_create(hdr->shm_name, schema, ncols,
-                                       (uint32_t) hdr->ring_depth_k,
-                                       hdr->data_region_size, NULL, CurTransactionContext);
+        /*
+         * The owner (worker 0) creates the SHM object + control socket; the
+         * other workers attach to it as secondary producers on the same ring.
+         * All share the DSM-resident publish coord (slot cursor + global block
+         * sequence). The producer is owned by the transaction context so an abort
+         * (error / SIGTERM-FATAL) tears it down via the reset callback (the owner
+         * additionally unlinks the SHM object + control socket).
+         */
+        if (is_owner)
+        {
+            producer = shm_producer_create(hdr->shm_name, schema, ncols,
+                                           (uint32_t) hdr->ring_depth_k,
+                                           hdr->data_region_size, &coord->publish,
+                                           CurTransactionContext);
+        }
+        else
+        {
+            uint32 owner_st;
 
-        /* Tell the backend it may now dispatch the ClickHouse query (the consumer
-         * can attach to the control socket). */
-        pg_atomic_write_u32(&hdr->state, PGCH_WS_READY);
+            /* Wait for the owner to create the ring before attaching to it. */
+            while ((owner_st = pg_atomic_read_u32(&wslot_of(hdr, 0)->state)) == PGCH_WS_INIT)
+            {
+                CHECK_FOR_INTERRUPTS();
+                pg_usleep(1000L);
+            }
+            if (owner_st == PGCH_WS_ERROR)
+                ereport(ERROR,
+                        (errmsg("pg_clickhouse: shm streaming owner failed before the ring was created")));
+
+            producer = shm_producer_attach(hdr->shm_name, schema, ncols,
+                                           (uint32_t) hdr->ring_depth_k,
+                                           hdr->data_region_size, &coord->publish,
+                                           CurTransactionContext);
+        }
+
+        /* Mark this worker ready. Once every worker is ready the backend dispatches
+         * the ClickHouse query (the consumer can attach to the owner's control
+         * socket; all W producers are already counted toward end-of-stream). */
+        pg_atomic_write_u32(&me->state, PGCH_WS_READY);
         SetLatch(&hdr->backend_proc->procLatch);
 
         /* Apply the backend session's reader choices in this worker. */
@@ -357,6 +509,10 @@ pgch_shm_worker_main(Datum main_arg)
         pgch_log_stream_stats = hdr->log_stream_stats;
         pgch_enable_jit_deform = hdr->enable_jit_deform;
         pgch_jit_row_threshold = hdr->jit_row_threshold;
+
+        /* Cooperating workers (W>1) pull disjoint heap-block ranges from the
+         * shared cursor; a lone worker scans the whole relation (NULL). */
+        bcursor = (hdr->nworkers > 1) ? &coord->block : NULL;
 
         /* Stream the relation into the ring (ring backpressure applies; the
          * ClickHouse consumer drains concurrently), then signal end-of-stream.
@@ -375,7 +531,7 @@ pgch_shm_worker_main(Datum main_arg)
             getrusage(RUSAGE_SELF, &r0);
             w0 = GetCurrentTimestamp();
             rows = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, NULL, &vis);
+                                               producer, (size_t) hdr->rows_per_block, bcursor, &vis);
             w1 = GetCurrentTimestamp();
             getrusage(RUSAGE_SELF, &r1);
 
@@ -408,20 +564,45 @@ pgch_shm_worker_main(Datum main_arg)
         }
         else
             (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, NULL, NULL);
+                                               producer, (size_t) hdr->rows_per_block, bcursor, NULL);
 
-        /* Single producer: signal end-of-stream now that the relation is fully
-         * streamed. (The W>1 path signals EOS from the last worker to finish.) */
-        shm_producer_signal_eos(producer);
+        /*
+         * This worker has finished streaming its share. The LAST worker to finish
+         * (active_workers -> 0) publishes the single end-of-stream block -- by
+         * which point every data block from every worker is already PUBLISHED, so
+         * the EOS carries the highest global sequence and the consumer drains it
+         * strictly last. Then set eos_done so the owner may unlink the ring.
+         */
+        if (pg_atomic_sub_fetch_u32(&coord->active_workers, 1) == 0)
+        {
+            shm_producer_signal_eos(producer);
+            pg_atomic_write_u32(&coord->eos_done, 1);
+        }
 
-        /* Producer-outlives-consumer: wait for every retained block to release,
-         * then unlink the SHM object + socket. */
-        shm_producer_destroy(producer);
+        if (is_owner)
+        {
+            /* Producer-outlives-consumer: the owner unlinks the ring + socket,
+             * but only AFTER the EOS block has been published (so it never
+             * unlinks while the stream is logically unfinished), then drains
+             * every retained block. Bail early if any worker aborted. */
+            while (pg_atomic_read_u32(&coord->eos_done) == 0
+                   && pg_atomic_read_u32(&coord->aborted) == 0)
+            {
+                CHECK_FOR_INTERRUPTS();
+                pg_usleep(1000L);
+            }
+            shm_producer_destroy(producer);     /* drains consumer retains, unlinks */
+        }
+        else
+        {
+            /* A secondary just drops its own mapping/fds (no drain, no unlink). */
+            shm_producer_destroy(producer);
+        }
 
         table_close(rel, AccessShareLock);
         PopActiveSnapshot();
 
-        pg_atomic_write_u32(&hdr->state, PGCH_WS_DONE);
+        pg_atomic_write_u32(&me->state, PGCH_WS_DONE);
         SetLatch(&hdr->backend_proc->procLatch);
     }
     PG_CATCH();
@@ -429,14 +610,19 @@ pgch_shm_worker_main(Datum main_arg)
         MemoryContext ecxt = MemoryContextSwitchTo(TopMemoryContext);
         ErrorData    *edata = CopyErrorData();
 
-        strlcpy(hdr->errmsg, edata->message, sizeof(hdr->errmsg));
+        strlcpy(me->errmsg, edata->message, sizeof(me->errmsg));
         FreeErrorData(edata);
         MemoryContextSwitchTo(ecxt);
 
-        /* Publish the error BEFORE tearing down the producer, so the backend (which
-         * may be woken either by this latch or by ClickHouse seeing the producer go
+        /* Mark the whole stream aborted so the owner stops waiting for an EOS that
+         * will never come and tears the ring down promptly (which makes the
+         * consumer fail) -- never a false EOS, so results are never truncated. */
+        pg_atomic_write_u32(&coord->aborted, 1);
+
+        /* Publish this worker's error BEFORE tearing down the producer, so the
+         * backend (woken by this latch or by ClickHouse seeing the producer go
          * away) reads the real cause rather than a generic producer-death error. */
-        pg_atomic_write_u32(&hdr->state, PGCH_WS_ERROR);
+        pg_atomic_write_u32(&me->state, PGCH_WS_ERROR);
         SetLatch(&hdr->backend_proc->procLatch);
 
         EmitErrorReport();

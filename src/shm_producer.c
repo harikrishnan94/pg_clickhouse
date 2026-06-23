@@ -101,7 +101,15 @@ StaticAssertDecl(sizeof(ShmSlot) == 64, "ShmSlot must be 64 bytes");
 StaticAssertDecl(sizeof(ShmSchemaEntry) == 128, "ShmSchemaEntry must be 128 bytes");
 StaticAssertDecl(sizeof(ShmColumnDescriptor) == 56, "ShmColumnDescriptor must be 56 bytes");
 
-#define MAX_PARKED_CONNS 16
+/*
+ * Parked control-socket connections. The consumer connects once and must stay
+ * parked (closing it would surface POLLHUP and trip producer-death detection).
+ * Cooperating SECONDARY producers also connect here briefly to receive the
+ * shared readiness eventfd via SCM_RIGHTS, so the cap must comfortably exceed
+ * the worker count (shm_stream_workers is capped well below this) plus the
+ * consumer, or a late consumer connection could be refused a parked slot.
+ */
+#define MAX_PARKED_CONNS 128
 
 struct ShmProducer {
     char       *shm_name;       /* with leading '/' */
@@ -173,6 +181,20 @@ static inline size_t
 align_up(size_t v, size_t a)
 {
     return (v + a - 1) & ~(a - 1);
+}
+
+/* Total mapped size of the SHM region (handshake + slot table + schema table +
+ * data region). Used by both the owner (shm_producer_create) and a secondary
+ * (shm_producer_attach) so they map exactly the same layout. */
+static size_t
+shm_region_size(uint32_t ring_depth_k, int n_columns, size_t data_region_size, long page)
+{
+    size_t off = align_up(sizeof(ShmHandshake), (size_t) page);  /* slot table */
+    off += (size_t) ring_depth_k * sizeof(ShmSlot);
+    off += (size_t) n_columns * sizeof(ShmSchemaEntry);
+    off = align_up(off, (size_t) page);                          /* data region */
+    off += data_region_size;
+    return align_up(off, (size_t) page);
 }
 
 static ShmHandshake *
@@ -266,6 +288,61 @@ send_eventfd(int conn_fd, int eventfd_to_pass)
     /* Best effort: a consumer that vanished mid-handshake must not error the
      * producer; the connection is simply dropped by the caller. */
     (void) sendmsg(conn_fd, &msg, MSG_NOSIGNAL);
+}
+
+/* Connect a fresh SOCK_STREAM client to the owner's control socket. Returns the
+ * connected fd, or -1 (the caller retries while the owner is still coming up). */
+static int
+connect_control_socket(const char *socket_path)
+{
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd < 0)
+        return -1;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, socket_path, strlen(socket_path));
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Receive the readiness eventfd the owner's pump thread sends via SCM_RIGHTS
+ * (the counterpart of send_eventfd). Returns the received fd, or -1. */
+static int
+recv_eventfd(int conn_fd)
+{
+    struct msghdr msg;
+    struct iovec iov;
+    char dummy = 0;
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+    struct cmsghdr *cmsg;
+    int fd = -1;
+
+    memset(&msg, 0, sizeof(msg));
+    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.buf;
+    msg.msg_controllen = sizeof(cmsg_buf.buf);
+
+    if (recvmsg(conn_fd, &msg, MSG_CMSG_CLOEXEC) < 0)
+        return -1;
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg != NULL && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS
+        && cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
+        memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+    return fd;
 }
 
 /* Accept any pending consumer connections and hand each the readiness eventfd.
@@ -432,7 +509,8 @@ shm_producer_create(const char *name,
     off += (size_t) n_columns * sizeof(ShmSchemaEntry);
     off = align_up(off, (size_t) page);                           /* data region */
     off += data_region_size;
-    p->mapping_size = align_up(off, (size_t) page);
+    p->mapping_size = shm_region_size(ring_depth_k, n_columns, data_region_size, page);
+    Assert(p->mapping_size == align_up(off, (size_t) page));
 
     /* A stale object from a prior crash blocks O_EXCL. */
     shm_unlink(p->shm_name);
@@ -521,6 +599,120 @@ shm_producer_create(const char *name,
     if (pthread_create(&p->pump_thread, NULL, pump_thread_main, p) != 0)
         ereport(ERROR, (errmsg("pg_clickhouse: could not start SHM control-socket pump thread")));
     p->pump_running = true;
+
+    MemoryContextSwitchTo(old);
+    return p;
+}
+
+/* ~60s cap (1ms spins) on each attach wait, as a safety net beyond
+ * CHECK_FOR_INTERRUPTS (the backend SIGTERMs all workers if the owner fails). */
+#define SHM_ATTACH_SPIN_CAP 60000
+
+ShmProducer *
+shm_producer_attach(const char *name,
+                    const ShmColumnSchema *schema, int n_columns,
+                    uint32_t ring_depth_k, size_t data_region_size,
+                    ShmPublishCoord *coord, MemoryContext owner_cxt)
+{
+    MemoryContext old = MemoryContextSwitchTo(owner_cxt);
+    ShmProducer *p = palloc0(sizeof(ShmProducer));
+    ShmHandshake *hs;
+    long page = sysconf(_SC_PAGESIZE);
+    int  spins;
+
+    p->shm_fd = p->event_fd = p->listen_fd = -1;
+    p->mapping = NULL;
+    p->owner_cxt = owner_cxt;
+    p->is_owner = false;            /* never unlinks / drains; just drops its view */
+    Assert(coord != NULL);          /* a shared ring always has a shared coord */
+    p->coord = coord;
+
+    if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
+                               ring_depth_k, SHM_IMPL_MAX_K)));
+    if (n_columns <= 0 || (uint32_t) n_columns > SHM_IMPL_MAX_COLS)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm column count %d out of range (1..%u)",
+                               n_columns, SHM_IMPL_MAX_COLS)));
+    if (data_region_size == 0)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm data region size must be > 0")));
+
+    if (name[0] == '/')
+        p->shm_name = pstrdup(name);
+    else
+        p->shm_name = psprintf("/%s", name);
+    p->socket_path = control_socket_path(p->shm_name);
+
+    /* Register cleanup before acquiring any kernel resource (an ereport below
+     * must still unwind cleanly). A secondary never unlinks (is_owner == false). */
+    p->cleanup_cb.func = producer_cleanup_callback;
+    p->cleanup_cb.arg = p;
+    MemoryContextRegisterResetCallback(owner_cxt, &p->cleanup_cb);
+
+    p->ring_depth_k = ring_depth_k;
+    p->n_columns = n_columns;
+    p->schema = palloc0(sizeof(ShmColumnSchema) * n_columns);
+    memcpy(p->schema, schema, sizeof(ShmColumnSchema) * n_columns);
+    p->mapping_size = shm_region_size(ring_depth_k, n_columns, data_region_size, page);
+    p->per_slot_capacity = (data_region_size / ring_depth_k) & ~((size_t) 63);
+    p->per_slot_payload_offset = align_up((size_t) n_columns * sizeof(ShmColumnDescriptor), 64);
+
+    /* Open the owner's SHM object. The worker-side launch coordination only calls
+     * attach after the owner has created the ring, so this normally succeeds at
+     * once; the bounded CFI spin tolerates a small startup skew. */
+    for (spins = 0;; spins++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        p->shm_fd = shm_open(p->shm_name, O_RDWR, 0);
+        if (p->shm_fd >= 0)
+            break;
+        if (errno != ENOENT)
+            ereport(ERROR, (errcode_for_file_access(),
+                            errmsg("pg_clickhouse: shm_open(\"%s\") failed: %m", p->shm_name)));
+        if (spins >= SHM_ATTACH_SPIN_CAP)
+            ereport(ERROR, (errmsg("pg_clickhouse: timed out attaching to shm ring \"%s\"", p->shm_name)));
+        pg_usleep(1000L);
+    }
+
+    p->mapping = mmap(NULL, p->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, p->shm_fd, 0);
+    if (p->mapping == MAP_FAILED)
+        ereport(ERROR, (errcode_for_file_access(),
+                        errmsg("pg_clickhouse: mmap(\"%s\") failed: %m", p->shm_name)));
+
+    /* Wait for the owner's release-stored handshake magic, then cross-validate. */
+    hs = hs_of(p);
+    for (spins = 0; __atomic_load_n(&hs->magic, __ATOMIC_ACQUIRE) != SHM_MAGIC; spins++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        if (spins >= SHM_ATTACH_SPIN_CAP)
+            ereport(ERROR, (errmsg("pg_clickhouse: timed out on shm handshake for \"%s\"", p->shm_name)));
+        pg_usleep(1000L);
+    }
+    if (hs->abi_version != SHM_ABI_VERSION_1
+        || hs->ring_depth_k != ring_depth_k
+        || hs->schema_count != (uint32_t) n_columns)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm ring \"%s\" handshake mismatch on attach "
+                               "(abi=%u k=%u cols=%u)", p->shm_name,
+                               hs->abi_version, hs->ring_depth_k, hs->schema_count)));
+
+    /* Receive the shared readiness eventfd over the owner's control socket (same
+     * SCM_RIGHTS handshake the consumer uses); every producer writes it on publish. */
+    for (spins = 0;; spins++)
+    {
+        int conn;
+
+        CHECK_FOR_INTERRUPTS();
+        conn = connect_control_socket(p->socket_path);
+        if (conn >= 0)
+        {
+            p->event_fd = recv_eventfd(conn);
+            close(conn);
+            if (p->event_fd >= 0)
+                break;
+        }
+        if (spins >= SHM_ATTACH_SPIN_CAP)
+            ereport(ERROR, (errmsg("pg_clickhouse: timed out receiving shm eventfd for \"%s\"", p->shm_name)));
+        pg_usleep(1000L);
+    }
 
     MemoryContextSwitchTo(old);
     return p;

@@ -653,7 +653,7 @@ shm_scan_access_mtd(ScanState *ss)
                                              estate->es_snapshot,
                                              pgch_shm_ring_depth_k,
                                              (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                             65536);
+                                             65536, 1);
         pgch_shm_worker_wait_ready(sss->worker);
 
         /* 2. Dispatch the ClickHouse query; it attaches to the SHM stream and
