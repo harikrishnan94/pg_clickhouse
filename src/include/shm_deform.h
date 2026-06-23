@@ -80,25 +80,71 @@ typedef void (*PgchStringFill) (void *cz, int col_index, size_t dst_row,
                                 char *const *cur, size_t nrows);
 
 /*
- * Group A: a sub-batch of `n` NULL-free, full-natts tuples. `cur[r]` is the
- * tuple data start (htup + t_hoff); the driver mutates it in place (tail walk).
- * Fills rows [dst_row, dst_row+n) of every projected column. Caller guarantees
- * dst_row + n <= rows_per_block.
+ * Compiled deform plan (the "step program"). Built once per scan by
+ * pgch_build_deform_plans from a PgchDeformDesc: it lowers the per-column walk +
+ * fill into an ordered list of specialized steps, each a pre-instantiated kernel
+ * (selected by attlen/attalign/wire) plus baked args. Runs of fixed columns with
+ * statically-known offsets collapse into a constant `lead`/`disp`; only varlena
+ * (and post-varlena / nullable) columns cost per-row cursor work. The hot path
+ * (pgch_columnar_deform_run) just invokes each step over the whole sub-batch, so
+ * the per-row inner loops are monomorphic with constants folded in.
  */
-extern void pgch_columnar_deform_simple(const PgchDeformDesc *desc,
-                                        char **cur, size_t n, size_t dst_row,
-                                        void *cz, PgchStringFill str_fill);
+
+/* One cursor advance inside a WALK step. */
+typedef struct PgchHop
+{
+    int16  attlen;     /* -1 varlena, >0 fixed-width */
+    uint8  align;      /* numeric alignment: 1/2/4/8 */
+    int16  null_bit;   /* group B: 0-based attno for att_isnull; -1 = always present */
+} PgchHop;
+
+typedef struct PgchStep PgchStep;
 
 /*
- * Group B: a sub-batch of `n` tuples that have NULLs (in non-projected columns)
- * but full natts. `cur[r]` = data start, `bits[r]` = the NULL bitmap base
- * (htup + SizeofHeapTupleHeader). Projected columns are NOT NULL (never null);
- * only nullable non-projected columns take a per-row att_isnull check.
+ * A step kernel: processes the whole sub-batch (n rows). For FILL steps it reads
+ * each row's value and writes the columnizer staging buffer; for WALK steps it
+ * advances cur[] past skipped/nullable columns. `bits` is NULL for group A.
  */
-extern void pgch_columnar_deform_nullable(const PgchDeformDesc *desc,
-                                          char **cur, const bits8 **bits,
-                                          size_t n, size_t dst_row,
-                                          void *cz, PgchStringFill str_fill);
+typedef void (*PgchStepFn) (const PgchStep *st, char **cur, const bits8 **bits,
+                            size_t n, size_t dst_row, void *cz, PgchStringFill str_fill);
+
+struct PgchStep
+{
+    PgchStepFn      run;        /* the specialized kernel (chosen at build time) */
+    uint32          disp;       /* FILL_CONST: byte offset from data start; WALK: const lead */
+    void           *dst_base;   /* fixed-fill target (ColBuf.fixed) */
+    int             col_index;  /* columnizer column (string fill) */
+    uint8           align;      /* string-fill / generic-walk positioning alignment */
+    const PgchHop  *hops;       /* WALK: hop list (into the caller's hop buffer) */
+    int             nhop;
+};
+
+typedef struct PgchDeformPlan
+{
+    const PgchStep *step;
+    int             n_step;
+} PgchDeformPlan;
+
+/*
+ * Build the group-A and group-B step plans from `desc`, once per scan. The
+ * caller supplies the step/hop storage (scan-lived): each buffer must hold at
+ * least (2*max_attno + 2) steps and max_attno hops. POD-only; allocates nothing.
+ */
+extern void pgch_build_deform_plans(const PgchDeformDesc *desc,
+                                    PgchStep *step_a, PgchHop *hop_a, PgchDeformPlan *plan_a,
+                                    PgchStep *step_b, PgchHop *hop_b, PgchDeformPlan *plan_b);
+
+/*
+ * Run a compiled plan over a sub-batch of `n` tuples. `cur[r]` is the tuple data
+ * start (htup + t_hoff); the kernels mutate it in place. For the group-A plan
+ * `bits` is NULL; for the group-B plan `bits[r]` is row r's NULL-bitmap base
+ * (htup + SizeofHeapTupleHeader). Fills rows [dst_row, dst_row+n) of every
+ * projected column; caller guarantees dst_row + n <= rows_per_block.
+ */
+extern void pgch_columnar_deform_run(const PgchDeformPlan *plan,
+                                     char **cur, const bits8 **bits,
+                                     size_t n, size_t dst_row,
+                                     void *cz, PgchStringFill str_fill);
 
 #ifdef __cplusplus
 }

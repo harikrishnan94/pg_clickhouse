@@ -2,19 +2,32 @@
  *
  * shm_deform.cpp
  *      Templated, column-major (struct-of-arrays) heap deform engine for the
- *      SHM-offload reader. One driver `deform_impl<bool Nullable>` serves both
- *      group A (NULL-free tuples) and group B (tuples with NULLs in
- *      non-projected columns); `if constexpr (Nullable)` removes the NULL path
- *      from group A's instantiation entirely, so the generated code matches a
- *      hand-rolled per-group implementation. Group C (short/missing-attr tuples)
- *      is handled by the C row-major path, not here.
+ *      SHM-offload reader, organized as a per-scan COMPILED STEP PLAN.
  *
- *      The driver allocates nothing and never raises a PostgreSQL error: fixed
- *      column values are stored directly into the columnizer's per-column
- *      buffers (PgchDeformCol.dst_base) by type-monomorphic templated kernels;
+ *      pgch_build_deform_plans lowers a scan's projection into an ordered list
+ *      of specialized steps (one per projected column, plus the cursor walks
+ *      between them). Each step is a pre-instantiated kernel selected by the
+ *      column's (attlen, attalign, wire): the value transform (Identity/DateToCh/
+ *      BoolToU8) and the fixed-width size/alignment are compile-time constants,
+ *      so the per-row inner loops are monomorphic -- no PgchDeformCol field
+ *      loads, no attlen sign-test, and only the data-dependent varlena/NULL
+ *      branches survive. This is the C++-template analog of a JIT-compiled
+ *      deform (slot_compile_deform), but the variants are compiled ahead of time
+ *      and merely SELECTED once per scan.
+ *
+ *      Structural wins over the old per-column two-pass walk:
+ *        - runs of fixed columns with statically-known offsets collapse into a
+ *          constant `lead`/`disp` (no per-row work);
+ *        - the reposition + per-skip align/addlength passes fuse into one
+ *          row-major walk per segment (group A: unrolled up to 4 varlena hops);
+ *        - only varlena (and, group B, nullable) columns cost a per-row cursor
+ *          advance -- the irreducible VARSIZE_ANY header gather.
+ *
+ *      The kernels allocate nothing and never raise a PostgreSQL error: fixed
+ *      values are stored into the columnizer's per-column buffers (dst_base);
  *      string columns are handed back to C (StringInfo append) via PgchStringFill.
- *      Compiled with -fno-exceptions -fno-rtti; all kernels/functors are
- *      trivial-destructor, so a PG longjmp from the string callback is safe.
+ *      Compiled -fno-exceptions -fno-rtti; all kernels are trivial-destructor, so
+ *      a PG longjmp from the string callback is safe.
  *
  * Copyright (c) 2025-2026, ClickHouse, Inc.
  *
@@ -24,8 +37,8 @@
 
 extern "C"
 {
-#include "access/tupmacs.h"     /* att_align_pointer/_nominal, att_addlength_pointer, att_isnull */
-#include "varatt.h"             /* VARSIZE_ANY (used by att_addlength_pointer) */
+#include "access/tupmacs.h"     /* att_isnull, TYPALIGN_*; alignment helpers */
+#include "varatt.h"             /* VARSIZE_ANY, VARATT_NOT_PAD_BYTE */
 }
 
 #include "shm_deform.h"
@@ -33,8 +46,7 @@ extern "C"
 namespace
 {
 
-/* Alignment-safe typed load. PG stores fixed attrs naturally aligned, but the
- * memcpy is free under -O2 and lowers to a single load. */
+/* Alignment-safe typed load; lowers to a single load under -O2. */
 template <typename T>
 [[gnu::always_inline]] static inline T
 load(const char *p)
@@ -45,167 +57,377 @@ load(const char *p)
 }
 
 /* Per-wire value transforms (stateless functors). */
-struct Identity
+struct Identity { template <typename T> T operator() (T v) const { return v; } };
+struct DateToCh { uint16 operator() (int32 v) const { return (uint16) (v + PGCH_DATE_EPOCH_DIFF); } };
+struct BoolToU8 { uint8 operator() (uint8 v) const { return v ? 1 : 0; } };
+
+/* TYPALIGN_{CHAR,SHORT,INT,DOUBLE} char -> numeric alignment. */
+static inline uint8
+align_bytes(char a)
 {
-    template <typename T> T operator() (T v) const { return v; }
-};
-struct DateToCh                                     /* PG 2000-epoch day -> CH 1970-epoch day */
-{
-    uint16 operator() (int32 v) const { return (uint16) (v + PGCH_DATE_EPOCH_DIFF); }
-};
-struct BoolToU8
-{
-    uint8 operator() (uint8 v) const { return v ? 1 : 0; }
-};
+    switch (a)
+    {
+        case TYPALIGN_DOUBLE: return 8;
+        case TYPALIGN_INT:    return 4;
+        case TYPALIGN_SHORT:  return 2;
+        default:              return 1;   /* TYPALIGN_CHAR */
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* Specialized leaf kernels                                                */
+/* ----------------------------------------------------------------------- */
 
 /*
- * The reusable kernel: one instantiation per (Src, Dst, Xform). Rows-inner,
- * type-monomorphic; the contiguous store side autovectorizes, the per-row load
- * is a gather (scalar on NEON). `disp` is the constant prefix displacement (0 for
- * tail columns, where `cur` is already positioned).
+ * FILL_CONST: a projected fixed column in the constant-offset region (the
+ * prefix). cur stays at the tuple data start; the value is at a per-scan
+ * constant displacement. Contiguous store side autovectorizes.
  */
 template <typename Src, typename Dst, typename Xform>
-[[gnu::always_inline]] static inline void
-fill_fixed_col(Dst *__restrict dst, size_t dst_row,
-               char *const *__restrict cur, uint32 disp, size_t n)
+static void
+k_fill_const(const PgchStep *st, char **__restrict cur, const bits8 **,
+             size_t n, size_t dst_row, void *, PgchStringFill)
 {
+    Dst   *__restrict dst = (Dst *) st->dst_base;
+    uint32 disp = st->disp;
+
     for (size_t r = 0; r < n; ++r)
         dst[dst_row + r] = Xform() (load<Src>(cur[r] + disp));
 }
 
-/* Wire -> kernel instantiation. Decimals are declined upstream; strings take the
- * callback path, so they never reach here. */
-static inline void
-dispatch_fixed(const PgchDeformCol &c, char *const *cur, size_t dst_row,
-               uint32 disp, size_t n)
+/*
+ * FILL_WALK: a projected fixed column reached by the cursor walk (after a
+ * varlena, or in group B after a possibly-NULL column). Aligns the per-row
+ * cursor (constant mask), reads, and advances past the column so the next step
+ * resumes from its end. alignof(Src) == the PG attalign for every wire here.
+ */
+template <typename Src, typename Dst, typename Xform>
+static void
+k_fill_walk(const PgchStep *st, char **__restrict cur, const bits8 **,
+            size_t n, size_t dst_row, void *, PgchStringFill)
 {
-    switch (c.wire)
+    Dst *__restrict dst = (Dst *) st->dst_base;
+
+    for (size_t r = 0; r < n; ++r)
     {
-        case SHM_WIRE_UINT8:
-            fill_fixed_col<uint8, uint8, BoolToU8>((uint8 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_INT16:
-            fill_fixed_col<int16, int16, Identity>((int16 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_INT32:
-            fill_fixed_col<int32, int32, Identity>((int32 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_INT64:
-            fill_fixed_col<int64, int64, Identity>((int64 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_FLOAT32:
-            fill_fixed_col<float4, float4, Identity>((float4 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_FLOAT64:
-            fill_fixed_col<float8, float8, Identity>((float8 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        case SHM_WIRE_DATE:
-            fill_fixed_col<int32, uint16, DateToCh>((uint16 *) c.dst_base, dst_row, cur, disp, n);
-            break;
-        default:
-            /* Contract violation: the C reader must only present these wires.
-             * No ereport here (C++ frame) -- trap in debug, unreachable in prod. */
-            Assert(false);
-            pg_unreachable();
+        char *c = (char *) TYPEALIGN(alignof(Src), (uintptr_t) cur[r]);
+        dst[dst_row + r] = Xform() (load<Src>(c));
+        cur[r] = c + sizeof(Src);
     }
 }
 
 /*
- * The unified column-major driver. Group A == deform_impl<false>, group B ==
- * deform_impl<true>. `bits` is unused (and may be NULL) when Nullable is false.
+ * FILL_STRING: a projected varlena column. Position each row's cursor at the
+ * datum (att_align_pointer: align only for a 4-byte header), hand the batch to
+ * the C string fill, then advance past each datum (att_addlength_pointer).
  */
-template <bool Nullable>
 static void
-deform_impl(const PgchDeformDesc *d, char **cur, const bits8 **bits,
-            size_t n, size_t dst_row, void *cz, PgchStringFill str_fill)
+k_fill_string(const PgchStep *st, char **cur, const bits8 **,
+              size_t n, size_t dst_row, void *cz, PgchStringFill sf)
 {
-    const PgchDeformCol *col = d->col;
-    int     prefix_len = Nullable ? d->prefix_len_b : d->prefix_len_a;
-    uint32  walk_start_off = Nullable ? d->walk_start_off_b : d->walk_start_off_a;
-    int     i;
-    size_t  r;
+    uint8 al = st->align;
 
-    /* Prefix: projected fixed-width columns at a constant displacement. The
-     * non-projected prefix columns are skipped entirely (no cursor advance). */
-    for (i = 0; i < prefix_len; ++i)
-        if (col[i].is_needed)
-            dispatch_fixed(col[i], cur, dst_row, col[i].disp, n);
-
-    if (prefix_len >= d->max_attno)
-        return;
-
-    /* Position each row's cursor at the start of the tail (varlena) region. */
-    for (r = 0; r < n; ++r)
-        cur[r] += walk_start_off;
-
-    /* Tail: advance the per-row cursor through columns prefix_len..max_attno-1,
-     * filling projected ones. */
-    for (i = prefix_len; i < d->max_attno; ++i)
+    for (size_t r = 0; r < n; ++r)
     {
-        const PgchDeformCol &c = col[i];
+        char *c = cur[r];
+        if (!VARATT_NOT_PAD_BYTE(c))               /* 4-byte-header form must align */
+            c = (char *) TYPEALIGN(al, (uintptr_t) c);
+        cur[r] = c;
+    }
+    sf(cz, st->col_index, dst_row, cur, n);
+    for (size_t r = 0; r < n; ++r)
+        cur[r] += VARSIZE_ANY(cur[r]);
+}
 
-        if constexpr (Nullable)
+/*
+ * WALK (group A, unrolled): advance each row's cursor by a constant `lead`, then
+ * through Nhop skipped VARLENA columns of uniform alignment Align. No final
+ * align (the following FILL aligns). Nhop and Align are compile-time, so the hop
+ * loop is fully unrolled and the only surviving branch is VARATT_NOT_PAD_BYTE.
+ */
+template <int Align, int Nhop>
+static void
+k_walk_uv(const PgchStep *st, char **__restrict cur, const bits8 **,
+          size_t n, size_t, void *, PgchStringFill)
+{
+    uint32 lead = st->disp;
+
+    for (size_t r = 0; r < n; ++r)
+    {
+        char *c = cur[r] + lead;
+        for (int j = 0; j < Nhop; ++j)
         {
-            if (c.nullable)
+            if (VARATT_NOT_PAD_BYTE(c))
+                c += VARSIZE_ANY(c);
+            else
             {
-                /* Nullable => non-projected (projected cols are NOT NULL): no
-                 * fill, per-row skip of NULLs. */
-                if (c.attlen == -1)
-                {
-                    for (r = 0; r < n; ++r)
-                        if (!att_isnull(i, bits[r]))
-                        {
-                            cur[r] = (char *) att_align_pointer((uintptr_t) cur[r], c.attalign, -1, cur[r]);
-                            cur[r] = (char *) att_addlength_pointer((uintptr_t) cur[r], -1, cur[r]);
-                        }
-                }
-                else
-                {
-                    for (r = 0; r < n; ++r)
-                        if (!att_isnull(i, bits[r]))
-                            cur[r] = (char *) att_align_nominal((uintptr_t) cur[r], c.attalign) + c.attlen;
-                }
-                continue;
+                c = (char *) TYPEALIGN(Align, (uintptr_t) c);
+                c += VARSIZE_ANY(c);
             }
         }
+        cur[r] = c;
+    }
+}
 
-        /* Present for every row (group A, or a NOT NULL group-B column). */
-        if (c.attlen == -1)
-            for (r = 0; r < n; ++r)
-                cur[r] = (char *) att_align_pointer((uintptr_t) cur[r], c.attalign, -1, cur[r]);
-        else
-            for (r = 0; r < n; ++r)
-                cur[r] = (char *) att_align_nominal((uintptr_t) cur[r], c.attalign);
+/* WALK (group A, generic): a mixed varlena/fixed skip run of any length. */
+static void
+k_walk_generic(const PgchStep *st, char **cur, const bits8 **,
+               size_t n, size_t, void *, PgchStringFill)
+{
+    const PgchHop *h = st->hops;
+    int            m = st->nhop;
+    uint32         lead = st->disp;
 
-        if (c.is_needed)
+    for (size_t r = 0; r < n; ++r)
+    {
+        char *c = cur[r] + lead;
+        for (int j = 0; j < m; ++j)
         {
-            if (c.is_string)
-                str_fill(cz, c.col_index, dst_row, cur, n);
+            if (h[j].attlen < 0)
+            {
+                if (VARATT_NOT_PAD_BYTE(c))
+                    c += VARSIZE_ANY(c);
+                else
+                {
+                    c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
+                    c += VARSIZE_ANY(c);
+                }
+            }
             else
-                dispatch_fixed(c, cur, dst_row, 0, n);
+                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
+        }
+        cur[r] = c;
+    }
+}
+
+/* WALK (group B, generic + NULL-aware): a NULL column occupies no bytes. */
+static void
+k_walk_nullable(const PgchStep *st, char **cur, const bits8 **bits,
+                size_t n, size_t, void *, PgchStringFill)
+{
+    const PgchHop *h = st->hops;
+    int            m = st->nhop;
+    uint32         lead = st->disp;
+
+    for (size_t r = 0; r < n; ++r)
+    {
+        char        *c = cur[r] + lead;
+        const bits8 *bp = bits[r];
+
+        for (int j = 0; j < m; ++j)
+        {
+            if (h[j].null_bit >= 0 && att_isnull(h[j].null_bit, bp))
+                continue;                          /* NULL: no data bytes, no advance */
+            if (h[j].attlen < 0)
+            {
+                if (VARATT_NOT_PAD_BYTE(c))
+                    c += VARSIZE_ANY(c);
+                else
+                {
+                    c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c);
+                    c += VARSIZE_ANY(c);
+                }
+            }
+            else
+                c = (char *) TYPEALIGN(h[j].align, (uintptr_t) c) + h[j].attlen;
+        }
+        cur[r] = c;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* Dispatch: bind a column's (wire, attlen, attalign) to a kernel instance  */
+/* ----------------------------------------------------------------------- */
+
+static PgchStepFn
+pick_fill_const(ShmWireType w)
+{
+    switch (w)
+    {
+        case SHM_WIRE_UINT8:   return k_fill_const<uint8,  uint8,  BoolToU8>;
+        case SHM_WIRE_INT16:   return k_fill_const<int16,  int16,  Identity>;
+        case SHM_WIRE_INT32:   return k_fill_const<int32,  int32,  Identity>;
+        case SHM_WIRE_INT64:   return k_fill_const<int64,  int64,  Identity>;
+        case SHM_WIRE_FLOAT32: return k_fill_const<float4, float4, Identity>;
+        case SHM_WIRE_FLOAT64: return k_fill_const<float8, float8, Identity>;
+        case SHM_WIRE_DATE:    return k_fill_const<int32,  uint16, DateToCh>;
+        default:               Assert(false); pg_unreachable();
+    }
+}
+
+static PgchStepFn
+pick_fill_walk(ShmWireType w)
+{
+    switch (w)
+    {
+        case SHM_WIRE_UINT8:   return k_fill_walk<uint8,  uint8,  BoolToU8>;
+        case SHM_WIRE_INT16:   return k_fill_walk<int16,  int16,  Identity>;
+        case SHM_WIRE_INT32:   return k_fill_walk<int32,  int32,  Identity>;
+        case SHM_WIRE_INT64:   return k_fill_walk<int64,  int64,  Identity>;
+        case SHM_WIRE_FLOAT32: return k_fill_walk<float4, float4, Identity>;
+        case SHM_WIRE_FLOAT64: return k_fill_walk<float8, float8, Identity>;
+        case SHM_WIRE_DATE:    return k_fill_walk<int32,  uint16, DateToCh>;
+        default:               Assert(false); pg_unreachable();
+    }
+}
+
+/* Unrolled all-varlena walk for align in {1,2,4,8} and nhop in 1..4; else NULL. */
+static PgchStepFn
+pick_walk_uv(uint8 align, int nhop)
+{
+#define WUV(A) \
+    switch (nhop) { case 1: return k_walk_uv<A,1>; case 2: return k_walk_uv<A,2>; \
+                    case 3: return k_walk_uv<A,3>; case 4: return k_walk_uv<A,4>; }
+    switch (align)
+    {
+        case 1: WUV(1); break;
+        case 2: WUV(2); break;
+        case 4: WUV(4); break;
+        case 8: WUV(8); break;
+    }
+#undef WUV
+    return nullptr;
+}
+
+/* ----------------------------------------------------------------------- */
+/* Plan builder (once per scan)                                             */
+/* ----------------------------------------------------------------------- */
+
+/* Emit a WALK step for the accumulated hop run, choosing the unrolled kernel
+ * when the run is all-varlena of uniform alignment and <= 4 hops, else generic.
+ * Emits nothing when there is no cursor movement (lead == 0 and no hops). */
+static void
+emit_walk(PgchStep *step, int *ns, uint32 lead,
+          const PgchHop *hops, int m, bool nullable_group)
+{
+    if (lead == 0 && m == 0)
+        return;
+
+    PgchStep *s = &step[(*ns)++];
+    s->disp = lead;
+    s->hops = hops;
+    s->nhop = m;
+    s->dst_base = nullptr;
+    s->col_index = -1;
+    s->align = 0;
+
+    if (nullable_group)
+    {
+        s->run = k_walk_nullable;
+        return;
+    }
+    if (m >= 1 && m <= 4)
+    {
+        bool  uniform = true;
+        uint8 a = hops[0].align;
+
+        for (int j = 0; j < m; ++j)
+            if (hops[j].attlen >= 0 || hops[j].align != a)
+            {
+                uniform = false;
+                break;
+            }
+        if (uniform)
+        {
+            PgchStepFn fn = pick_walk_uv(a, m);
+            if (fn) { s->run = fn; return; }
+        }
+    }
+    s->run = k_walk_generic;
+}
+
+/* Build one group's plan. `prefix_len`/`walk_start_off` select the group; for
+ * group B, nullable non-projected columns become NULL-checked hops. */
+static void
+build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
+           bool nullable_group, PgchStep *step, PgchHop *hop, PgchDeformPlan *plan)
+{
+    const PgchDeformCol *col = d->col;
+    int    ns = 0;
+    int    nh = 0;
+    int    i;
+
+    /* Prefix: projected fixed columns at constant displacement (cur unmoved). */
+    for (i = 0; i < prefix_len; ++i)
+        if (col[i].is_needed)
+        {
+            PgchStep *s = &step[ns++];
+            s->run = pick_fill_const(col[i].wire);     /* prefix is fixed-width, never string */
+            s->disp = col[i].disp;
+            s->dst_base = col[i].dst_base;
+            s->col_index = col[i].col_index;
+            s->hops = nullptr; s->nhop = 0; s->align = 0;
         }
 
-        if (c.attlen == -1)
-            for (r = 0; r < n; ++r)
-                cur[r] = (char *) att_addlength_pointer((uintptr_t) cur[r], -1, cur[r]);
-        else
-            for (r = 0; r < n; ++r)
-                cur[r] += c.attlen;
+    /* Tail: alternate a fused walk (to the next projected column) and its fill. */
+    if (prefix_len < d->max_attno)
+    {
+        uint32 lead = walk_start_off;
+        int    hop_start = nh;
+
+        for (i = prefix_len; i < d->max_attno; ++i)
+        {
+            const PgchDeformCol *c = &col[i];
+
+            if (!c->is_needed)
+            {
+                hop[nh].attlen = c->attlen;
+                hop[nh].align = align_bytes(c->attalign);
+                hop[nh].null_bit = (nullable_group && c->nullable) ? (int16) i : -1;
+                nh++;
+                continue;
+            }
+
+            /* projected column (group B: NOT NULL): walk to it, then fill. */
+            emit_walk(step, &ns, lead, &hop[hop_start], nh - hop_start, nullable_group);
+
+            PgchStep *s = &step[ns++];
+            if (c->is_string)
+            {
+                s->run = k_fill_string;
+                s->align = align_bytes(c->attalign);
+                s->col_index = c->col_index;
+                s->dst_base = nullptr; s->disp = 0; s->hops = nullptr; s->nhop = 0;
+            }
+            else
+            {
+                s->run = pick_fill_walk(c->wire);
+                s->dst_base = c->dst_base;
+                s->col_index = c->col_index;
+                s->disp = 0; s->align = 0; s->hops = nullptr; s->nhop = 0;
+            }
+
+            /* the fill advanced cur past this column; start a fresh segment */
+            lead = 0;
+            hop_start = nh;
+        }
+        /* any skipped columns after the last projected one are irrelevant */
     }
+
+    plan->step = step;
+    plan->n_step = ns;
 }
 
 }                               /* anonymous namespace */
 
 extern "C" void
-pgch_columnar_deform_simple(const PgchDeformDesc *desc, char **cur,
-                            size_t n, size_t dst_row, void *cz, PgchStringFill str_fill)
+pgch_build_deform_plans(const PgchDeformDesc *desc,
+                        PgchStep *step_a, PgchHop *hop_a, PgchDeformPlan *plan_a,
+                        PgchStep *step_b, PgchHop *hop_b, PgchDeformPlan *plan_b)
 {
-    deform_impl<false>(desc, cur, nullptr, n, dst_row, cz, str_fill);
+    build_plan(desc, desc->prefix_len_a, desc->walk_start_off_a, /*nullable=*/false,
+               step_a, hop_a, plan_a);
+    build_plan(desc, desc->prefix_len_b, desc->walk_start_off_b, /*nullable=*/true,
+               step_b, hop_b, plan_b);
 }
 
 extern "C" void
-pgch_columnar_deform_nullable(const PgchDeformDesc *desc, char **cur, const bits8 **bits,
-                              size_t n, size_t dst_row, void *cz, PgchStringFill str_fill)
+pgch_columnar_deform_run(const PgchDeformPlan *plan, char **cur, const bits8 **bits,
+                         size_t n, size_t dst_row, void *cz, PgchStringFill str_fill)
 {
-    deform_impl<true>(desc, cur, bits, n, dst_row, cz, str_fill);
+    const PgchStep *step = plan->step;
+    int             ns = plan->n_step;
+
+    for (int s = 0; s < ns; ++s)
+        step[s].run(&step[s], cur, bits, n, dst_row, cz, str_fill);
 }

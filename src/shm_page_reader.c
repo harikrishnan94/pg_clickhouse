@@ -324,7 +324,7 @@ typedef struct PgchFixedFetch
  * (or after a NULL) needs the offset walk, started at walk_start_off for the
  * fast path or from scratch in the generic path.
  */
-typedef struct PgchDeformPlan
+typedef struct PgchRowPlan
 {
     int             max_attno;
     PgchAttrMeta   *meta;            /* [0..max_attno-1]: generic walk + fast-path tail */
@@ -333,7 +333,7 @@ typedef struct PgchDeformPlan
     int             prefix_len;      /* length of the leading fixed-width run */
     uint32          walk_start_off;  /* data offset of attr[prefix_len] (no-NULL layout) */
     bool            has_tail;        /* a projected attr lies at/after prefix_len */
-} PgchDeformPlan;
+} PgchRowPlan;
 
 /*
  * Generic offset walk over attributes 1..max_attno (mirrors
@@ -395,7 +395,7 @@ pgch_deform_generic(const HeapTupleHeaderData *htup, const PgchAttrMeta *restric
  * (varlena-and-after region) up to max_attno.
  */
 static pg_attribute_always_inline void
-pgch_deform_fast(const HeapTupleHeaderData *htup, const PgchDeformPlan *restrict plan,
+pgch_deform_fast(const HeapTupleHeaderData *htup, const PgchRowPlan *restrict plan,
                  Datum *restrict values, bool *restrict isnull)
 {
     const char *tp = (const char *) htup + htup->t_hoff;
@@ -436,7 +436,7 @@ pgch_deform_fast(const HeapTupleHeaderData *htup, const PgchDeformPlan *restrict
 }
 
 static void
-pgch_deform_needed(const HeapTupleHeaderData *htup, const PgchDeformPlan *plan,
+pgch_deform_needed(const HeapTupleHeaderData *htup, const PgchRowPlan *plan,
                    Datum *values, bool *isnull)
 {
     int natts_present = HeapTupleHeaderGetNatts(htup);
@@ -589,9 +589,12 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     BlockNumber          blk;
     AttrNumber           max_attno = 0;
     PgchAttrMeta        *meta;
-    PgchDeformPlan       plan;          /* group C / GUC-off row-major path */
-    PgchDeformCol       *col;           /* group A/B C++ driver descriptor */
+    PgchRowPlan          plan;          /* group C / GUC-off row-major path */
+    PgchDeformCol       *col;           /* group A/B columnar driver descriptor */
     PgchDeformDesc       desc;
+    PgchStep            *step_a, *step_b;   /* compiled columnar deform step plans */
+    PgchHop             *hop_a, *hop_b;
+    PgchDeformPlan       plan_a, plan_b;    /* group A / group B */
     PgchVisDesc          visdesc;       /* per-scan snapshot bounds for the classify kernel */
     PgchVisStats         vis;           /* per-scan visibility-path counters */
     uint32               cum;
@@ -661,6 +664,11 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     values = (Datum *) palloc(sizeof(Datum) * max_attno);
     isnull = (bool *) palloc(sizeof(bool) * max_attno);
     col = (PgchDeformCol *) palloc0(sizeof(PgchDeformCol) * max_attno);
+    /* Step plans: <= 2*max_attno+2 steps, <= max_attno hops per group. */
+    step_a = (PgchStep *) palloc(sizeof(PgchStep) * (2 * max_attno + 2));
+    step_b = (PgchStep *) palloc(sizeof(PgchStep) * (2 * max_attno + 2));
+    hop_a = (PgchHop *) palloc(sizeof(PgchHop) * (max_attno + 1));
+    hop_b = (PgchHop *) palloc(sizeof(PgchHop) * (max_attno + 1));
     cur_simple = (char **) palloc(sizeof(char *) * MaxHeapTuplesPerPage);
     complex_tup = (HeapTupleHeader *) palloc(sizeof(HeapTupleHeader) * MaxHeapTuplesPerPage);
     fallback_tup = (HeapTupleHeader *) palloc(sizeof(HeapTupleHeader) * MaxHeapTuplesPerPage);
@@ -668,8 +676,10 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
 
     cz = pgch_columnizer_begin(cols, ncols, producer, rows_per_block);
 
-    /* C++ driver descriptor (needs cz for the per-column output buffers). */
+    /* C++ driver descriptor (needs cz for the per-column output buffers), then
+     * compile the per-scan group-A / group-B step plans from it. */
     pgch_build_deform_desc(rel, cz, cols, col_of, max_attno, col, &desc);
+    pgch_build_deform_plans(&desc, step_a, hop_a, &plan_a, step_b, hop_b, &plan_b);
 
     s.max_attno = max_attno;
     s.columnar = pgch_use_columnar_deform;
@@ -725,8 +735,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
             size_t avail = pgch_columnizer_block_avail(cz);
             int    navail = (int) Min((size_t) (s.na - done), avail);
 
-            pgch_columnar_deform_simple(&desc, cur_simple + done, (size_t) navail,
-                                        dst, cz, pgch_str_fill_cb);
+            pgch_columnar_deform_run(&plan_a, cur_simple + done, NULL, (size_t) navail,
+                                     dst, cz, pgch_str_fill_cb);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }
@@ -746,8 +756,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
                 cur_simple[r] = (char *) h + h->t_hoff;
                 bits[r] = (const bits8 *) ((char *) h + SizeofHeapTupleHeader);
             }
-            pgch_columnar_deform_nullable(&desc, cur_simple, bits, (size_t) navail,
-                                          dst, cz, pgch_str_fill_cb);
+            pgch_columnar_deform_run(&plan_b, cur_simple, bits, (size_t) navail,
+                                     dst, cz, pgch_str_fill_cb);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }
@@ -769,6 +779,10 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     pfree(fallback_tup);
     pfree(complex_tup);
     pfree(cur_simple);
+    pfree(hop_b);
+    pfree(hop_a);
+    pfree(step_b);
+    pfree(step_a);
     pfree(col);
     pfree(isnull);
     pfree(values);
