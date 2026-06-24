@@ -58,6 +58,7 @@ bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_stream_workers = 0;
+int   pgch_shm_rows_per_block = 65536;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -724,7 +725,7 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
     producer = shm_producer_create(shm_name, schema, ncols,
                                    (uint32_t) pgch_shm_ring_depth_k,
                                    (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                   NULL, CurrentMemoryContext);
+                                   CurrentMemoryContext);
 
     /* Stream under the active (query) snapshot for correct MVCC visibility
      * (single producer: no shared block cursor), then signal end-of-stream. */
@@ -819,6 +820,14 @@ pgch_shm_offload_init(void)
                             "max_parallel_workers); 1 = the original single producer. The effective "
                             "value is also forced as ClickHouse max_threads for the offload query.",
                             NULL, &pgch_shm_stream_workers, 0, 0, PGCH_SHM_MAX_STREAM_WORKERS,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.shm_rows_per_block",
+                            "Rows per published SHM block. Larger blocks amortize the consumer's "
+                            "fixed per-block adoption cost (fewer, bigger ClickHouse Chunks) at the "
+                            "cost of more shared memory per ring slot; must fit a slot "
+                            "(shm_data_region_mb / shm_ring_depth_k).",
+                            NULL, &pgch_shm_rows_per_block, 65536, 1024, 1048576,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the

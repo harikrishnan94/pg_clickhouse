@@ -60,6 +60,7 @@ extern bool  pgch_log_stream_stats;
 extern bool  pgch_enable_jit_deform;
 extern int   pgch_jit_row_threshold;
 extern int   pgch_shm_stream_workers;
+extern int   pgch_shm_rows_per_block;
 
 /*
  * Hard cap on cooperating SHM streaming workers (the GUC's upper bound and the

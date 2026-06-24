@@ -70,19 +70,15 @@ typedef struct ShmWorkerSlot
 } ShmWorkerSlot;
 
 /*
- * Cross-process coordination shared by all W workers on one ring (in the DSM):
- *   - publish: the ring slot-claim cursor + global block sequence (shm_producer);
- *   - block:   the heap-block work allocator for the parallel vectorized reader;
- *   - active_workers: initialized to W; each worker decrements when it finishes
- *     streaming, and the worker that drives it to 0 publishes the single EOS.
+ * Cross-process coordination shared by all W workers (in the DSM). The only
+ * shared mutable state is the heap-block work allocator: each worker writes its
+ * OWN private ring, so there is no shared publish cursor or end-of-stream
+ * coordination -- every worker independently signals EOS on its own ring and the
+ * ClickHouse consumer reads the W rings as W parallel sources.
  */
 typedef struct ShmWorkerCoord
 {
-    ShmPublishCoord  publish;
-    ShmBlockCursor   block;
-    pg_atomic_uint32 active_workers;
-    pg_atomic_uint32 eos_done;       /* set 1 AFTER the single EOS block is published */
-    pg_atomic_uint32 aborted;        /* set 1 by any worker that errors out */
+    ShmBlockCursor   block;          /* shared heap-block allocator (work-stealing) */
 } ShmWorkerCoord;
 
 /*
@@ -90,6 +86,7 @@ typedef struct ShmWorkerCoord
  * the serialized snapshot at snapshot_offset, then one ShmWorkerCoord at
  * coord_offset, then ShmWorkerSlot[nworkers] at wslot_offset. All W workers
  * attach the SAME segment; the originating backend's PGPROC pins the snapshot.
+ * The header's shm_name is the BASE ring name; worker w owns ring <base>_<w>.
  */
 typedef struct ShmWorkerHeader
 {
@@ -217,12 +214,7 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
 
     /* Initialize the shared coordination before any worker can start. */
     coord = coord_of(hdr);
-    pg_atomic_init_u64(&coord->publish.next_slot, 0);
-    pg_atomic_init_u64(&coord->publish.global_seq, 0);
     pg_atomic_init_u32(&coord->block.next_block, 0);
-    pg_atomic_init_u32(&coord->active_workers, (uint32) nworkers);
-    pg_atomic_init_u32(&coord->eos_done, 0);
-    pg_atomic_init_u32(&coord->aborted, 0);
     for (w = 0; w < nworkers; w++)
         pg_atomic_init_u32(&wslot_of(hdr, w)->state, PGCH_WS_INIT);
 
@@ -397,15 +389,13 @@ pgch_shm_worker_main(Datum main_arg)
     ShmWorkerCoord  *coord;
     ShmWorkerSlot   *me;
     int              my_index = 0;
-    bool             is_owner;
 
     pqsignal(SIGTERM, die);
     BackgroundWorkerUnblockSignals();
 
-    /* This worker's index within the cooperating set (owner == 0), passed in
-     * bgw_extra by the launcher. */
+    /* This worker's index within the cooperating set, passed in bgw_extra by the
+     * launcher. Worker w owns ring "<base>_<w>". */
     memcpy(&my_index, MyBgworkerEntry->bgw_extra, sizeof(my_index));
-    is_owner = (my_index == 0);
 
     seg = dsm_attach(DatumGetUInt32(main_arg));
     if (seg == NULL)
@@ -430,6 +420,7 @@ pgch_shm_worker_main(Datum main_arg)
         ShmColumnSchema  *schema;
         ShmProducer      *producer;
         ShmBlockCursor   *bcursor;
+        char             *my_shm_name;
         AttrNumber       *attnos = (AttrNumber *) ((char *) hdr + hdr->attnos_offset);
         int               ncols = hdr->ncols;
         int               i;
@@ -461,48 +452,26 @@ pgch_shm_worker_main(Datum main_arg)
         }
 
         /*
-         * The owner (worker 0) creates the SHM object + control socket; the
-         * other workers attach to it as secondary producers on the same ring.
-         * All share the DSM-resident publish coord (slot cursor + global block
-         * sequence). The producer is owned by the transaction context so an abort
-         * (error / SIGTERM-FATAL) tears it down via the reset callback (the owner
-         * additionally unlinks the SHM object + control socket).
+         * Each worker creates and owns its OWN ring, named "<base>_<index>".
+         * The W rings are independent: the ClickHouse query reads them as W
+         * parallel streamed_table() sources (UNION ALL), so the consumer
+         * parallelizes W-way. The producer is owned by the transaction context so
+         * an abort (error / SIGTERM-FATAL) unlinks this worker's ring + socket via
+         * the reset callback.
          */
-        if (is_owner)
-        {
-            producer = shm_producer_create(hdr->shm_name, schema, ncols,
-                                           (uint32_t) hdr->ring_depth_k,
-                                           hdr->data_region_size, &coord->publish,
-                                           CurTransactionContext);
-        }
-        else
-        {
-            uint32 owner_st;
-
-            /* Wait for the owner to create the ring before attaching to it. */
-            while ((owner_st = pg_atomic_read_u32(&wslot_of(hdr, 0)->state)) == PGCH_WS_INIT)
-            {
-                CHECK_FOR_INTERRUPTS();
-                pg_usleep(1000L);
-            }
-            if (owner_st == PGCH_WS_ERROR)
-                ereport(ERROR,
-                        (errmsg("pg_clickhouse: shm streaming owner failed before the ring was created")));
-
-            producer = shm_producer_attach(hdr->shm_name, schema, ncols,
-                                           (uint32_t) hdr->ring_depth_k,
-                                           hdr->data_region_size, &coord->publish,
-                                           CurTransactionContext);
-        }
+        my_shm_name = psprintf("%s_%d", hdr->shm_name, my_index);
+        producer = shm_producer_create(my_shm_name, schema, ncols,
+                                       (uint32_t) hdr->ring_depth_k,
+                                       hdr->data_region_size,
+                                       CurTransactionContext);
 
         /* Abandon the stream (rather than hang) if the originating backend dies
          * while we are blocked on a full ring -- a dead backend means the
-         * ClickHouse consumer was cancelled and the ring will never drain. */
+         * ClickHouse consumer was cancelled and this ring will never drain. */
         shm_producer_set_origin_pid(producer, hdr->backend_pid);
 
         /* Mark this worker ready. Once every worker is ready the backend dispatches
-         * the ClickHouse query (the consumer can attach to the owner's control
-         * socket; all W producers are already counted toward end-of-stream). */
+         * the ClickHouse query (each ring's control socket is up for its source). */
         pg_atomic_write_u32(&me->state, PGCH_WS_READY);
         SetLatch(&hdr->backend_proc->procLatch);
 
@@ -571,37 +540,13 @@ pgch_shm_worker_main(Datum main_arg)
                                                producer, (size_t) hdr->rows_per_block, bcursor, NULL);
 
         /*
-         * This worker has finished streaming its share. The LAST worker to finish
-         * (active_workers -> 0) publishes the single end-of-stream block -- by
-         * which point every data block from every worker is already PUBLISHED, so
-         * the EOS carries the highest global sequence and the consumer drains it
-         * strictly last. Then set eos_done so the owner may unlink the ring.
+         * This worker streamed its share into its OWN ring; signal end-of-stream
+         * on it (each ring is independent -- the consumer reads each source to its
+         * own EOS), then drain consumer retains and unlink. No cross-worker
+         * coordination is needed.
          */
-        if (pg_atomic_sub_fetch_u32(&coord->active_workers, 1) == 0)
-        {
-            shm_producer_signal_eos(producer);
-            pg_atomic_write_u32(&coord->eos_done, 1);
-        }
-
-        if (is_owner)
-        {
-            /* Producer-outlives-consumer: the owner unlinks the ring + socket,
-             * but only AFTER the EOS block has been published (so it never
-             * unlinks while the stream is logically unfinished), then drains
-             * every retained block. Bail early if any worker aborted. */
-            while (pg_atomic_read_u32(&coord->eos_done) == 0
-                   && pg_atomic_read_u32(&coord->aborted) == 0)
-            {
-                CHECK_FOR_INTERRUPTS();
-                pg_usleep(1000L);
-            }
-            shm_producer_destroy(producer);     /* drains consumer retains, unlinks */
-        }
-        else
-        {
-            /* A secondary just drops its own mapping/fds (no drain, no unlink). */
-            shm_producer_destroy(producer);
-        }
+        shm_producer_signal_eos(producer);
+        shm_producer_destroy(producer);     /* drains consumer retains, unlinks */
 
         table_close(rel, AccessShareLock);
         PopActiveSnapshot();
@@ -618,14 +563,11 @@ pgch_shm_worker_main(Datum main_arg)
         FreeErrorData(edata);
         MemoryContextSwitchTo(ecxt);
 
-        /* Mark the whole stream aborted so the owner stops waiting for an EOS that
-         * will never come and tears the ring down promptly (which makes the
-         * consumer fail) -- never a false EOS, so results are never truncated. */
-        pg_atomic_write_u32(&coord->aborted, 1);
-
         /* Publish this worker's error BEFORE tearing down the producer, so the
-         * backend (woken by this latch or by ClickHouse seeing the producer go
-         * away) reads the real cause rather than a generic producer-death error. */
+         * backend (woken by this latch or by ClickHouse seeing this ring's source
+         * go away) reads the real cause rather than a generic producer-death
+         * error. This worker's ring is independent; its abort unlinks only its own
+         * ring + socket, and that source's failure fails the whole UNION query. */
         pg_atomic_write_u32(&me->state, PGCH_WS_ERROR);
         SetLatch(&hdr->backend_proc->procLatch);
 

@@ -671,8 +671,8 @@ shm_fetch_into_slot(ShmScanState *sss, TupleTableSlot *slot)
 static int
 shm_auto_stream_workers(BlockNumber nblocks)
 {
-    int         w = 1;
-    BlockNumber threshold = 1024;
+    int      w = 1;
+    uint64   threshold = 1024;   /* uint64: threshold*3 must not overflow on huge heaps */
 
     while (nblocks >= threshold * 3 && w < PGCH_SHM_MAX_STREAM_WORKERS)
     {
@@ -758,9 +758,52 @@ shm_settings_force_max_threads(int nworkers)
     return new_kv_list_from_pg_list(items, kv_pair_palloc);
 }
 
+/*
+ * Rewrite the offload SQL to read from W independent rings instead of one.
+ * The deparser emitted a single `streamed_table('<base>', '<schema>')`; replace
+ * that exact reference with a UNION ALL of W per-worker rings
+ * `(SELECT * FROM streamed_table('<base>_0','<schema>') UNION ALL ...)`.
+ * Each streamed_table() call is its own ClickHouse source, so the consumer reads
+ * the W rings as W PARALLEL streams (one PollableShmSource each) -- which is what
+ * lifts the single-source bottleneck. Worker w creates the matching ring
+ * "<base>_<w>". W=1 yields a single-source subquery (semantically identical).
+ */
+static char *
+shm_build_union_sql(const char *sql, const char *base, const char *schema, int nworkers)
+{
+    char         *needle = psprintf("streamed_table(%s, %s)",
+                                    ch_quote_literal(base), ch_quote_literal(schema));
+    const char   *pos = strstr(sql, needle);
+    StringInfoData out;
+    int           w;
+
+    if (pos == NULL)
+        ereport(ERROR,
+                (errmsg("pg_clickhouse: could not locate streamed_table() in the SHM-offload SQL")));
+
+    initStringInfo(&out);
+    appendBinaryStringInfo(&out, sql, pos - sql);          /* everything before the source */
+    appendStringInfoChar(&out, '(');
+    for (w = 0; w < nworkers; w++)
+    {
+        char *name = psprintf("%s_%d", base, w);
+
+        if (w > 0)
+            appendStringInfoString(&out, " UNION ALL ");
+        appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s)",
+                         ch_quote_literal(name), ch_quote_literal(schema));
+        pfree(name);
+    }
+    appendStringInfoChar(&out, ')');
+    appendStringInfoString(&out, pos + strlen(needle));    /* everything after the source */
+
+    pfree(needle);
+    return out.data;
+}
+
 /* ExecScan access method: produce the next raw scan tuple. On the first call it
- * launches the streaming background worker and dispatches the ClickHouse query;
- * the worker fills the bounded ring while ClickHouse drains it concurrently. */
+ * launches the streaming background workers and dispatches the ClickHouse query;
+ * the workers fill their rings while ClickHouse drains them concurrently. */
 static TupleTableSlot *
 shm_scan_access_mtd(ScanState *ss)
 {
@@ -788,7 +831,7 @@ shm_scan_access_mtd(ScanState *ss)
                                              estate->es_snapshot,
                                              pgch_shm_ring_depth_k,
                                              (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                             65536, nworkers);
+                                             pgch_shm_rows_per_block, nworkers);
         MemoryContextSwitchTo(old);
         pgch_shm_worker_wait_ready(sss->worker);
 
@@ -797,7 +840,9 @@ shm_scan_access_mtd(ScanState *ss)
          *    consumer's max_threads to match the producer worker count. */
         old = MemoryContextSwitchTo(sss->batch_cxt);
         {
-            ch_query query = new_query(sss->sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);
+            char    *union_sql = shm_build_union_sql(sss->sql, sss->shm_name,
+                                                     sss->schema_string, nworkers);
+            ch_query query = new_query(union_sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);
 
             query.settings = shm_settings_force_max_threads(nworkers);
 

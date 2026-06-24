@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <signal.h>             /* kill() for backend-liveness checks */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -101,15 +102,7 @@ StaticAssertDecl(sizeof(ShmSlot) == 64, "ShmSlot must be 64 bytes");
 StaticAssertDecl(sizeof(ShmSchemaEntry) == 128, "ShmSchemaEntry must be 128 bytes");
 StaticAssertDecl(sizeof(ShmColumnDescriptor) == 56, "ShmColumnDescriptor must be 56 bytes");
 
-/*
- * Parked control-socket connections. The consumer connects once and must stay
- * parked (closing it would surface POLLHUP and trip producer-death detection).
- * Cooperating SECONDARY producers also connect here briefly to receive the
- * shared readiness eventfd via SCM_RIGHTS, so the cap must comfortably exceed
- * the worker count (shm_stream_workers is capped well below this) plus the
- * consumer, or a late consumer connection could be refused a parked slot.
- */
-#define MAX_PARKED_CONNS 128
+#define MAX_PARKED_CONNS 16
 
 struct ShmProducer {
     char       *shm_name;       /* with leading '/' */
@@ -126,22 +119,16 @@ struct ShmProducer {
     size_t      per_slot_capacity;
     size_t      per_slot_payload_offset;
 
-    /*
-     * Cross-process publish coordination (slot-claim cursor + global block
-     * sequence). Points at `private_coord` for a single-producer ring, or at a
-     * shared DSM-resident coord when W workers cooperate on one ring.
-     */
-    ShmPublishCoord *coord;
-    ShmPublishCoord  private_coord;
-    bool        is_owner;        /* owns the SHM object + control socket + pump */
+    uint64_t   *next_sequence;   /* per slot */
+    uint32_t    next_slot;
     bool        eos_published;
     bool        cleaned;
     /*
      * Originating backend PID (0 = no check). When set, the ring-full wait polls
      * it so a producer cannot block forever if the backend has died (which
-     * cancels the ClickHouse consumer, so nothing will ever drain the ring) --
-     * the wait then errors out and the worker tears itself down. Query *cancel*
-     * (backend still alive) is handled separately by the backend reaping workers.
+     * cancels the ClickHouse consumer, so nothing will ever drain this ring) --
+     * the wait then errors and the worker tears itself down. Clean query cancel
+     * (backend still alive) is handled by the backend reaping its workers.
      */
     int         origin_pid;
 
@@ -191,18 +178,13 @@ align_up(size_t v, size_t a)
     return (v + a - 1) & ~(a - 1);
 }
 
-/* Total mapped size of the SHM region (handshake + slot table + schema table +
- * data region). Used by both the owner (shm_producer_create) and a secondary
- * (shm_producer_attach) so they map exactly the same layout. */
-static size_t
-shm_region_size(uint32_t ring_depth_k, int n_columns, size_t data_region_size, long page)
+/* True if a configured originating backend has gone away (so the ClickHouse
+ * consumer was cancelled and this ring will never drain). kill(pid, 0) probes
+ * existence; ESRCH means the process is gone. */
+static inline bool
+origin_backend_dead(ShmProducer *p)
 {
-    size_t off = align_up(sizeof(ShmHandshake), (size_t) page);  /* slot table */
-    off += (size_t) ring_depth_k * sizeof(ShmSlot);
-    off += (size_t) n_columns * sizeof(ShmSchemaEntry);
-    off = align_up(off, (size_t) page);                          /* data region */
-    off += data_region_size;
-    return align_up(off, (size_t) page);
+    return p->origin_pid > 0 && kill((pid_t) p->origin_pid, 0) < 0 && errno == ESRCH;
 }
 
 static ShmHandshake *
@@ -222,17 +204,6 @@ static char *
 data_region(ShmProducer *p)
 {
     return (char *) p->mapping + hs_of(p)->data_region_offset;
-}
-
-#include <signal.h>             /* kill() for backend-liveness checks */
-
-/* True if a configured originating backend has gone away (so the ClickHouse
- * consumer has been cancelled and the ring will never drain again). kill(pid, 0)
- * probes existence; ESRCH means the process is gone. */
-static inline bool
-origin_backend_dead(ShmProducer *p)
-{
-    return p->origin_pid > 0 && kill((pid_t) p->origin_pid, 0) < 0 && errno == ESRCH;
 }
 
 /* /tmp/clickhouse_shm_<sanitized>.sock — must match ClickHouse
@@ -307,61 +278,6 @@ send_eventfd(int conn_fd, int eventfd_to_pass)
     /* Best effort: a consumer that vanished mid-handshake must not error the
      * producer; the connection is simply dropped by the caller. */
     (void) sendmsg(conn_fd, &msg, MSG_NOSIGNAL);
-}
-
-/* Connect a fresh SOCK_STREAM client to the owner's control socket. Returns the
- * connected fd, or -1 (the caller retries while the owner is still coming up). */
-static int
-connect_control_socket(const char *socket_path)
-{
-    struct sockaddr_un addr;
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-
-    if (fd < 0)
-        return -1;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    memcpy(addr.sun_path, socket_path, strlen(socket_path));
-    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0)
-    {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-/* Receive the readiness eventfd the owner's pump thread sends via SCM_RIGHTS
- * (the counterpart of send_eventfd). Returns the received fd, or -1. */
-static int
-recv_eventfd(int conn_fd)
-{
-    struct msghdr msg;
-    struct iovec iov;
-    char dummy = 0;
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg_buf;
-    struct cmsghdr *cmsg;
-    int fd = -1;
-
-    memset(&msg, 0, sizeof(msg));
-    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
-    iov.iov_base = &dummy;
-    iov.iov_len = 1;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.buf;
-    msg.msg_controllen = sizeof(cmsg_buf.buf);
-
-    if (recvmsg(conn_fd, &msg, MSG_CMSG_CLOEXEC) < 0)
-        return -1;
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg != NULL && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS
-        && cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
-        memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-    return fd;
 }
 
 /* Accept any pending consumer connections and hand each the readiness eventfd.
@@ -447,17 +363,10 @@ producer_cleanup(ShmProducer *p)
         p->mapping = NULL;
     }
     if (p->shm_fd >= 0) { close(p->shm_fd); p->shm_fd = -1; }
-    /* Only the owner unlinks the SHM object + control socket; a secondary
-     * (attached) producer just drops its own mapping/fds. shm_unlink removes the
-     * name only -- any still-mapped peer keeps a valid view -- so owner teardown
-     * never crashes a lingering secondary writer. */
-    if (p->is_owner)
-    {
-        if (p->shm_name)
-            shm_unlink(p->shm_name);
-        if (p->socket_path)
-            unlink(p->socket_path);
-    }
+    if (p->shm_name)
+        shm_unlink(p->shm_name);
+    if (p->socket_path)
+        unlink(p->socket_path);
 }
 
 static void
@@ -470,7 +379,7 @@ ShmProducer *
 shm_producer_create(const char *name,
                     const ShmColumnSchema *schema, int n_columns,
                     uint32_t ring_depth_k, size_t data_region_size,
-                    ShmPublishCoord *coord, MemoryContext owner_cxt)
+                    MemoryContext owner_cxt)
 {
     MemoryContext old = MemoryContextSwitchTo(owner_cxt);
     ShmProducer *p = palloc0(sizeof(ShmProducer));
@@ -484,17 +393,6 @@ shm_producer_create(const char *name,
     p->shm_fd = p->event_fd = p->listen_fd = -1;
     p->mapping = NULL;
     p->owner_cxt = owner_cxt;
-    p->is_owner = true;
-    /* Single-producer ring: a private coord (uncontended). A shared ring passes
-     * a DSM-resident coord so all W cooperating producers share the cursor. */
-    if (coord == NULL)
-    {
-        pg_atomic_init_u64(&p->private_coord.next_slot, 0);
-        pg_atomic_init_u64(&p->private_coord.global_seq, 0);
-        p->coord = &p->private_coord;
-    }
-    else
-        p->coord = coord;
 
     if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
         ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
@@ -528,8 +426,7 @@ shm_producer_create(const char *name,
     off += (size_t) n_columns * sizeof(ShmSchemaEntry);
     off = align_up(off, (size_t) page);                           /* data region */
     off += data_region_size;
-    p->mapping_size = shm_region_size(ring_depth_k, n_columns, data_region_size, page);
-    Assert(p->mapping_size == align_up(off, (size_t) page));
+    p->mapping_size = align_up(off, (size_t) page);
 
     /* A stale object from a prior crash blocks O_EXCL. */
     shm_unlink(p->shm_name);
@@ -586,6 +483,8 @@ shm_producer_create(const char *name,
     if (p->per_slot_capacity < SHM_PADDING_FOR_SIMD * 4)
         ereport(ERROR, (errmsg("pg_clickhouse: shm data region too small for %u slots", ring_depth_k)));
     p->per_slot_payload_offset = align_up((size_t) n_columns * sizeof(ShmColumnDescriptor), 64);
+    p->next_sequence = palloc0(sizeof(uint64_t) * ring_depth_k);
+    p->next_slot = 0;
 
     for (i = 0; i < (int) ring_depth_k; i++)
         slot_at(p, (uint32_t) i)->slot_index = (uint32_t) i;
@@ -618,120 +517,6 @@ shm_producer_create(const char *name,
     if (pthread_create(&p->pump_thread, NULL, pump_thread_main, p) != 0)
         ereport(ERROR, (errmsg("pg_clickhouse: could not start SHM control-socket pump thread")));
     p->pump_running = true;
-
-    MemoryContextSwitchTo(old);
-    return p;
-}
-
-/* ~60s cap (1ms spins) on each attach wait, as a safety net beyond
- * CHECK_FOR_INTERRUPTS (the backend SIGTERMs all workers if the owner fails). */
-#define SHM_ATTACH_SPIN_CAP 60000
-
-ShmProducer *
-shm_producer_attach(const char *name,
-                    const ShmColumnSchema *schema, int n_columns,
-                    uint32_t ring_depth_k, size_t data_region_size,
-                    ShmPublishCoord *coord, MemoryContext owner_cxt)
-{
-    MemoryContext old = MemoryContextSwitchTo(owner_cxt);
-    ShmProducer *p = palloc0(sizeof(ShmProducer));
-    ShmHandshake *hs;
-    long page = sysconf(_SC_PAGESIZE);
-    int  spins;
-
-    p->shm_fd = p->event_fd = p->listen_fd = -1;
-    p->mapping = NULL;
-    p->owner_cxt = owner_cxt;
-    p->is_owner = false;            /* never unlinks / drains; just drops its view */
-    Assert(coord != NULL);          /* a shared ring always has a shared coord */
-    p->coord = coord;
-
-    if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
-        ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
-                               ring_depth_k, SHM_IMPL_MAX_K)));
-    if (n_columns <= 0 || (uint32_t) n_columns > SHM_IMPL_MAX_COLS)
-        ereport(ERROR, (errmsg("pg_clickhouse: shm column count %d out of range (1..%u)",
-                               n_columns, SHM_IMPL_MAX_COLS)));
-    if (data_region_size == 0)
-        ereport(ERROR, (errmsg("pg_clickhouse: shm data region size must be > 0")));
-
-    if (name[0] == '/')
-        p->shm_name = pstrdup(name);
-    else
-        p->shm_name = psprintf("/%s", name);
-    p->socket_path = control_socket_path(p->shm_name);
-
-    /* Register cleanup before acquiring any kernel resource (an ereport below
-     * must still unwind cleanly). A secondary never unlinks (is_owner == false). */
-    p->cleanup_cb.func = producer_cleanup_callback;
-    p->cleanup_cb.arg = p;
-    MemoryContextRegisterResetCallback(owner_cxt, &p->cleanup_cb);
-
-    p->ring_depth_k = ring_depth_k;
-    p->n_columns = n_columns;
-    p->schema = palloc0(sizeof(ShmColumnSchema) * n_columns);
-    memcpy(p->schema, schema, sizeof(ShmColumnSchema) * n_columns);
-    p->mapping_size = shm_region_size(ring_depth_k, n_columns, data_region_size, page);
-    p->per_slot_capacity = (data_region_size / ring_depth_k) & ~((size_t) 63);
-    p->per_slot_payload_offset = align_up((size_t) n_columns * sizeof(ShmColumnDescriptor), 64);
-
-    /* Open the owner's SHM object. The worker-side launch coordination only calls
-     * attach after the owner has created the ring, so this normally succeeds at
-     * once; the bounded CFI spin tolerates a small startup skew. */
-    for (spins = 0;; spins++)
-    {
-        CHECK_FOR_INTERRUPTS();
-        p->shm_fd = shm_open(p->shm_name, O_RDWR, 0);
-        if (p->shm_fd >= 0)
-            break;
-        if (errno != ENOENT)
-            ereport(ERROR, (errcode_for_file_access(),
-                            errmsg("pg_clickhouse: shm_open(\"%s\") failed: %m", p->shm_name)));
-        if (spins >= SHM_ATTACH_SPIN_CAP)
-            ereport(ERROR, (errmsg("pg_clickhouse: timed out attaching to shm ring \"%s\"", p->shm_name)));
-        pg_usleep(1000L);
-    }
-
-    p->mapping = mmap(NULL, p->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, p->shm_fd, 0);
-    if (p->mapping == MAP_FAILED)
-        ereport(ERROR, (errcode_for_file_access(),
-                        errmsg("pg_clickhouse: mmap(\"%s\") failed: %m", p->shm_name)));
-
-    /* Wait for the owner's release-stored handshake magic, then cross-validate. */
-    hs = hs_of(p);
-    for (spins = 0; __atomic_load_n(&hs->magic, __ATOMIC_ACQUIRE) != SHM_MAGIC; spins++)
-    {
-        CHECK_FOR_INTERRUPTS();
-        if (spins >= SHM_ATTACH_SPIN_CAP)
-            ereport(ERROR, (errmsg("pg_clickhouse: timed out on shm handshake for \"%s\"", p->shm_name)));
-        pg_usleep(1000L);
-    }
-    if (hs->abi_version != SHM_ABI_VERSION_1
-        || hs->ring_depth_k != ring_depth_k
-        || hs->schema_count != (uint32_t) n_columns)
-        ereport(ERROR, (errmsg("pg_clickhouse: shm ring \"%s\" handshake mismatch on attach "
-                               "(abi=%u k=%u cols=%u)", p->shm_name,
-                               hs->abi_version, hs->ring_depth_k, hs->schema_count)));
-
-    /* Receive the shared readiness eventfd over the owner's control socket (same
-     * SCM_RIGHTS handshake the consumer uses); every producer writes it on publish. */
-    for (spins = 0;; spins++)
-    {
-        int conn;
-
-        CHECK_FOR_INTERRUPTS();
-        conn = connect_control_socket(p->socket_path);
-        if (conn >= 0)
-        {
-            p->event_fd = recv_eventfd(conn);
-            close(conn);
-            if (p->event_fd >= 0)
-                break;
-        }
-        if (spins >= SHM_ATTACH_SPIN_CAP)
-            ereport(ERROR, (errmsg("pg_clickhouse: timed out receiving shm eventfd for \"%s\"", p->shm_name)));
-        pg_usleep(1000L);
-    }
 
     MemoryContextSwitchTo(old);
     return p;
@@ -775,12 +560,7 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ereport(ERROR, (errmsg("pg_clickhouse: shm row_count %zu exceeds limit %u",
                                row_count, SHM_IMPL_MAX_ROWS)));
 
-    /* Atomically claim the next ring slot. With one producer this is an
-     * uncontended increment; with W cooperating producers the shared DSM coord
-     * hands each a distinct slot index, so per slot there is still exactly one
-     * writer and the EMPTY->WRITING->PUBLISHED state machine below is unchanged. */
-    slot_pos = (uint32_t) (pg_atomic_fetch_add_u64(&p->coord->next_slot, 1)
-                           % p->ring_depth_k);
+    slot_pos = p->next_slot % p->ring_depth_k;
     slot = slot_at(p, slot_pos);
 
     /* Wait for the slot to be reusable. The consumer drives PUBLISHED->EMPTY on
@@ -880,12 +660,7 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
     slot->per_column_descriptors_offset = slot_data_base;
     slot->row_count = row_count;
     __atomic_store_n(&slot->eos_marker, is_eos ? 1 : 0, __ATOMIC_RELAXED);
-    /* Global (not per-slot) sequence: the EOS block, published last, gets the
-     * highest sequence, so the consumer (which drains lowest unconsumed sequence
-     * first) processes it strictly last. Still strictly per-slot monotonic. */
-    __atomic_store_n(&slot->sequence,
-                     pg_atomic_add_fetch_u64(&p->coord->global_seq, 1),
-                     __ATOMIC_RELAXED);
+    __atomic_store_n(&slot->sequence, ++p->next_sequence[slot_pos], __ATOMIC_RELAXED);
 
     /* WRITING -> PUBLISHED (counter bump before the state store, both release). */
     __atomic_fetch_add(&slot->transition_counter, 1, __ATOMIC_RELEASE);
@@ -897,6 +672,8 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ssize_t w = write(p->event_fd, &one, sizeof(one));
         (void) w;   /* EAGAIN on a full counter is harmless: consumer still polls */
     }
+
+    p->next_slot++;
     return;
 
 overflow:
@@ -930,15 +707,6 @@ shm_producer_destroy(ShmProducer *p)
 
     if (p->cleaned)
         return;
-
-    /* A secondary (attached) producer does not own the consumer relationship and
-     * must not drain or unlink: just drop its own mapping + fds. The owner does
-     * the drain wait below before unlinking. */
-    if (!p->is_owner)
-    {
-        producer_cleanup(p);
-        return;
-    }
 
     /* Producer must outlive every consumer retain. Wait (cooperatively, bounded)
      * until all slots are released (consumer drove them back to EMPTY). Keep
