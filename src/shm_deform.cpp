@@ -60,6 +60,68 @@ dec_width_of(ShmWireType w)
     }
 }
 
+/* ----------------------------------------------------------------------- */
+/* Numeric -> Decimal fast converter (width-specialized accumulator)        */
+/* ----------------------------------------------------------------------- */
+
+/*
+ * Accumulator traits for the inline numeric->Decimal converter. The accumulator
+ * is chosen by WIRE WIDTH, not just for capacity: a uint64 divide-by-constant
+ * (the end-of-loop rescale) strength-reduces to a reciprocal-multiply on x86-64,
+ * whereas an __int128 divide-by-constant stays a __udivti3 libcall -- so the
+ * common TPC-H Decimal32/64 path uses uint64 and Decimal128 uses __int128.
+ *
+ *   max_limbs : NBASE^max_limbs < 2^(bits(Acc)-1), so the guard-free Horner
+ *               accumulation provably cannot wrap Acc (an over-limb value takes
+ *               the guarded fallback converter instead).
+ *   max_exp   : 10^max_exp < 2^(bits(Acc)-1), so the rescaled magnitude cannot
+ *               wrap Acc. (The Decimal *wire width* fit -- e.g. a Decimal32 value
+ *               held in a uint64 accumulator -- is enforced separately by the
+ *               explicit signed-width `limit` check, not by max_exp.)
+ *
+ * 256 later: add DecAcc<u256> { using S = i256; max_limbs = 19; max_exp = 76; }
+ * plus a portable uint64[4] limb struct exposing * + / << > and signed negate
+ * AND a fast small-constant divide (a generic struct operator/ will not
+ * strength-reduce). _BitInt(256) is rejected by the C++ TU, so it must be a
+ * struct. The guarded fallback / scalar / resolver paths are __int128-bound and
+ * would also need widening; this seam reduces that work, it is not "drop-in".
+ */
+template <typename Acc> struct DecAcc;
+
+template <> struct DecAcc<uint64_t>             /* Decimal32 (Width 4) + Decimal64 (Width 8) */
+{
+    using S = int64_t;                          /* signed store/negate type */
+    static constexpr int max_limbs = 4;         /* NBASE^4 = 10^16 < 2^63 */
+    static constexpr int max_exp   = 18;        /* 10^18        < 2^63; uint64 /const reciprocal-multiplies */
+};
+
+template <> struct DecAcc<unsigned __int128>    /* Decimal128 (Width 16) */
+{
+    using S = __int128;
+    static constexpr int max_limbs = 9;         /* NBASE^9 = 10^36 < 2^127 */
+    static constexpr int max_exp   = 38;        /* 10^38        < 2^127 */
+};
+
+/* 10^0 .. 10^N as a constexpr (.rodata) table; no first-call `inited` guard. */
+template <typename Acc, int N>
+struct Pow10Tbl
+{
+    Acc v[N + 1];
+    constexpr Pow10Tbl() : v{}
+    {
+        Acc p = 1;
+        for (int i = 0; i <= N; ++i) { v[i] = p; p *= 10; }
+    }
+};
+
+template <typename Acc>
+[[gnu::always_inline]] static inline Acc
+dec_pow10(unsigned e)
+{
+    static constexpr Pow10Tbl<Acc, DecAcc<Acc>::max_exp> t{};
+    return t.v[e];
+}
+
 /* Alignment-safe typed load; lowers to a single load under -O2. */
 template <typename T>
 [[gnu::always_inline]] static inline T
@@ -232,40 +294,207 @@ k_fill_string(const PgchStep *st, char **cur, const bits8 **,
 }
 
 /*
- * FILL_DECIMAL: a projected heap numeric (varlena, attlen = -1) whose ClickHouse
- * wire form is a fixed-width Decimal (4/8/16). Positioned exactly like a string
- * (align only for a 4-byte header; advance past each datum by VARSIZE_ANY), but
- * converted inline into the column's fixed dst_base via the shared, allocation-free
- * core converter. A value it cannot convert in place (stored NaN/Inf, compressed/
- * external, or out of range) is recorded as a deferred fault (resolved on the C
- * side before the block is published) and a zero placeholder is written; the
- * common case never leaves this kernel.
+ * Hot converter: a SHORT (1-byte-header), non-external numeric varlena -> the
+ * ClickHouse Decimal wire value, round(value * 10^scale) as a two's-complement
+ * little-endian integer of `Width` bytes, written to `out`. `*consumed` receives
+ * the on-disk datum size so the caller advances the cursor without re-decoding
+ * the header (no second VARSIZE_ANY).
+ *
+ * A value whose magnitude exceeds the cheap precondition (corrupt data, or a
+ * legitimate value needing more limbs than the chosen accumulator holds) is NOT
+ * an error: it delegates to the general guarded converter (the documented 256
+ * swap point). A stored NaN/Inf returns SPECIAL; an out-of-wire-range magnitude
+ * returns OVERFLOW. Allocation-free; never raises.
  */
+template <typename Acc, uint32 Width>
+[[gnu::always_inline]] static inline PgchDecConv
+dec_convert_short(const char *p, uint32 scale, char *out, uint32 *consumed)
+{
+    using L = DecAcc<Acc>;
+
+    uint32      totlen      = (uint32) VARSIZE_SHORT(p);    /* = (header byte >> 1) */
+    const char *payload     = p + VARHDRSZ_SHORT;
+    uint32      payload_len = totlen - VARHDRSZ_SHORT;
+
+    *consumed = totlen;                                     /* kernel advances by this; no VARSIZE_ANY */
+
+    uint16 n_header;
+    __builtin_memcpy(&n_header, payload, sizeof(uint16));
+    if ((n_header & PGCH_NUMERIC_SIGN_MASK) == PGCH_NUMERIC_SPECIAL) [[unlikely]]
+        return PGCH_DECCONV_SPECIAL;                        /* NaN / +Inf / -Inf */
+
+    int sign_neg, weight, nhdr;
+    if (n_header & PGCH_NUMERIC_SHORT)                      /* short numeric header (2 bytes) */
+    {
+        nhdr     = 2;
+        sign_neg = (n_header & PGCH_NUMERIC_SHORT_SIGN_MASK) != 0;
+        int w    = n_header & PGCH_NUMERIC_SHORT_WEIGHT_MASK;
+        if (n_header & PGCH_NUMERIC_SHORT_WEIGHT_SIGN)
+            w |= ~PGCH_NUMERIC_SHORT_WEIGHT_MASK;           /* sign-extend 7-bit weight */
+        weight   = w;
+    }
+    else                                                    /* long numeric header (4 bytes) */
+    {
+        int16 w16;
+        nhdr     = 4;
+        sign_neg = (n_header & PGCH_NUMERIC_SIGN_MASK) == PGCH_NUMERIC_NEG;
+        __builtin_memcpy(&w16, payload + sizeof(uint16), sizeof(int16));
+        weight   = w16;
+    }
+
+    const char *digp    = payload + nhdr;
+    int         ndigits = ((int) payload_len - nhdr) / 2;   /* signed subtraction (robust off the short path) */
+
+    /* One branch: fast path vs the general guarded fallback (rare; 256 swap point). */
+    int hi_exp = PGCH_DEC_DIGITS * (weight + 1) + (int) scale;
+    if (ndigits > L::max_limbs || hi_exp > L::max_exp) [[unlikely]]
+        return pgch_numeric_to_decimal_wire_core(p, scale, Width, out);
+
+    /* Guard-free Horner: imul-by-constant + add (no per-limb pow10/divide/guard). */
+    Acc H = 0;
+    for (int i = 0; i < ndigits; ++i)
+    {
+        uint16 d16;
+        __builtin_memcpy(&d16, digp + (size_t) i * 2, sizeof(uint16));
+        H = H * (Acc) PGCH_NBASE + (Acc) d16;
+    }
+
+    /*
+     * Single end-of-loop rescale: one multiply, or one constant-divisor divide.
+     * On uint64 the divide strength-reduces to a reciprocal-multiply; on __int128
+     * it stays one __udivti3 (still one divide instead of N per-limb divides).
+     */
+    int texp = PGCH_DEC_DIGITS * (weight - ndigits + 1) + (int) scale;   /* = hi_exp - 4*ndigits */
+    Acc mag;
+    if (texp >= 0)
+    {
+        mag = H * dec_pow10<Acc>((unsigned) texp);          /* texp <= hi_exp <= max_exp */
+    }
+    else
+    {
+        switch (-texp)                                      /* valid numeric(P,S): -texp in {1,2,3} */
+        {
+            case 1:  mag = (H + 5)   / 10;   break;
+            case 2:  mag = (H + 50)  / 100;  break;         /* the scale-2 TPC-H hot constant */
+            case 3:  mag = (H + 500) / 1000; break;
+            default:                                        /* corrupt-data safety only */
+            {
+                unsigned s = (unsigned) -texp;
+                if (s > (unsigned) L::max_exp)
+                    mag = 0;                                /* 10^s >> H: rounds to 0 */
+                else
+                {
+                    Acc q = dec_pow10<Acc>(s);
+                    mag = (H + q / 2) / q;
+                }
+                break;
+            }
+        }
+    }
+
+    /* Defensive (cannot fire for valid data within the precondition) + the
+     * signed-width range check (this is what enforces e.g. Decimal32-in-uint64). */
+    Acc limit = (Acc) 1 << (8u * Width - 1);                /* 2^(bits-1) */
+    if (sign_neg ? (mag > limit) : (mag > limit - 1)) [[unlikely]]
+        return PGCH_DECCONV_OVERFLOW;
+
+    typename L::S sv = sign_neg ? -(typename L::S) mag : (typename L::S) mag;
+    __builtin_memcpy(out, &sv, Width);                      /* low Width bytes, two's-complement LE */
+    return PGCH_DECCONV_OK;
+}
+
+/*
+ * FILL_DECIMAL: a projected heap numeric (varlena, attlen = -1) whose ClickHouse
+ * wire form is a fixed-width Decimal (Width = 4/8/16). The common case is a SHORT
+ * varlena (numeric(P<=38,S) datums are tiny), converted inline into the column's
+ * fixed dst_base by dec_convert_short with no detoast and no second header
+ * decode. The cold branch handles the 4-byte / compressed / external forms: a
+ * plain 4-byte-uncompressed numeric is converted inline via the general core
+ * converter (NOT a fault -- e.g. a column with STORAGE PLAIN), while a genuinely
+ * compressed/external datum is recorded as a deferred fault (resolved on the C
+ * side before the block is published). NaN/Inf and out-of-range also fault.
+ */
+template <typename Acc, uint32 Width>
 static void
 k_fill_decimal(const PgchStep *st, char **cur, const bits8 **,
                size_t n, size_t dst_row, void *cz, PgchStringFill)
 {
     uint8  al    = st->align;
     uint32 scale = st->dec_scale;
-    uint32 width = st->dec_width;
     char  *base  = (char *) st->dst_base;
 
     for (size_t r = 0; r < n; ++r)
     {
-        char *c = cur[r];
-        if (!VARATT_NOT_PAD_BYTE(c))               /* 4-byte-header form must align */
-            c = (char *) TYPEALIGN(al, (uintptr_t) c);
-        cur[r] = c;
+        char *c   = cur[r];
+        uint8 b   = (uint8) *c;
+        char *dst = base + (dst_row + r) * Width;
 
-        char       *dst = base + (dst_row + r) * width;
-        PgchDecConv rc = pgch_numeric_to_decimal_wire_core(c, scale, width, dst);
-        if (rc != PGCH_DECCONV_OK)
+        if ((b & 1) && b != 0x01) [[likely]]                /* plain short, not external */
         {
-            __builtin_memset(dst, 0, width);
-            pgch_columnizer_note_dec_fault(cz, dst, c, scale, width,
-                                           st->col_index, (int) rc);
+            uint32      consumed;
+            PgchDecConv rc = dec_convert_short<Acc, Width>(c, scale, dst, &consumed);
+
+            if (rc != PGCH_DECCONV_OK) [[unlikely]]
+            {
+                __builtin_memset(dst, 0, Width);
+                pgch_columnizer_note_dec_fault(cz, dst, c, scale, Width,
+                                               st->col_index, (int) rc);
+            }
+#ifdef USE_ASSERT_CHECKING
+            else
+            {
+                /* Keep the fast path under the oracle: cross-check every OK row
+                 * against the general per-limb converter. ref is sized to the
+                 * compile-time Width (256-safe; no [16] stack smash). */
+                char        ref[Width];
+                PgchDecConv rrc = pgch_numeric_to_decimal_wire_core(c, scale, Width, ref);
+
+                Assert(rrc == PGCH_DECCONV_OK && memcmp(dst, ref, Width) == 0);
+            }
+#endif
+            cur[r] = c + consumed;
         }
-        cur[r] = c + VARSIZE_ANY(c);
+        else [[unlikely]]                                   /* 4B-uncompressed / compressed / external */
+        {
+            char *cc = c;
+            if (!VARATT_NOT_PAD_BYTE(cc))                   /* pad-safe align (NOT a blind TYPEALIGN) */
+                cc = (char *) TYPEALIGN(al, (uintptr_t) cc);
+
+            if (VARATT_IS_EXTERNAL(cc) || VARATT_IS_COMPRESSED(cc))
+            {
+                __builtin_memset(dst, 0, Width);            /* truly toasted: resolver detoasts + converts */
+                pgch_columnizer_note_dec_fault(cz, dst, cc, scale, Width,
+                                               st->col_index, (int) PGCH_DECCONV_TOASTED);
+            }
+            else
+            {
+                /* Plain 4-byte-uncompressed numeric: convert inline (not a fault). */
+                PgchDecConv rc = pgch_numeric_to_decimal_wire_core(cc, scale, Width, dst);
+                if (rc != PGCH_DECCONV_OK)
+                {
+                    __builtin_memset(dst, 0, Width);
+                    pgch_columnizer_note_dec_fault(cz, dst, cc, scale, Width,
+                                                   st->col_index, (int) rc);
+                }
+            }
+            cur[r] = cc + VARSIZE_ANY(cc);
+        }
+    }
+}
+
+/* Bind a Decimal wire tag to its (accumulator, width) kernel instantiation. The
+ * accumulator is uint64 for Decimal32/64 (its constant-divisor rescale becomes a
+ * reciprocal-multiply) and __int128 for Decimal128. */
+static PgchStepFn
+pick_fill_decimal(ShmWireType w)
+{
+    switch (w)
+    {
+        case SHM_WIRE_DECIMAL32:  return k_fill_decimal<uint64_t, 4>;
+        case SHM_WIRE_DECIMAL64:  return k_fill_decimal<uint64_t, 8>;
+        case SHM_WIRE_DECIMAL128: return k_fill_decimal<unsigned __int128, 16>;
+        /* case SHM_WIRE_DECIMAL256: return k_fill_decimal<u256, 32>;  // 256 later */
+        default:                  Assert(false); pg_unreachable();
     }
 }
 
@@ -631,9 +860,11 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
             }
             else if (c->is_decimal)
             {
-                /* Varlena-positioned like a string, but filled fixed-width inline. */
+                /* Varlena-positioned like a string, but filled fixed-width inline.
+                 * The width is baked into the kernel template; dec_width is kept
+                 * for diagnostics / the scalar path. */
                 s->kind = PGCH_STEP_FILL_DECIMAL;
-                s->run = k_fill_decimal;
+                s->run = pick_fill_decimal(c->wire);
                 s->align = align_bytes(c->attalign);
                 s->col_index = c->col_index;
                 s->dst_base = c->dst_base;

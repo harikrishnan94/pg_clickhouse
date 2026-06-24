@@ -579,48 +579,49 @@ columnizer_should_flush_bytes(ShmColumnizer *cz)
 }
 
 /*
- * Read a string column's payload (bytes + length) WITHOUT detoasting the common
- * short (1-byte header) and 4-byte-uncompressed varlena forms -- a heap text/
- * varchar/bpchar value is almost always one of these, so we avoid the per-row
- * palloc that DatumGetTextP does for a short varlena. A genuinely compressed-
- * inline or external value (rare: only above the TOAST threshold) is detoasted
- * into *to_free, which the caller pfrees. EXTERNAL is tested before SHORT because
- * an external datum also reports a 1-byte header. bpchar trailing blanks and
- * empty strings are preserved verbatim (we copy VARSIZE-VARHDRSZ bytes, exactly
- * as DatumGetTextP would have).
+ * Hot path: read an IN-PLACE string varlena's payload (bytes + length) without
+ * detoasting -- a heap text/varchar/bpchar value is almost always a 1-byte short
+ * header or a 4-byte uncompressed header, so we avoid the per-row palloc that
+ * DatumGetTextP does for a short varlena. Returns false for a genuinely
+ * compressed-inline / external datum (rare: only above the TOAST threshold), so
+ * the caller takes the cold pgch_string_detoast path. EXTERNAL/COMPRESSED are
+ * tested first because an external datum also reports a 1-byte (short) header, so
+ * the VARATT_IS_SHORT test below must only see a genuine short. bpchar trailing
+ * blanks and empty strings are preserved verbatim (VARSIZE-VARHDRSZ bytes,
+ * exactly as DatumGetTextP would have).
  */
-static inline void
-pgch_string_payload(char *p, const char **data, size_t *len, struct varlena **to_free)
+static inline bool
+pgch_string_inplace(const char *p, const char **data, size_t *len)
 {
-    *to_free = NULL;
-    if (VARATT_IS_EXTERNAL(p))
-    {
-        struct varlena *dt = pg_detoast_datum((struct varlena *) p);
+    if (unlikely(VARATT_IS_EXTERNAL(p) || VARATT_IS_COMPRESSED(p)))
+        return false;
 
-        *data = VARDATA(dt);
-        *len = (size_t) (VARSIZE(dt) - VARHDRSZ);
-        if ((char *) dt != p)
-            *to_free = dt;
-    }
-    else if (VARATT_IS_SHORT(p))
+    if (VARATT_IS_SHORT(p))
     {
         *data = VARDATA_SHORT(p);
-        *len = (size_t) (VARSIZE_SHORT(p) - VARHDRSZ_SHORT);
-    }
-    else if (VARATT_IS_COMPRESSED(p))
-    {
-        struct varlena *dt = pg_detoast_datum((struct varlena *) p);
-
-        *data = VARDATA(dt);
-        *len = (size_t) (VARSIZE(dt) - VARHDRSZ);
-        if ((char *) dt != p)
-            *to_free = dt;
+        *len  = (size_t) (VARSIZE_SHORT(p) - VARHDRSZ_SHORT);
     }
     else
     {
-        *data = VARDATA(p);
-        *len = (size_t) (VARSIZE(p) - VARHDRSZ);
+        *data = VARDATA(p);                     /* 4-byte uncompressed; bpchar/empty verbatim */
+        *len  = (size_t) (VARSIZE(p) - VARHDRSZ);
     }
+    return true;
+}
+
+/*
+ * Cold path: a compressed-inline / external string varlena. Detoast; the caller
+ * pfrees *to_free (set only when pg_detoast_datum actually allocated a copy).
+ * Out of line so the hot loop carries no detoast / to_free machinery.
+ */
+pg_noinline static void
+pgch_string_detoast(char *p, const char **data, size_t *len, struct varlena **to_free)
+{
+    struct varlena *dt = pg_detoast_datum((struct varlena *) p);
+
+    *data    = VARDATA(dt);
+    *len     = (size_t) (VARSIZE(dt) - VARHDRSZ);
+    *to_free = ((char *) dt != p) ? dt : NULL;
 }
 
 void
@@ -642,13 +643,21 @@ pgch_columnizer_add_row(ShmColumnizer *cz, const Datum *values, const bool *isnu
         {
             const char     *data;
             size_t          len;
-            struct varlena *tofree;
 
-            pgch_string_payload((char *) DatumGetPointer(d), &data, &len, &tofree);
-            appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
+            if (likely(pgch_string_inplace((char *) DatumGetPointer(d), &data, &len)))
+            {
+                appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
+            }
+            else
+            {
+                struct varlena *tofree;
+
+                pgch_string_detoast((char *) DatumGetPointer(d), &data, &len, &tofree);
+                appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
+                if (tofree)
+                    pfree(tofree);
+            }
             cz->bufs[c].offsets[cz->in_block] = (uint64_t) cz->bufs[c].chars.len;
-            if (tofree)
-                pfree(tofree);
         }
         else
         {
@@ -752,11 +761,19 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
     {
         const char     *data;
         size_t          len;
-        struct varlena *tofree;
 
-        pgch_string_payload(cur[r], &data, &len, &tofree);
-        if (tofree)
-            pfree(tofree);
+        if (likely(pgch_string_inplace(cur[r], &data, &len)))
+        {
+            /* in place: no palloc, no to_free */
+        }
+        else
+        {
+            struct varlena *tofree;
+
+            pgch_string_detoast(cur[r], &data, &len, &tofree);
+            if (tofree)
+                pfree(tofree);
+        }
         total += len;
         cb->offsets[dst_row + r] = (uint64_t) (base + total);
     }
@@ -768,13 +785,22 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
     {
         const char     *data;
         size_t          len;
-        struct varlena *tofree;
 
-        pgch_string_payload(cur[r], &data, &len, &tofree);
-        memcpy(dest, data, len);
-        dest += len;
-        if (tofree)
-            pfree(tofree);
+        if (likely(pgch_string_inplace(cur[r], &data, &len)))
+        {
+            memcpy(dest, data, len);            /* in place: no palloc, no to_free */
+            dest += len;
+        }
+        else
+        {
+            struct varlena *tofree;
+
+            pgch_string_detoast(cur[r], &data, &len, &tofree);
+            memcpy(dest, data, len);            /* copy before free: data aliases tofree */
+            dest += len;
+            if (tofree)
+                pfree(tofree);
+        }
     }
 
     /* We wrote directly past chars.len; restore the StringInfo invariants so the
