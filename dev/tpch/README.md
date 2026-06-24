@@ -1,32 +1,15 @@
-TPC-H Benchmark (SF=10)
-=======================
+TPC-H Benchmark
+===============
 
-This directory contains scripts to execute the [TPC-H] benchmark queries at
-**scaling factor 10** with the same data in ClickHouse and PostgreSQL, comparing
-three execution modes:
+This directory contains scripts to execute the [TPC-H] benchmark queries with
+the same data in ClickHouse and Postgres, and generates a table comparing
+PostgreSQL performance to pg_clickhouse performance.
 
-1. **native PostgreSQL** (heap tables, `pg_clickhouse.enable_shm_offload = off`),
-2. **`pg_clickhouse` FDW pushdown** (querying the imported `ch` schema),
-3. **`pg_clickhouse` SHM offload** (`enable_shm_offload = on` ->
-   `streamed_table()`; see [`../bench/README.md`](../bench/README.md)).
-
-Most TPC-H queries are multi-table joins; the SHM offload fires only on
-single-table scan + filter + aggregate + `GROUP BY` + `HAVING`, so only **Q1**
-and **Q6** fully offload via SHM. TPC-H is kept mainly for the native-vs-FDW
-comparison at scale, plus SHM where applicable. `run.sh` records per query which
-mode actually offloaded via the per-session `SHOW
-pg_clickhouse.last_query_used_clickhouse` (correct under concurrency).
-
-There are two `lineitem` tables: the stock `DECIMAL(15,2)` `lineitem` and a
-`lineitem_f64` where only the numeric columns (`l_quantity`, `l_extendedprice`,
-`l_discount`, `l_tax`) become `double precision` (integer keys stay `INTEGER`),
-derived from `lineitem`. SHM offload of exact `Decimal` is byte-identical to
-native; `Float64` is order-dependent, so it is compared with a tolerance.
-
-`run.sh` runs each query in [queries](queries) three times per mode and reports
-averaged `Execution Time`; `sanity.sh` proves correctness for the SHM-eligible
-queries. An illustrative SF=1 native-vs-FDW table (the new harness adds a SHM
-column):
+The scripts run each query in [queries](queries) three times each for native
+PostgreSQL and pg_clickhouse performance and produces a Markdown table
+reporting the averaged times for each, as well as whether the pg_clickhouse
+query pushed down to ClickHouse. Times exceeding 60s will not be recorded, and
+result in a `-`. An example:
 
 ```md
 |    Query   | PostgreSQL | pg_clickhouse | Pushdown |
@@ -57,47 +40,55 @@ column):
 
 ## Setup & Execution
 
-The harness uses a dedicated, isolated ClickHouse server (own data dir + unique
-ports, patched `streamed_table` binary), co-located with PostgreSQL so the SHM
-path works. Start it first; the `Makefile` reads its `manifest.env` for the
-current `RUN_ID`. All `psql` runs as the `postgres` OS user (the login user has
-no PostgreSQL role on this host).
+To use it, set up ClickHouse and Postgres running locally and execute these
+commands.
+
+### ClickHouse
 
 ```sh
-# 1. Dedicated ClickHouse server (see ../bench/README.md).
-RUN_ID=tpchcb ../bench/ch-bench-server.sh start
-
-# 2. Load ClickHouse tpch_sf10 (SF=10 tables + lineitem_f64) via the manifest TCP port.
-RUN_ID=tpchcb make ch
-
-# 3. Load PostgreSQL tpch_sf10 (heap tables + FDW import of the ch schema, incl.
-#    ch.lineitem_f64) via the manifest HTTP port. Run AFTER `make ch` so the
-#    IMPORT picks up lineitem_f64. The postgres OS user needs curl + zstd.
-RUN_ID=tpchcb make pg
-
-# 4. Sanity-check native / FDW / SHM-offload (the on==off oracle).
-RUN_ID=tpchcb make sanity
-
-# 5. (Optional) full 22-query, 3-mode matrix -> result/RESULTS.md.
-RUN_ID=tpchcb make run
-
-# 6. Teardown.
-RUN_ID=tpchcb ../bench/ch-bench-server.sh stop   # then rm -rf "$CH_DIR" to reclaim
+make ch
 ```
 
-`make ch` runs [tpch-ch.sql](tpch-ch.sql) (database `tpch_sf10`, the [ClickHouse
-TPC-H] tables + `lineitem_f64`, SF=10 `.tbl.zst` data from the ClickHouse S3
-buckets). `make pg` runs [tpch-pg.sql](tpch-pg.sql) (schema `pg` with the
-[PostgreSQL TPC-H] tables + `lineitem_f64`, the FDW server `ch_bench` over
-`http`, and the `ch` schema imported from ClickHouse). `make sanity` and
-`make run` engage SHM offload per session via `pg_clickhouse.local_ch_server`,
-`shm_min_rows=0`, `enable_shm_offload=on`, and a `session_settings` carrying the
-experimental flag and a unique `log_comment`.
+This command connects to ClickHouse and runs [tpch-ch.sql](tpch-ch.sql), which
+creates a database named `tpch`, creates the [ClickHouse TPC-H] tables, and
+loads them with scaling factor 1 data from ClickHouse S3 buckets. Export the
+[ClickHouse client environment variables][chenv] `CLICKHOUSE_USER`,
+`CLICKHOUSE_PASSWORD` and `CLICKHOUSE_HOST` as appropriate to configure the
+ClickHouse server and user.
 
-Q11's `HAVING` fraction is the spec-defined `0.0001 / SF`, set to `0.00001` for
-SF=10 in [queries/11.sql](queries/11.sql).
+### PostgreSQL
+
+```sh
+make pg
+```
+
+This command connects to PostgreSQL and runs [tpch-pg.sql](tpch-pg.sql), which
+creates a schema named `pg`, creates the [PostgreSQL TPC-H] tables, and loads
+them with scaling factor 1 data from ClickHouse S3 buckets. It also loads
+pg_clickhouse (which must already be installed in the cluster), creates a
+schema named `ch`, and imports the the tables from the ClickHouse database
+created above.
+
+Export the [PostgreSQL client environment variables][pgenv] as appropriate to
+configure the PostgreSQL server and user, and the [ClickHouse client
+environment variables][chenv] to configure the server to which pg_clickhouse
+connects.
+
+### Run
+
+Run this command to run the benchmark:
+
+```sh
+make run
+```
+
+This will save the results in the `result` directory and produce a Markdown
+table report with the average time between three runs of each query in
+[queries](queries) for both PostgreSQL and pg_clickhouse.
 
 ### Cleanup
+
+Run this command to clean up artifacts from running the benchmark:
 
 ```sh
 make clean
