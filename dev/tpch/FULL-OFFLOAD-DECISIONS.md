@@ -133,6 +133,47 @@ Verdict: **no blocking findings.**
   front so the tolerance only ever guards the avg→Float64 round-off. Suite still
   137 PASS / 0 FAIL. Phase 1 marked GREEN.
 
+## D0005 — 2026-06-25 — Phase 2: two join blockers root-caused & fixed
+
+The Phase-0 "join offload broken at SF10" had TWO distinct causes, both now fixed:
+
+**(a) ClickHouse READONLY crash on adopted columns** (CH-side; ClickHouse repo
+commit 498959fa5ee). The join pipeline's `SimpleSquashingTransform` reused the
+first input chunk's columns as a mutable accumulator via `IColumn::mutate()`, which
+is a no-op at refcount 1, leaving a read-only adopted (zero-copy SHM) column in
+place → `prepareForSquashing()->reserve()` threw `Code 164 READONLY`. Fixed by
+adding `IColumn::convertToFullColumnIfAdopted()` (no-op default; overridden in
+ColumnVector/Decimal/String to materialize an owned copy when adopted) and calling
+it at the squash accumulator. +2 unit tests (refcount-1 materialization); 83/83
+adoption tests pass. Verified: a no-filter 3-table join that threw Code 164 now
+returns correct rows.
+
+**(b) bpchar (CHAR(n)) equality semantics under pushdown** (producer-side;
+`src/shm_offload.c`). TPC-H string columns are `CHAR(n)` (bpchar), stored
+blank-padded ("BUILDING  "). PostgreSQL's `bpchareq` ignores trailing blanks; the
+pushed-down ClickHouse `String =` is byte-exact, so `c_mktsegment = 'BUILDING'`
+matched 0 rows (the dominant cause of the "empty join" symptom: Q3, Q5, Q7, Q8,
+Q11, Q12, Q17, Q19, Q20). Diagnosed by an adversarial investigation that
+overturned the initial "CH string-comparison bug" hypothesis (LIKE and GROUP BY
+worked; only `=`/`IN`/range on padded values failed). Fixed by stripping trailing
+blanks from bpchar values at columnization (both the per-row and vectorized
+string-fill paths), in `pgch_bpchar_trim_len`. **No ClickHouse rebuild needed.**
+Verified end-to-end: single-table `c_mktsegment='BUILDING'` → 300276 (was 0); Q3
+join+filter → 10 rows matching native; Q12 (sum(case)→bigint over join) fully
+offloads, 2 rows matching native. verify_offload.sh stays 137/0.
+
+**Decision (alternatives).** For (b), chose producer-side bpchar trim over
+(i) padding the comparison literal to the column width in deparse — rejected:
+deparseConst lacks the column typmod, needs OpExpr+ScalarArrayOpExpr plumbing,
+more surface; (ii) declining bpchar-comparison pushdown — rejected: would keep the
+filter (and hence the aggregate) in PostgreSQL, losing full-pushdown coverage. The
+producer trim is uniform across `=`/`<>`/`IN`/ordering/`length()`/grouping and
+matches PG bpchar semantics exactly except for display padding (F5). **Limitation:**
+a query literal carrying *significant* trailing blanks on a bpchar comparison
+(`col = 'X  '`) is not yet trimmed on the literal side; TPC-H literals are clean,
+so this is a logged robustness follow-up (also trim bpchar constants in
+deparseConst), not a TPC-H correctness issue.
+
 ## Intentional fidelity deviations (bounded, quantified)
 
 | # | query/col | engine diff | max abs err | max rel err | bound / cause |
@@ -141,6 +182,7 @@ Verdict: **no blocking findings.**
 | F2 | Q1 `count_order` (SF10) | count → Int | 0 | 0 | exact |
 | F3 | Q1 `avg_qty,avg_price,avg_disc` (SF10) | CH `avg(Decimal)`→Float64 vs PG exact numeric | avg_price 6e-12 | **1.57e-16** | Float64 round-off; ≤ machine epsilon (~2.2e-16). Per fidelity policy: bounded, intentional. Measured `dev/tpch/evidence/phase1/`. |
 | F4 | Q6 `revenue` (SF10) | CH Decimal sum | 0 | 0 | exact (`1230113636.0101` both) |
+| F5 | any projected/grouped `CHAR(n)` column (e.g. Q2/Q9/Q10 `n_name`) | offload strips bpchar trailing blanks ("GERMANY" vs "GERMANY⎵⎵…") | 0 (display only) | 0 | semantically identical — bpchar trailing blanks are insignificant in PG too (`length()`/comparison/grouping all ignore them). Display-padding only. Producer rtrim (D0005b). Detected in the eligibility scan as `exact(bpchar)`. |
 
 **Root cause of F3.** ClickHouse `avg()` over a Decimal returns Float64 (it does
 not keep Decimal accumulation), so the mean carries ~15–16 significant digits vs

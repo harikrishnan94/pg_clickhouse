@@ -126,14 +126,23 @@ for q in "${QUERIES[@]}"; do
     grep -qiE 'ERROR|FATAL|server closed|terminated' "$OUT/q${q}.on.err" && on_err="ON_ERR"
     off_err=""
     grep -qiE 'ERROR|FATAL|server closed|terminated' "$OUT/q${q}.off.err" && off_err="OFF_ERR"
+    # Normalize the accepted bpchar deviation: CHAR(n) values are stored
+    # blank-padded by PostgreSQL but the offload strips the (insignificant) trailing
+    # blanks, so a projected/grouped CHAR(n) column differs only by trailing spaces.
+    # Strip spaces before each '|' and at line end on BOTH sides; a real value error
+    # still differs in its non-space characters. "exact" = byte-identical;
+    # "exact(bpchar)" = identical after trailing-blank normalization.
+    norm() { sed 's/ *|/|/g; s/ *$//' "$1" | grep -ve '^$' | sort; }
     if [ -n "$on_err$off_err" ]; then
         fidelity="$on_err$off_err"
     elif sort "$OUT/q${q}.off.out" | grep -ve '^$' > "$OUT/q${q}.off.sorted" 2>/dev/null \
          && sort "$OUT/q${q}.on.out" | grep -ve '^$' > "$OUT/q${q}.on.sorted" 2>/dev/null \
          && diff -q "$OUT/q${q}.off.sorted" "$OUT/q${q}.on.sorted" >/dev/null 2>&1; then
         fidelity="exact"
+    elif diff -q <(norm "$OUT/q${q}.off.out") <(norm "$OUT/q${q}.on.out") >/dev/null 2>&1; then
+        fidelity="exact(bpchar)"
     else
-        d=$(diff "$OUT/q${q}.off.sorted" "$OUT/q${q}.on.sorted" 2>/dev/null | grep -cE '^[<>]')
+        d=$(diff <(norm "$OUT/q${q}.off.out") <(norm "$OUT/q${q}.on.out") 2>/dev/null | grep -cE '^[<>]')
         fidelity="DIFF($d lines)"
     fi
 

@@ -590,6 +590,27 @@ columnizer_should_flush_bytes(ShmColumnizer *cz)
  * blanks and empty strings are preserved verbatim (VARSIZE-VARHDRSZ bytes,
  * exactly as DatumGetTextP would have).
  */
+/*
+ * CHAR(n)/bpchar trailing-blank trim. PostgreSQL stores a bpchar blank-padded to n
+ * and compares it IGNORING trailing blanks (bpchareq / bpchar ordering), whereas a
+ * ClickHouse String compares byte-exact. So a pushed-down `char_col = 'lit'`,
+ * `IN (...)`, `<>`, or range comparison would never match the padded bytes. We
+ * strip the (semantically insignificant) trailing blanks at offload time so pushed
+ * comparisons match PostgreSQL bpchar semantics. The ONLY visible effect is that a
+ * projected or grouped CHAR(n) value loses its display padding (e.g. "GERMANY" vs
+ * "GERMANY                  ") -- a bounded, documented fidelity deviation; the
+ * value is semantically identical (bpchar trailing blanks carry no information, and
+ * length()/ordering/grouping already ignore them). Applied ONLY to bpchar;
+ * text/varchar (where trailing spaces ARE significant) are never trimmed.
+ */
+static inline size_t
+pgch_bpchar_trim_len(const char *data, size_t len)
+{
+    while (len > 0 && data[len - 1] == ' ')
+        len--;
+    return len;
+}
+
 static inline bool
 pgch_string_inplace(const char *p, const char **data, size_t *len)
 {
@@ -643,20 +664,17 @@ pgch_columnizer_add_row(ShmColumnizer *cz, const Datum *values, const bool *isnu
         {
             const char     *data;
             size_t          len;
+            struct varlena *tofree = NULL;
 
-            if (likely(pgch_string_inplace((char *) DatumGetPointer(d), &data, &len)))
-            {
-                appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
-            }
-            else
-            {
-                struct varlena *tofree;
-
+            if (!likely(pgch_string_inplace((char *) DatumGetPointer(d), &data, &len)))
                 pgch_string_detoast((char *) DatumGetPointer(d), &data, &len, &tofree);
-                appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
-                if (tofree)
-                    pfree(tofree);
-            }
+
+            if (cz->cols[c].pg_type == BPCHAROID)
+                len = pgch_bpchar_trim_len(data, len);
+
+            appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
+            if (tofree)
+                pfree(tofree);
             cz->bufs[c].offsets[cz->in_block] = (uint64_t) cz->bufs[c].chars.len;
         }
         else
@@ -749,6 +767,9 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
     size_t  base = (size_t) cb->chars.len;
     size_t  total = 0;
     char   *dest;
+    /* bpchar: strip trailing blanks (see pgch_bpchar_trim_len). Both passes must
+     * trim identically so offsets (pass 1) and the copied bytes (pass 2) agree. */
+    const bool is_bpchar = (cz->cols[col].pg_type == BPCHAROID);
 
     /*
      * Pass 1: per-row length -> offsets prefix-sum (ClickHouse end-offsets) and
@@ -774,6 +795,8 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
             if (tofree)
                 pfree(tofree);
         }
+        if (is_bpchar)
+            len = pgch_bpchar_trim_len(data, len);
         total += len;
         cb->offsets[dst_row + r] = (uint64_t) (base + total);
     }
@@ -788,6 +811,8 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
 
         if (likely(pgch_string_inplace(cur[r], &data, &len)))
         {
+            if (is_bpchar)
+                len = pgch_bpchar_trim_len(data, len);
             memcpy(dest, data, len);            /* in place: no palloc, no to_free */
             dest += len;
         }
@@ -796,6 +821,8 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
             struct varlena *tofree;
 
             pgch_string_detoast(cur[r], &data, &len, &tofree);
+            if (is_bpchar)
+                len = pgch_bpchar_trim_len(data, len);
             memcpy(dest, data, len);            /* copy before free: data aliases tofree */
             dest += len;
             if (tofree)
