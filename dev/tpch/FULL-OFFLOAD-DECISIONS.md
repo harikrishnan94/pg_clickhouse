@@ -82,6 +82,41 @@ adoption-layer semantics); doing the clean single-table win first de-risks the
 pipeline and yields an immediately committable, evidence-backed result. The CH
 fix is Phase 2 — next, not deferred.
 
+## D0006 — 2026-06-25 — Phase 3: numeric aggregate output over joins unlocked
+
+Removed the `!ifpinfo->is_heap_offload` gate in `shm_create_upper_paths` so a
+numeric `sum`/`avg` output pushes over a (now-correct) SHM-offload join, not just
+a single table. **9 queries now fully offload** (heavy fragment in ClickHouse, no
+residual PG aggregate): Q1, Q3, Q4, Q5, Q6, Q7, Q10, Q12, Q19. Values match native
+within the bounded Decimal display-scale / avg→Float64 deviations (e.g. Q5 exact
+`INDIA|536862587.9995…`; Q3/Q10 differ only by Decimal trailing zeros such as
+`439855.3250` vs `439855.325`, numerically identical). verify_offload.sh 137/0.
+
+**Residual deadlock (#1 remaining blocker) — Q8, Q9, Q11, Q14.** When the
+aggregate is pushed over *these* joins the ClickHouse query freezes: `read_rows`
+stuck at exactly one ring block (1048576) on the join **build** side's producer,
+which trips `SHM_PRODUCER_STALL` at 30s. Root-caused as a genuine multi-ring
+`streamed_table` JOIN-build consumption deadlock — **independently of** the
+READONLY fix, `max_threads` (tested `total_producers+16`; no change), `final`, and
+`group_by_use_nulls` (all ruled out by experiment). It is a deeper ClickHouse
+pipeline/`PollableShmSource` scheduling issue (the join build over a UNION-ALL of
+per-ring sources adopts one block then waits on a source whose producer is blocked
+on a ring the consumer never drains). A fix needs CH-side pipeline work and is
+deferred. Evidence: `dev/tpch/evidence/phase0/q{9,14}.on.err`, live probes showing
+frozen read_rows.
+
+**Trade-off decision (logged).** Q8 and Q11 were scan_only-CORRECT after Phase 2
+(bare join streamed back, aggregate in PG); enabling agg-over-join (Phase 3) makes
+them attempt the full push and hit the deadlock → they now error. This is a
+deliberate trade-off favoring the spec's PRIMARY goal ("maximize offload coverage
+aggressively / fully push down" for a perf-measurement exercise): +5 fully-offloaded
+revenue joins (Q3,Q5,Q7,Q10,Q19 — the best showcase of offload's join performance)
+at the cost of Q8,Q11 regressing from scan_only-correct to deadlock-error. Both
+states are "not a correct full offload"; at the ORIGINAL baseline Q8/Q11 were wrong
+(bpchar). Alternatives: (i) revert Phase 3 → 13 correct but only 4 fully-offloaded,
+no regression; (ii) per-shape gate → cannot predict the deadlock statically. The
+deadlock fix (when done) unlocks Q8/Q9/Q11/Q14 fully and erases the trade-off.
+
 ## Queries provisionally NOT-YET-offloadable (root-caused, pending phase work)
 
 - **CH join READONLY/empty (Phase 2):** Q2, Q3, Q5, Q7, Q8, Q11, Q12, Q17, Q19, Q20.

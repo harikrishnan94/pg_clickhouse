@@ -518,41 +518,24 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
     }
 
     /*
-     * Decimal/numeric aggregate output.
+     * Decimal/numeric aggregate output is pushed to ClickHouse for BOTH single-table
+     * aggregates AND aggregates over a (now-correct) SHM-offload join. ClickHouse
+     * computes sum/min/max over a Decimal AS a Decimal (parsed back exactly by
+     * numeric_in, modulo PostgreSQL display-scale trailing zeros -- "0.5" vs "0.50"
+     * -- equal as numeric values) and avg() over a Decimal as Float64 (a bounded,
+     * documented Decimal->Float64 deviation; see dev/tpch/FULL-OFFLOAD-DECISIONS.md
+     * F3). The result read-back (char_to_datum -> numeric_in, driven by the PG output
+     * tuple descriptor) accepts any finite decimal/float text ClickHouse emits.
      *
-     * SINGLE-TABLE aggregate (input is a heap-offload base relation): push the
-     * whole scan+filter+aggregate fragment to ClickHouse even when output columns
-     * are numeric. ClickHouse computes sum/min/max over a Decimal AS a Decimal
-     * (parsed back exactly by numeric_in, modulo PostgreSQL display-scale trailing
-     * zeros -- e.g. "0.5" vs "0.50" -- which compare equal as numeric values), and
-     * avg() over a Decimal as Float64 (a bounded, documented fidelity deviation;
-     * see dev/tpch/FULL-OFFLOAD-DECISIONS.md). This is what unlocks the sum/avg
-     * revenue queries (Q1, Q6, ...) to fully offload. The result read-back path
-     * (char_to_datum -> numeric_in, driven by the PG output tuple descriptor)
-     * accepts any finite decimal/float text ClickHouse emits.
-     *
-     * AGGREGATE OVER A JOIN: still decline numeric output. The ClickHouse
-     * join-squashing path currently mishandles zero-copy adopted columns
-     * (SimpleSquashingTransform -> reserve() on an adopted column => Code 164
-     * READONLY, or a silently-empty join when filters swallow the exception), so
-     * pushing the aggregate over a join would compute over wrong/empty input.
-     * Until that consumer bug is fixed (Phase 2), keep the numeric aggregate in
-     * PostgreSQL. Non-numeric outputs (count, integer/float aggregates, HAVING-only
-     * decimal comparisons returning bool) push down in both cases.
+     * The earlier decline of numeric output over a JOIN was a guard against the
+     * ClickHouse adopted-column join bugs (Code 164 READONLY squash; bpchar-equality
+     * empties). Those are fixed (ClickHouse convertToFullColumnIfAdopted squash fix +
+     * producer-side bpchar trailing-blank trim), so the whole scan+filter+join+
+     * aggregate fragment now offloads -- unlocking the sum/avg revenue queries over
+     * joins (Q3, Q5, Q9, Q10, Q14, Q19). Pushing the aggregate also bounds ClickHouse's
+     * output to the grouped result, which removes the producer-stall that afflicted
+     * the agg-not-pushed path (CH otherwise had to stream the whole join result back).
      */
-    if (!ifpinfo->is_heap_offload)
-    {
-        ListCell *lc;
-
-        foreach (lc, output_rel->reltarget->exprs)
-        {
-            if (exprType((Node *) lfirst(lc)) == NUMERICOID)
-            {
-                output_rel->fdw_private = NULL;
-                return;
-            }
-        }
-    }
 
     cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
