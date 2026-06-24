@@ -64,10 +64,19 @@ ch_latest() {  # field of the most-recent genuine streamed_table QueryFinish
 # bounded, DOCUMENTED fidelity deviations (dev/tpch/FULL-OFFLOAD-DECISIONS.md),
 # not bugs. The comparator prints the max relative deviation it observed, so the
 # deviation stays VISIBLE and a real error (row/col mismatch, text diff, or a
-# numeric diff above tolerance) still fails. Default tolerance 1e-9 sits ~7
-# orders of magnitude above Float64 epsilon yet far below any real agg error.
+# numeric diff above tolerance) still fails.
+#
+# Tolerance design: values that are EQUAL AS DECIMALS (sum/min/max with only a
+# display-scale difference, e.g. "0.50" vs "0.5") compare equal up front and the
+# tolerance never applies to them -- so sum/min/max stay effectively bit-exact.
+# The tolerance therefore only ever guards a genuine numeric difference, i.e. the
+# avg(Decimal)->Float64 round-off. Default 1e-14 sits ~45x above Float64 machine
+# epsilon (~2.2e-16; measured avg deviation <=1.6e-16) yet below a one-cent error
+# in a billion-scale SF10 sum (0.01/5.7e11 ~= 1.8e-14 > 1e-14, so still caught).
+# A blanket-loose tolerance (e.g. 1e-9) would mask such absolute errors at SF10
+# magnitudes, so it is deliberately tight here.
 rows_equiv() {  # <baseline> <result> [reltol]; exit 0 + prints "OK maxrel=..." if equivalent
-    python3 - "$1" "$2" "${3:-1e-9}" <<'PY'
+    python3 - "$1" "$2" "${3:-1e-14}" <<'PY'
 import sys
 from decimal import Decimal, InvalidOperation
 base, res, tol = sys.argv[1], sys.argv[2], Decimal(sys.argv[3])

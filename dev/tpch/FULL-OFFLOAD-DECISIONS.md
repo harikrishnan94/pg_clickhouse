@@ -112,6 +112,27 @@ observed max deviation** so it is never hidden. Suite is green: 137 PASS / 0 FAI
 the PG output tuple descriptor, so a numeric output column always parses CH's
 text (Decimal or Float64) correctly; finite values never fail.
 
+## D0004 — 2026-06-24 — Phase 1 independent adversarial review: PASS
+
+A fresh reviewer (separate context, did not write the code) attacked Phase 1 on
+correctness, fidelity, performance, and test integrity, running its own queries.
+Verdict: **no blocking findings.**
+- Correctness: Q1/Q6 fully offload, oracle fires, no residual PG aggregate; empty
+  result, empty-group, 2526-group, and HAVING edge cases all match native.
+- Fidelity: SUM columns (incl. scale-growing `sum_charge`) bit-exact (maxrel 0);
+  avg independently re-derived at max rel **1.48e-16** (≤ machine epsilon). Noted
+  CH Decimal `sum` wraps silently on overflow — ~20 orders of magnitude of
+  headroom at SF10, irrelevant here, recorded as a latent caveat.
+- Performance: native baseline confirmed parallel (16 workers) + JIT + no spill;
+  offload not cached (reads 60M fresh each run); cgroup cap applies to both trees;
+  cores=CPU-s/wall correct. The 3.2–4.3× win is real.
+- Test integrity (non-blocking, **addressed**): the `rows_equiv` relative
+  tolerance was 1e-9, which could mask a sub-cent error in a billion-scale SF10
+  sum. Tightened to **1e-14** (still ≥45× above Float64 epsilon; catches a
+  one-cent-at-billion error rel ~1.8e-14). sum/min/max compare Decimal-exact up
+  front so the tolerance only ever guards the avg→Float64 round-off. Suite still
+  137 PASS / 0 FAIL. Phase 1 marked GREEN.
+
 ## Intentional fidelity deviations (bounded, quantified)
 
 | # | query/col | engine diff | max abs err | max rel err | bound / cause |
