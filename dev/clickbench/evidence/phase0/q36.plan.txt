@@ -1,0 +1,7 @@
+Limit
+  Output: clientip, ((clientip - 1)), ((clientip - 2)), ((clientip - 3)), (count(*))
+  ->  Sort
+        Output: clientip, ((clientip - 1)), ((clientip - 2)), ((clientip - 3)), (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: clientip, ((clientip - 1)), ((clientip - 2)), ((clientip - 3)), (count(*))

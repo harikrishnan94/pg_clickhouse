@@ -1,0 +1,7 @@
+Limit
+  Output: regionid, (sum(advengineid)), (count(*)), (avg(resolutionwidth)), (count(DISTINCT userid))
+  ->  Sort
+        Output: regionid, (sum(advengineid)), (count(*)), (avg(resolutionwidth)), (count(DISTINCT userid))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: regionid, (sum(advengineid)), (count(*)), (avg(resolutionwidth)), (count(DISTINCT userid))

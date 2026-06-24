@@ -1,0 +1,7 @@
+Limit
+  Output: searchphrase, (min(url)), (min(title)), (count(*)), (count(DISTINCT userid))
+  ->  Sort
+        Output: searchphrase, (min(url)), (min(title)), (count(*)), (count(DISTINCT userid))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: searchphrase, (min(url)), (min(title)), (count(*)), (count(DISTINCT userid))

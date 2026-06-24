@@ -1,0 +1,7 @@
+Limit
+  Output: counterid, (avg(length(url))), (count(*))
+  ->  Sort
+        Output: counterid, (avg(length(url))), (count(*))
+        Sort Key: (avg(length(hits.url))) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: counterid, (avg(length(url))), (count(*))

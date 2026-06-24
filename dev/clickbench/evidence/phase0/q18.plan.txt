@@ -1,0 +1,4 @@
+Limit
+  Output: userid, searchphrase, (count(*))
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: userid, searchphrase, (count(*))

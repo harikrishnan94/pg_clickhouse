@@ -1,0 +1,11 @@
+Limit
+  Output: searchphrase, eventtime
+  ->  Gather Merge
+        Output: searchphrase, eventtime
+        Workers Planned: 7
+        ->  Sort
+              Output: searchphrase, eventtime
+              Sort Key: hits.eventtime
+              ->  Parallel Seq Scan on pg.hits
+                    Output: searchphrase, eventtime
+                    Filter: (hits.searchphrase <> ''::text)

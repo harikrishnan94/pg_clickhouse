@@ -1,0 +1,5 @@
+Sort
+  Output: advengineid, (count(*))
+  Sort Key: (count(*)) DESC
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: advengineid, (count(*))

@@ -1,0 +1,7 @@
+Limit
+  Output: mobilephone, mobilephonemodel, (count(DISTINCT userid))
+  ->  Sort
+        Output: mobilephone, mobilephonemodel, (count(DISTINCT userid))
+        Sort Key: (count(DISTINCT hits.userid)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: mobilephone, mobilephonemodel, (count(DISTINCT userid))

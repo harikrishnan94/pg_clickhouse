@@ -1,0 +1,14 @@
+Limit
+  Output: (date_trunc('minute'::text, eventtime)), (count(*))
+  ->  GroupAggregate
+        Output: (date_trunc('minute'::text, eventtime)), count(*)
+        Group Key: (date_trunc('minute'::text, hits.eventtime))
+        ->  Gather Merge
+              Output: (date_trunc('minute'::text, eventtime))
+              Workers Planned: 7
+              ->  Sort
+                    Output: (date_trunc('minute'::text, eventtime))
+                    Sort Key: (date_trunc('minute'::text, hits.eventtime))
+                    ->  Parallel Seq Scan on pg.hits
+                          Output: date_trunc('minute'::text, eventtime)
+                          Filter: ((hits.eventdate >= '2013-07-14'::date) AND (hits.eventdate <= '2013-07-15'::date) AND (hits.counterid = 62) AND (hits.isrefresh = 0) AND (hits.dontcounthits = 0))

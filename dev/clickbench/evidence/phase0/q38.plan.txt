@@ -1,0 +1,7 @@
+Limit
+  Output: title, (count(*))
+  ->  Sort
+        Output: title, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: title, (count(*))

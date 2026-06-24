@@ -1,0 +1,7 @@
+Limit
+  Output: urlhash, eventdate, (count(*))
+  ->  Sort
+        Output: urlhash, eventdate, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: urlhash, eventdate, (count(*))

@@ -1,0 +1,10 @@
+Limit
+  Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, (count(*))
+  ->  Sort
+        Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  HashAggregate
+              Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, count(*)
+              Group Key: hits.userid, EXTRACT(minute FROM hits.eventtime), hits.searchphrase
+              ->  Seq Scan on pg.hits
+                    Output: userid, EXTRACT(minute FROM eventtime), searchphrase

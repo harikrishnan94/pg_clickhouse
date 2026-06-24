@@ -1,0 +1,7 @@
+Limit
+  Output: (regexp_replace(referer, '^https?://(?:www\.)?([^/]+)/.*$'::text, '\1'::text)), (avg(length(referer))), (count(*)), (min(referer))
+  ->  Sort
+        Output: (regexp_replace(referer, '^https?://(?:www\.)?([^/]+)/.*$'::text, '\1'::text)), (avg(length(referer))), (count(*)), (min(referer))
+        Sort Key: (avg(length(hits.referer))) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: (regexp_replace(referer, '^https?://(?:www\.)?([^/]+)/.*$'::text, '\1'::text)), (avg(length(referer))), (count(*)), (min(referer))

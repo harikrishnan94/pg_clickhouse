@@ -1,0 +1,7 @@
+Limit
+  Output: regionid, (count(DISTINCT userid))
+  ->  Sort
+        Output: regionid, (count(DISTINCT userid))
+        Sort Key: (count(DISTINCT hits.userid)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: regionid, (count(DISTINCT userid))

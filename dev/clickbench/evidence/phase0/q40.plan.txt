@@ -1,0 +1,7 @@
+Limit
+  Output: traficsourceid, searchengineid, advengineid, (CASE WHEN ((searchengineid = 0) AND (advengineid = 0)) THEN referer ELSE ''::text END), url, (count(*))
+  ->  Sort
+        Output: traficsourceid, searchengineid, advengineid, (CASE WHEN ((searchengineid = 0) AND (advengineid = 0)) THEN referer ELSE ''::text END), url, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: traficsourceid, searchengineid, advengineid, (CASE WHEN ((searchengineid = 0) AND (advengineid = 0)) THEN referer ELSE ''::text END), url, (count(*))
