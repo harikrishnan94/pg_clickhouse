@@ -17,9 +17,12 @@ dispatched SQL), never from the PostgreSQL plan alone.
 
 - DB `clickbench`, schema `pg`, table `hits` (10M-row subset `hits_0..9`). PG 18.4
   @ 127.0.0.1:5432. `pg_clickhouse` 0.3.
-- ClickHouse patched `streamed_table` build (v26.6.1.1), RUN_ID=tpchcb, HTTP
-  127.0.0.1:21002 / TCP 21003. The live pid (`2394956` at scan time) is resolved
-  from the listening port, **not** the manifest `CH_PID` (`274738`, stale).
+- ClickHouse patched `streamed_table` build (v26.6.1.1), RUN_ID=tpchcb. HTTP port
+  was 21002 at session start; **after the Phase-1b consumer rebuild + restart the
+  server moved to HTTP 21000 / TCP 21001** (the start script picks a free port —
+  D0013). The live pid + ports are resolved from the listening socket, **not** the
+  manifest `CH_PID` (stale); harnesses read the port from the manifest, and the FDW
+  server `ch_bench` is re-pointed after each restart (`ALTER SERVER … SET port`).
 - `ubuntu` OS login has no PG role; all psql runs as the `postgres` OS user.
 - Offload engaged via the `shm_set_block` SET block in `dev/bench/bench-common.sh`
   (`enable_shm_offload=on`, `shm_min_rows=0`, `session_settings` incl.

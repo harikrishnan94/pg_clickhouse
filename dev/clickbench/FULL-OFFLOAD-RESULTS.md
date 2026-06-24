@@ -134,6 +134,10 @@ Full W={8,16} matrix for all 42 offload-eligible queries:
 | 8 | 42 | **38** | 4 | 7 | 1.97× | 5.23× (Q30) | 0.55× (Q25) |
 | 16 | 42 | **37** | 5 | 7 | 2.18× | 6.98× (Q10) | 0.40× (Q25) |
 
+(W=16 central tendency over all 42: arithmetic mean 2.18×, geometric mean 1.79×,
+median 1.80× — reported transparently; all three computed over the full set
+including the 5 losses, not just the wins.)
+
 **Where offload wins big — CPU-heavy aggregation that native PG can't parallelize.**
 The largest wins are `COUNT(DISTINCT)`, many-aggregate, multi-key `GROUP BY`, and
 regex queries, where native PG's aggregate is effectively serial (its measured
