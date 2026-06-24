@@ -48,6 +48,23 @@ extern ShmWorkerHandle *pgch_shm_worker_launch(const char *shm_name,
                                                int nworkers);
 
 /*
+ * Two-phase launch, so a multi-source scan (a join) can fork ALL of its sources'
+ * workers concurrently instead of paying register+startup latency serially per
+ * source. pgch_shm_worker_register only registers the workers with the
+ * postmaster (it does not block on their startup) and returns the handle;
+ * pgch_shm_worker_wait_started then blocks until they have started. The caller
+ * registers every source, then waits-started every source, then
+ * pgch_shm_worker_wait_ready every source. pgch_shm_worker_launch is exactly
+ * register + wait_started. On failure each raises ERROR after reaping the
+ * handle's own workers (the caller reaps the other sources via its abort path).
+ */
+extern ShmWorkerHandle *pgch_shm_worker_register(const char *shm_name,
+                                                 Oid heap_relid, List *attnos,
+                                                 Snapshot snapshot,
+                                                 int nworkers);
+extern void pgch_shm_worker_wait_started(ShmWorkerHandle *h);
+
+/*
  * Block until the worker has created the SHM object + control socket (so the
  * ClickHouse consumer can attach), the worker has finished, or the worker has
  * died/reported an error. Raises the worker's error (or a worker-death error)

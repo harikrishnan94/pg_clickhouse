@@ -66,6 +66,8 @@
 #include "shm_producer.h"
 #include "shm_worker.h"
 
+#include <sys/statvfs.h>      /* statvfs() for the /dev/shm ring-footprint cap */
+
 /* custom_private indexes for the CustomScan. A scan may stream one (base scan /
  * aggregate over a base rel) or several (join) SHM sources, so the per-source
  * stream descriptors are carried as a List of fixed-shape sublists. */
@@ -901,15 +903,12 @@ shm_fetch_into_slot(ShmScanState *sss, TupleTableSlot *slot)
  * Fail-closed to a single producer when the scan is not eligible for the parallel
  * vectorized reader (the scalar fallback is single-producer).
  *
- * `cap_remaining` is the worker budget still available across the remaining SHM
- * sources of this scan (a join streams several): the chosen count is clamped to
- * it so a multi-source join cannot oversubscribe the shared worker pool. A
- * source always gets at least one producer (each source needs its own ring), so
- * a depleted budget still yields a single-producer stream rather than zero.
+ * This returns the source's DESIRED producer count in isolation; when a scan has
+ * several sources (a join) the desired counts are balanced against the shared
+ * worker budget by shm_balance_workers() before launch.
  */
 static int
-shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot,
-                          int cap_remaining)
+shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
 {
     Relation          rel;
     ShmOffloadColumn *cols;
@@ -969,12 +968,6 @@ shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot,
         w = max_parallel_workers;
     if (w > PGCH_SHM_MAX_STREAM_WORKERS)
         w = PGCH_SHM_MAX_STREAM_WORKERS;
-    /* Clamp to the remaining shared budget, but never below one (each source
-     * needs its own ring), so a depleted budget yields a single producer. */
-    if (cap_remaining < 1)
-        cap_remaining = 1;
-    if (w > cap_remaining)
-        w = cap_remaining;
     if (nblocks > 0 && (BlockNumber) w > nblocks)
         w = (int) nblocks;
     if (w < 1)
@@ -985,15 +978,131 @@ shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot,
 }
 
 /*
- * Build the ClickHouse session settings for an SHM-offload query with
- * max_threads forced to the producer worker count `nworkers`: copy every
- * user-supplied setting except any existing max_threads, then append
- * max_threads = nworkers. Documented precedence: shm_stream_workers
- * unconditionally overrides a user-supplied session_settings max_threads, so the
- * consumer's thread count always matches the producer parallelism.
+ * The shared producer-worker budget for one offload scan: the smallest of the
+ * SHM parking ceiling, the cluster-wide parallel pool, and the cluster-wide
+ * background-worker pool (the producers are dynamic bgworkers drawn from
+ * max_worker_processes, so sizing off max_parallel_workers alone could exhaust
+ * that pool and fail the launch). Also clamped so the combined ring footprint
+ * fits within /dev/shm: each producer owns one PGCH_SHM_DATA_REGION_BYTES ring,
+ * and at most half of the available shared-memory space is handed out so a join
+ * cannot SIGBUS the producers by exhausting /dev/shm.
+ */
+static int
+shm_worker_budget(void)
+{
+    int            budget = PGCH_SHM_MAX_STREAM_WORKERS;
+    struct statvfs vfs;
+
+    if (max_parallel_workers > 0 && budget > max_parallel_workers)
+        budget = max_parallel_workers;
+    if (max_worker_processes > 0 && budget > max_worker_processes)
+        budget = max_worker_processes;
+
+    /* Cap by /dev/shm capacity: keep total rings under half the free space. */
+    if (statvfs("/dev/shm", &vfs) == 0)
+    {
+        Size  avail = (Size) vfs.f_bavail * vfs.f_frsize;
+        int   ring_cap = (int) (avail / 2 / PGCH_SHM_DATA_REGION_BYTES);
+
+        if (ring_cap >= 1 && budget > ring_cap)
+            budget = ring_cap;
+    }
+
+    if (budget < 1)
+        budget = 1;
+    return budget;
+}
+
+/*
+ * Distribute the shared worker `budget` across `n` sources whose isolated
+ * desired counts are in `desired[]`, writing the allocation to `out[]`. Each
+ * source needs its own ring, so every source gets at least one producer (if the
+ * budget cannot cover one-per-source, it is raised to n -- the unavoidable
+ * floor). When the desired total fits the budget, every source gets exactly what
+ * it wants. Otherwise the budget is split PROPORTIONALLY to each source's desire
+ * (water-filling) rather than greedily in source order, so a large second source
+ * is never starved to a single producer just because the first source was sized
+ * first. Any rounding remainder is handed to the still-hungriest sources, and any
+ * over-allocation from the per-source floor is trimmed from the largest sources.
+ */
+static void
+shm_balance_workers(const int *desired, int n, int budget, int *out)
+{
+    int i;
+    int total_desired = 0;
+    int used = 0;
+
+    for (i = 0; i < n; i++)
+        total_desired += desired[i];
+
+    if (budget < n)
+        budget = n;                 /* each source needs its own ring */
+
+    if (total_desired <= budget)
+    {
+        for (i = 0; i < n; i++)
+            out[i] = desired[i];
+        return;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        out[i] = (int) (((double) desired[i] * budget) / total_desired);
+        if (out[i] < 1)
+            out[i] = 1;             /* per-source ring floor */
+        if (out[i] > desired[i])
+            out[i] = desired[i];
+        used += out[i];
+    }
+
+    /* Hand any leftover budget to the still-hungriest sources (largest desire). */
+    while (used < budget)
+    {
+        int best = -1;
+
+        for (i = 0; i < n; i++)
+            if (out[i] < desired[i] && (best < 0 || desired[i] > desired[best]))
+                best = i;
+        if (best < 0)
+            break;
+        out[best]++;
+        used++;
+    }
+
+    /* Trim any over-allocation (from the per-source floor) off the largest. */
+    while (used > budget)
+    {
+        int best = -1;
+
+        for (i = 0; i < n; i++)
+            if (out[i] > 1 && (best < 0 || out[i] > out[best]))
+                best = i;
+        if (best < 0)
+            break;                  /* all at the per-source floor of 1 */
+        out[best]--;
+        used--;
+    }
+}
+
+/*
+ * Build the ClickHouse session settings for an SHM-offload query: copy every
+ * user-supplied setting except the two this path must control, then force them:
+ *
+ *   - max_threads = `nworkers`. Documented precedence: the producer worker count
+ *     unconditionally overrides a user-supplied session_settings max_threads, so
+ *     the consumer's thread count always matches the producer parallelism.
+ *
+ *   - join_use_nulls = 1. A streamed_table() column is non-Nullable (the SHM
+ *     wire types are fixed-width, no NULL bitmap), so with ClickHouse's default
+ *     join_use_nulls=0 an OUTER join fills unmatched rows with the column type's
+ *     DEFAULT (0, '', ...) instead of NULL -- silently diverging from PostgreSQL,
+ *     which yields NULL. Forcing join_use_nulls=1 makes ClickHouse emit NULL for
+ *     the non-matched side, matching PostgreSQL's LEFT/RIGHT/FULL semantics. It
+ *     is a no-op for inner joins and single-table scans (no unmatched rows), so
+ *     forcing it unconditionally is safe.
  */
 static const kv_list *
-shm_settings_force_max_threads(int nworkers)
+shm_build_offload_settings(int nworkers)
 {
     const kv_list *base = chfdw_get_session_settings();
     List          *items = NIL;
@@ -1001,13 +1110,18 @@ shm_settings_force_max_threads(int nworkers)
 
     for (it = new_kv_iter(base); !kv_iter_done(&it); kv_iter_next(&it))
     {
+        /* Drop user-supplied values for the settings we force below. */
         if (pg_strcasecmp(it.name, "max_threads") == 0)
-            continue;       /* drop: shm_stream_workers wins */
+            continue;
+        if (pg_strcasecmp(it.name, "join_use_nulls") == 0)
+            continue;
         items = lappend(items, makeDefElem(pstrdup(it.name),
                                            (Node *) makeString(pstrdup(it.value)), -1));
     }
     items = lappend(items, makeDefElem(pstrdup("max_threads"),
                                        (Node *) makeString(psprintf("%d", nworkers)), -1));
+    items = lappend(items, makeDefElem(pstrdup("join_use_nulls"),
+                                       (Node *) makeString(pstrdup("1")), -1));
 
     return new_kv_list_from_pg_list(items, kv_pair_palloc);
 }
@@ -1070,46 +1184,51 @@ shm_scan_access_mtd(ScanState *ss)
         EState *estate = ss->ps.state;
         MemoryContext old;
         int total_producers = 0;
-        int budget;
         int i;
+        int *desired;
+        int *alloc;
 
-        /* Shared worker budget across this scan's SHM sources (a join streams one
-         * per leaf): cap the running total to the producer parking ceiling and the
-         * cluster-wide parallel pool so a multi-source join can't oversubscribe. */
-        budget = PGCH_SHM_MAX_STREAM_WORKERS;
-        if (max_parallel_workers > 0 && budget > max_parallel_workers)
-            budget = max_parallel_workers;
+        /* 1. Size each SHM source's producer parallelism in isolation, then split
+         *    the shared worker budget across them PROPORTIONALLY (water-filling),
+         *    so a multi-source join neither oversubscribes the worker/ring pool nor
+         *    starves a large later source. The budget already folds in the parallel
+         *    pool, the bgworker pool, and the /dev/shm ring-footprint ceiling. */
+        desired = (int *) palloc(sizeof(int) * sss->nsources);
+        alloc = (int *) palloc(sizeof(int) * sss->nsources);
+        for (i = 0; i < sss->nsources; i++)
+            desired[i] = shm_choose_stream_workers(sss->sources[i].heap_relid,
+                                                   sss->sources[i].attnos,
+                                                   estate->es_snapshot);
+        shm_balance_workers(desired, sss->nsources, shm_worker_budget(), alloc);
 
-        /* 1. For each SHM source, decide producer parallelism (fail-closed to 1
-         *    if the relation is not eligible for the parallel vectorized reader),
-         *    then launch that many cooperating workers to stream the relation into
-         *    its own bounded ring(s) under the query snapshot. Allocate the handle
-         *    in batch_cxt so the reset-callback reap (which fires on cancel/abort)
-         *    sees a still-valid handle. */
+        /* 2. Register every source's workers FIRST (this only enqueues them with
+         *    the postmaster, it does not block), so the postmaster forks all
+         *    sources' workers concurrently; then wait for them to start. This makes
+         *    startup latency ~max(per-source) rather than sum(per-source). Allocate
+         *    each handle in batch_cxt so the reset-callback reap (which fires on
+         *    cancel/abort) sees a still-valid handle even on a partial launch. */
         for (i = 0; i < sss->nsources; i++)
         {
             ShmScanSource *src = &sss->sources[i];
-            int            nworkers;
 
-            nworkers = shm_choose_stream_workers(src->heap_relid, src->attnos,
-                                                 estate->es_snapshot, budget);
-            src->nproducers = nworkers;
-            total_producers += nworkers;
-            budget -= nworkers;
+            src->nproducers = alloc[i];
+            total_producers += alloc[i];
 
             old = MemoryContextSwitchTo(sss->batch_cxt);
-            src->worker = pgch_shm_worker_launch(src->shm_name, src->heap_relid,
-                                                 src->attnos, estate->es_snapshot,
-                                                 nworkers);
+            src->worker = pgch_shm_worker_register(src->shm_name, src->heap_relid,
+                                                   src->attnos, estate->es_snapshot,
+                                                   alloc[i]);
             MemoryContextSwitchTo(old);
         }
+        for (i = 0; i < sss->nsources; i++)
+            pgch_shm_worker_wait_started(sss->sources[i].worker);
 
-        /* Wait for every source's workers to create/attach their SHM producers so
-         * the ClickHouse consumer can attach to all streamed_table() sources. */
+        /* 3. Wait for every source's workers to create/attach their SHM producers
+         *    so the ClickHouse consumer can attach to all streamed_table() sources. */
         for (i = 0; i < sss->nsources; i++)
             pgch_shm_worker_wait_ready(sss->sources[i].worker);
 
-        /* 2. Dispatch the ClickHouse query; it attaches to the SHM streams and
+        /* 4. Dispatch the ClickHouse query; it attaches to the SHM streams and
          *    drains them concurrently with the workers filling the rings. Each
          *    source's single streamed_table('<shm_name>', ...) reference is
          *    rewritten into a UNION ALL over its per-worker rings; the per-source
@@ -1127,7 +1246,7 @@ shm_scan_access_mtd(ScanState *ss)
             {
             ch_query query = new_query(union_sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);
 
-            query.settings = shm_settings_force_max_threads(total_producers);
+            query.settings = shm_build_offload_settings(total_producers);
 
             sss->is_streaming = sss->fetch_size > 0 && sss->conn.methods->streaming_query != NULL;
             if (sss->is_streaming)

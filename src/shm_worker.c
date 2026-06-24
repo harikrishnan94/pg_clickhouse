@@ -135,8 +135,8 @@ struct ShmWorkerHandle
 /* --------------------------------------------------------------------- */
 
 ShmWorkerHandle *
-pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
-                       Snapshot snapshot, int nworkers)
+pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
+                         Snapshot snapshot, int nworkers)
 {
     ShmWorkerHandle *h;
     dsm_segment    *seg;
@@ -257,8 +257,20 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
         launched++;
     }
 
-    /* Pass 2: wait for the concurrently-forking workers to reach startup. */
-    for (w = 0; w < nworkers; w++)
+    (void) launched;
+    return h;
+}
+
+/* Phase 2 of the launch: block until every registered worker has started. On
+ * failure, reap this handle's workers and raise (the caller reaps other sources
+ * via its abort path). Separated from registration so a multi-source scan can
+ * register all sources first and let the postmaster fork them concurrently. */
+void
+pgch_shm_worker_wait_started(ShmWorkerHandle *h)
+{
+    int w;
+
+    for (w = 0; w < h->nworkers; w++)
     {
         pid_t pid;
 
@@ -266,10 +278,20 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
         {
             pgch_shm_worker_shutdown(h);
             ereport(ERROR, (errmsg("pg_clickhouse: SHM streaming background worker %d/%d failed to start",
-                                   w, nworkers)));
+                                   w, h->nworkers)));
         }
     }
-    (void) launched;
+}
+
+/* Convenience: register the workers and wait for them to start (single source). */
+ShmWorkerHandle *
+pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
+                       Snapshot snapshot, int nworkers)
+{
+    ShmWorkerHandle *h = pgch_shm_worker_register(shm_name, heap_relid, attnos,
+                                                  snapshot, nworkers);
+
+    pgch_shm_worker_wait_started(h);
     return h;
 }
 

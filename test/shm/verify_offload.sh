@@ -397,6 +397,16 @@ verify_join join_numeric_agg $JOIN_ROWS 2 \
 # LEFT outer join (o has an unmatched row -> NULL right side in the result)
 verify_join join_left $JOIN_ROWS 2 \
   "SELECT count(*) FROM o LEFT JOIN t ON o.t_id = t.id;"
+# LEFT outer join PROJECTING the nullable side: the unmatched row (o.oid=6, t_id=6)
+# must yield NULL for t.id/t.n, NOT the column type default (0). streamed_table()
+# columns are non-Nullable, so this only matches the baseline when the offload
+# forces join_use_nulls=1 -- a count(*) test cannot see this (regression guard).
+verify_join join_left_project $JOIN_ROWS 2 \
+  "SELECT o.oid, t.id, t.n FROM o LEFT JOIN t ON o.t_id = t.id ORDER BY o.oid;"
+# FULL outer join projecting BOTH sides: t.id in {4,5} have no o row, o.t_id=6 has
+# no t row, so NULLs appear on both sides of the result.
+verify_join join_full_project $JOIN_ROWS 2 \
+  "SELECT t.id, o.oid, o.amt FROM t FULL JOIN o ON t.id = o.t_id ORDER BY t.id NULLS LAST, o.oid NULLS LAST;"
 # SEMI join (EXISTS): target references only the outer relation
 verify_join join_semi $JOIN_ROWS 2 \
   "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM o WHERE o.t_id = t.id);"
