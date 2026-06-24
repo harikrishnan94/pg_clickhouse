@@ -326,3 +326,22 @@ after the on-disk binary is rebuilt) and reported the old `[1, 64]` limit.
    restart). Harnesses read the port from the manifest, so they self-adjust; only
    the FDW server option must be re-set.
 This is also why `wsweep.sh`/`sweep-capped.sh` resolve the CH pid from the port.
+
+---
+
+## D0014 — 2026-06-25 — Known latent issue: SUM(bigint) overflows in offload (out of ClickBench scope)
+
+**Finding (raised by the Phase-1/2 adversarial review).** `SUM(<int8 col>)` over a
+full-range bigint overflows the ClickHouse Int64 sum accumulator, same class as the
+old Q4 avg bug: native `SUM(UserID)` = `25131007489380998843148972` (numeric, exact)
+vs offload `-6533157577348666708` (wrong sign). The Phase-2 fix is deliberately
+**avg-only** (F_AVG_INT8), so `sum(int8)` is unaffected.
+
+**Decision: log, do not fix in-scope.** **No ClickBench query sums a wide int8** —
+the only `SUM`s are over `int2`/`int4` (AdvEngineID, IsRefresh, ResolutionWidth+n),
+whose sums stay far inside Int64 (10M×65535=6.6e11; even 100M×2.1e9=2.1e17 ≪ 9.2e18),
+verified bit-exact. So this does not affect any of the 43 queries or the deliverable.
+If a future workload sums a full-range int8 column, the fix mirrors Phase 2: deparse
+`sum(int8)` → `sum(toInt128(col))` (Int128 accumulator: 10M×9.2e18 = 9.2e25 ≪ Int128
+max 1.7e38 → exact, and PG `sum(bigint)`→numeric matches). Not implemented now to
+avoid out-of-scope risk; flagged so it is not forgotten.
