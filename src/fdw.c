@@ -302,16 +302,8 @@ process_query_params(
     List* param_exprs,
     const char** param_values
 );
-static bool
-foreign_join_ok(
-    PlannerInfo* root,
-    RelOptInfo* joinrel,
-    JoinType jointype,
-    RelOptInfo* outerrel,
-    RelOptInfo* innerrel,
-    JoinPathExtraData* extra
-);
-/* foreign_grouping_ok is declared extern in fdw.h (reused by shm_customscan.c). */
+/* foreign_join_ok and foreign_grouping_ok are declared extern in fdw.h
+ * (reused by shm_customscan.c for heap-offload join / aggregate pushdown). */
 static List*
 get_useful_pathkeys_for_relation(PlannerInfo* root, RelOptInfo* rel);
 static void
@@ -1851,7 +1843,7 @@ semijoin_target_ok(
  * to the foreign server. As a side effect, save information we obtain in this
  * function to CHFdwRelationInfo passed in.
  */
-static bool
+bool
 foreign_join_ok(
     PlannerInfo* root,
     RelOptInfo* joinrel,

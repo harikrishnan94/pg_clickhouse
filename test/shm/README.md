@@ -21,6 +21,17 @@ Two negative controls confirm that with the feature off, and for an ineligible
 query (a bare `count(*)` that references no column), ClickHouse sees no
 `streamed_table` query at all.
 
+JOIN pushdown is covered by a dedicated `verify_join` matrix: an INNER/LEFT/SEMI
+join, a `GROUP BY` over a join, and aggregates over a join (including a numeric
+aggregate, which keeps the exact decimal math in PostgreSQL while the join itself
+still offloads). Each base relation in a join is streamed into its own SHM ring,
+so for a join the harness additionally asserts the ClickHouse query is a JOIN over
+`streamed_table()` sources, that `read_rows` equals the sum of the joined
+relations' row counts (every base relation streamed whole), and that
+`ShmAdoptedBlocks >= 2` (at least one block adopted per source). The teardown
+checks then prove the multi-source streams leak no `/dev/shm` object, control
+socket, or background worker.
+
 The script starts and stops its own ClickHouse server.
 
 ```sh

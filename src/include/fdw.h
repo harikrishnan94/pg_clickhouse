@@ -303,6 +303,17 @@ chfdw_is_foreign_expr(PlannerInfo* root, RelOptInfo* baserel, Expr* expr);
  * fdw.c, reused by shm_customscan.c for heap-offload aggregate pushdown). */
 extern bool
 foreign_grouping_ok(PlannerInfo* root, RelOptInfo* grouped_rel, Node* havingQual);
+/* Assess whether a join can be pushed down + fill the join CHFdwRelationInfo
+ * (defined in fdw.c, reused by shm_customscan.c for heap-offload join pushdown). */
+extern bool
+foreign_join_ok(
+    PlannerInfo* root,
+    RelOptInfo* joinrel,
+    JoinType jointype,
+    RelOptInfo* outerrel,
+    RelOptInfo* innerrel,
+    JoinPathExtraData* extra
+);
 extern bool
 is_foreign_param(PlannerInfo* root, RelOptInfo* baserel, Expr* expr);
 extern char*

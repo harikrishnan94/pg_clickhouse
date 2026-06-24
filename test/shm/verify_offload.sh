@@ -116,6 +116,20 @@ INSERT INTO w VALUES
   (3, 300, 3.0, true,  'x'), (4, 400, 4.0, false, 'y'),
   (5, 500, 5.0, true,  'z');
 
+-- Join partner for t: o.t_id references t.id (1..5), plus oid 6 with t_id 6 that
+-- has NO match in t (so an INNER join drops it, a LEFT/SEMI join exercises the
+-- unmatched-row path). Carries a numeric column to exercise join + numeric agg.
+DROP TABLE IF EXISTS o;
+CREATE TABLE o (oid bigint NOT NULL, t_id bigint NOT NULL, amt bigint NOT NULL,
+                price numeric(15,2) NOT NULL, cat text NOT NULL);
+INSERT INTO o VALUES
+  (1, 1,  5,  10.50, 'a'),
+  (2, 1,  7,  20.25, 'b'),
+  (3, 2,  9,   0.00, 'a'),
+  (4, 3,  2, 100.00, 'b'),
+  (5, 3,  4,   7.75, 'a'),
+  (6, 6, 99,  50.00, 'c');
+
 -- numeric/decimal table: price -> Decimal64 (P<=18), qty -> Decimal32 (P<=9),
 -- big -> Decimal128 (P<=38). Exercises money/quantity-style DECIMAL columns.
 DROP TABLE IF EXISTS m;
@@ -170,7 +184,7 @@ SQL
 # to this database (the supported way to enable the hooks).
 "${PSQL[@]}" -c "ALTER DATABASE \"$PG_DB\" SET session_preload_libraries = 'pg_clickhouse';" >/dev/null
 
-ROWS_T=5; ROWS_W=5; ROWS_M=5; ROWS_L=8; ROWS_BIG=1000000
+ROWS_T=5; ROWS_W=5; ROWS_M=5; ROWS_L=8; ROWS_BIG=1000000; ROWS_O=6
 SET_OFF="SET pg_clickhouse.enable_shm_offload=off;"
 # LOAD is belt-and-braces in case session_preload_libraries has not taken effect.
 SET_ON="LOAD 'pg_clickhouse'; SET pg_clickhouse.local_ch_server='local_ch'; SET pg_clickhouse.shm_min_rows=0; SET pg_clickhouse.session_settings='allow_experimental_streamed_table_function 1'; SET pg_clickhouse.enable_shm_offload=on;"
@@ -274,6 +288,43 @@ verify_big() {
         && ok "$name: CH read_rows == $want_rows (whole relation streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
 }
 
+# verify_join <name> <want_rows> <min_blocks> <sql>: like verify_offload, but for a
+# JOIN pushed down to ClickHouse as streamed_table() <type> JOIN streamed_table().
+# Each base relation is streamed into its own ring, so ClickHouse reads every base
+# table fully (read_rows == sum of the joined relations' row counts) and adopts at
+# least one block per source (min_blocks >= 2 for a two-table join).
+verify_join() {
+    local name="$1" want_rows="$2" min_blocks="$3" sql="$4"
+    local baseline result before after read_rows shm_blocks chsql
+
+    baseline=$("${PSQL[@]}" -c "$SET_OFF $sql" 2>/dev/null)
+    chq "SYSTEM FLUSH LOGS" >/dev/null
+    before=$(ch_count_streamed)
+    result=$("${PSQL[@]}" -c "$SET_ON $sql" 2>/dev/null)
+    chq "SYSTEM FLUSH LOGS" >/dev/null
+    after=$(ch_count_streamed)
+    read_rows=$(ch_latest "read_rows")
+    shm_blocks=$(ch_latest "ProfileEvents['ShmAdoptedBlocks']")
+    chsql=$(ch_latest "replaceRegexpAll(query,'\\\\s+',' ')")
+
+    say ""
+    say "[$name] (JOIN pushdown: one SHM source per base relation)"
+    say "    pg(off): $(echo "$baseline" | tr '\n' '|')   pg(on): $(echo "$result" | tr '\n' '|')"
+    say "    CH executed : $chsql"
+    say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
+
+    [ "$result" = "$baseline" ] && ok "$name: offload result == baseline" || bad "$name: result mismatch"
+    { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
+        && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query"
+    { echo "$chsql" | grep -qi 'join'; } \
+        && ok "$name: ClickHouse query is a JOIN over streamed_table() sources" || bad "$name: CH query is not a join"
+    [ "${shm_blocks:-0}" -ge "$min_blocks" ] 2>/dev/null \
+        && ok "$name: adopted >= $min_blocks SHM blocks (one per source) (ShmAdoptedBlocks=$shm_blocks)" \
+        || bad "$name: ShmAdoptedBlocks=$shm_blocks < $min_blocks (not all sources streamed?)"
+    [ "${read_rows:-0}" = "$want_rows" ] 2>/dev/null \
+        && ok "$name: CH read_rows == $want_rows (every base relation streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
+}
+
 # verify_error_closed <name> <sql>: an offloaded query over an out-of-domain value must FAIL
 # (the worker raises) rather than silently corrupt, and must leave no leaked SHM object/socket.
 verify_error_closed() {
@@ -325,6 +376,30 @@ verify_offload tpch_q18_inner  $ROWS_L \
   "SELECT l_orderkey, sum(l_quantity) FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 50 ORDER BY l_orderkey;"
 verify_offload tpch_q1         $ROWS_L \
   "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, sum(l_extendedprice) AS sum_base_price, sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, avg(l_quantity) AS avg_qty, avg(l_extendedprice) AS avg_price, avg(l_discount) AS avg_disc, count(*) AS count_order FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;"
+
+# JOIN pushdown: t INNER/LEFT/SEMI JOIN o, each base relation streamed into its own
+# SHM ring; ClickHouse runs a single streamed_table() <type> JOIN streamed_table().
+# read_rows == rows(t) + rows(o) == 5 + 6 == 11 (both base relations streamed whole).
+JOIN_ROWS=$((ROWS_T + ROWS_O))   # 11
+# bare INNER join projecting columns (join CustomScan, no aggregate)
+verify_join join_inner_project $JOIN_ROWS 2 \
+  "SELECT t.id, t.s, o.amt FROM t INNER JOIN o ON t.id = o.t_id ORDER BY t.id, o.amt;"
+# aggregate over an INNER join (non-numeric: full fragment pushed down)
+verify_join join_agg $JOIN_ROWS 2 \
+  "SELECT count(*), sum(o.amt) FROM t INNER JOIN o ON t.id = o.t_id;"
+# GROUP BY over an INNER join (non-numeric agg: full fragment pushed down)
+verify_join join_groupby $JOIN_ROWS 2 \
+  "SELECT o.cat, count(*), sum(o.amt) FROM t INNER JOIN o ON t.id = o.t_id GROUP BY o.cat ORDER BY o.cat;"
+# numeric aggregate over an INNER join: the aggregate stays in PostgreSQL for exact
+# decimal results, but the JOIN itself still offloads (CH runs the bare join, PG sums).
+verify_join join_numeric_agg $JOIN_ROWS 2 \
+  "SELECT sum(o.price) FROM t INNER JOIN o ON t.id = o.t_id;"
+# LEFT outer join (o has an unmatched row -> NULL right side in the result)
+verify_join join_left $JOIN_ROWS 2 \
+  "SELECT count(*) FROM o LEFT JOIN t ON o.t_id = t.id;"
+# SEMI join (EXISTS): target references only the outer relation
+verify_join join_semi $JOIN_ROWS 2 \
+  "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM o WHERE o.t_id = t.id);"
 
 # large-data streaming through a bounded ring (Task 2): the relation is far larger
 # than one ring slot, so it can only offload by streaming many blocks.
