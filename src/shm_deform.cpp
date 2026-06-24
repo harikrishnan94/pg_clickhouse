@@ -136,6 +136,9 @@ load(const char *p)
 struct Identity { template <typename T> T operator() (T v) const { return v; } };
 struct DateToCh { uint16 operator() (int32 v) const { return (uint16) (v + PGCH_DATE_EPOCH_DIFF); } };
 struct BoolToU8 { uint8 operator() (uint8 v) const { return v ? 1 : 0; } };
+/* PG timestamp (int64 us since 2000-01-01) -> CH DateTime64(6) ticks (int64 us
+ * since 1970-01-01 UTC). Mirrors write_fixed_value's SHM_WIRE_DATETIME64 case. */
+struct TimestampToCh { int64 operator() (int64 v) const { return v + PGCH_TS_EPOCH_DIFF_US; } };
 
 /* TYPALIGN_{CHAR,SHORT,INT,DOUBLE} char -> numeric alignment. */
 static inline uint8
@@ -588,6 +591,7 @@ pick_fill_const(ShmWireType w)
         case SHM_WIRE_FLOAT32: return k_fill_const<float4, float4, Identity>;
         case SHM_WIRE_FLOAT64: return k_fill_const<float8, float8, Identity>;
         case SHM_WIRE_DATE:    return k_fill_const<int32,  uint16, DateToCh>;
+        case SHM_WIRE_DATETIME64: return k_fill_const<int64, int64, TimestampToCh>;
         default:               Assert(false); pg_unreachable();
     }
 }
@@ -604,6 +608,7 @@ pick_fill_walk(ShmWireType w)
         case SHM_WIRE_FLOAT32: return k_fill_walk<float4, float4, Identity>;
         case SHM_WIRE_FLOAT64: return k_fill_walk<float8, float8, Identity>;
         case SHM_WIRE_DATE:    return k_fill_walk<int32,  uint16, DateToCh>;
+        case SHM_WIRE_DATETIME64: return k_fill_walk<int64, int64, TimestampToCh>;
         default:               Assert(false); pg_unreachable();
     }
 }

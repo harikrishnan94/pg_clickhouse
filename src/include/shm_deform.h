@@ -35,6 +35,13 @@ extern "C"
  * Shared by the C columnizer (write_fixed_value) and the C++ DATE kernel. */
 #define PGCH_DATE_EPOCH_DIFF (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) /* 10957 */
 
+/* PostgreSQL TIMESTAMP is int64 microseconds since 2000-01-01; ClickHouse
+ * DateTime64(6) is int64 ticks (microseconds) since 1970-01-01 UTC. Rebasing
+ * the epoch is an exact integer add (sub-second precision preserved at scale 6).
+ * 10957 days * 86400e6 us/day = 946684800000000. */
+#define PGCH_TS_EPOCH_DIFF_US \
+    ((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY)
+
 /*
  * One heap attribute's deform descriptor, indexed by attno-1 over 0..max_attno-1.
  * POD, built once per scan by the C reader from the relation's TupleDesc + the

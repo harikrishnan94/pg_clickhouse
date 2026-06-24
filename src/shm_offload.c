@@ -116,6 +116,23 @@ pgch_pg_type_to_ch_wire(Oid pg_type, int32 typmod, ShmOffloadColumn *out)
         case FLOAT4OID:  wire = SHM_WIRE_FLOAT32; ch_type = "Float32"; break;
         case FLOAT8OID:  wire = SHM_WIRE_FLOAT64; ch_type = "Float64"; break;
         case DATEOID:    wire = SHM_WIRE_DATE;    ch_type = "Date";    break;
+        /* PostgreSQL `timestamp` (no time zone, int64 us since 2000-01-01) maps to
+         * ClickHouse DateTime64(6): full microsecond precision, signed-Int64 tick
+         * range (no truncation, no 1970-2106 DateTime overflow). The consumer
+         * already adopts DateTime64 (Wire/Layout.h tag 18 -> ColumnDecimal<DateTime64>,
+         * scale derived from this type string), so this is a producer-side-only
+         * change. The byte conversion is in write_fixed_value (SHM_WIRE_DATETIME64).
+         *
+         * The 'UTC' time zone is REQUIRED for correctness, not cosmetic. PG
+         * `timestamp` is tz-naive wall-clock; our converter emits ticks treating
+         * that wall-clock as UTC. A bare DateTime64(6) inherits the ClickHouse
+         * server time zone (here Asia/Kolkata, +5:30), so tz-dependent extractors
+         * -- toMinute()/toHour() (extract(... FROM ts)) -- would shift the result
+         * (Q19 minute off by +30). Pinning 'UTC' makes CH interpret the instant in
+         * the same wall-clock PG used, so extract()/date_part() match native.
+         * (toStartOfMinute/date_trunc and ORDER BY are tz-invariant for whole-minute
+         * offsets, so Q25/27/43 were already exact; toMinute is not -- hence Q19.) */
+        case TIMESTAMPOID: wire = SHM_WIRE_DATETIME64; ch_type = "DateTime64(6, 'UTC')"; break;
         case TEXTOID:
         case VARCHAROID:
         case BPCHAROID:  wire = SHM_WIRE_STRING;  ch_type = "String";  break;
@@ -394,6 +411,18 @@ write_fixed_value(ColBuf *cb, const ShmOffloadColumn *col, size_t row, Datum d)
             int32 pg_days = (int32) DatumGetDateADT(d);
             uint16 ch_days = (uint16) (pg_days + PGCH_DATE_EPOCH_DIFF);
             memcpy(slot, &ch_days, sizeof(ch_days));
+            break;
+        }
+        case SHM_WIRE_DATETIME64:
+        {
+            /* PostgreSQL timestamp: int64 us since 2000-01-01. ClickHouse
+             * DateTime64(6): int64 ticks (us) since 1970-01-01 UTC. Rebase the
+             * epoch with an exact integer add; sub-second precision is preserved
+             * (scale 6, carried to the consumer in the DataType string, not on
+             * the wire). hits has no +/-infinity timestamps; real values are far
+             * inside the Int64 tick range so the add cannot overflow. */
+            int64 ch_ticks = DatumGetInt64(d) + PGCH_TS_EPOCH_DIFF_US;
+            memcpy(slot, &ch_ticks, sizeof(ch_ticks));
             break;
         }
         case SHM_WIRE_DECIMAL32:

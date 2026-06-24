@@ -217,3 +217,56 @@ the planner adds no `ClickHouseShmScan` and a parallel seq-scan `count(*)` wins.
 Per the spec this is **expected, not a failure**. Logged as `none (expected)`.
 Optional later experiment (P5): force a 1-column stream to offload the count;
 low value, deferred.
+
+---
+
+## D0011 — 2026-06-25 — Phase 1: timestamp → DateTime64(6, **'UTC'**) (tz fix)
+
+**Decision.** Map PG `timestamp` (`TIMESTAMPOID`) → ClickHouse **`DateTime64(6,
+'UTC')`** over the SHM wire (`src/shm_offload.c` type map + `write_fixed_value`
+`SHM_WIRE_DATETIME64` converter + the C++ `shm_deform.cpp` `TimestampToCh`
+kernel). PG timestamp is int64 µs since 2000-01-01; the converter rebases to int64
+µs since 1970-01-01 (`+ PGCH_TS_EPOCH_DIFF_US`). The consumer already adopts
+`DateTime64` (Wire/Layout.h tag 18), so this is **producer-side only** — no ABI
+change. Unlocks Q19, Q25, Q27, Q43 (Q24 needs the separate col-limit raise, D0012).
+
+**Why DateTime64(6) over DateTime(s):** DateTime64(6) is lossless (full µs, signed
+Int64 tick range), avoiding the 1970–2106 UInt32 DateTime window and any sub-second
+truncation. ClickBench `EventTime` is whole-second, so both would be exact here,
+but DateTime64(6) is the correct general mapping.
+
+**Why the `'UTC'` qualifier is mandatory (correctness, not cosmetic).** Caught by
+the Phase-1 correctness gate: with a bare `DateTime64(6)`, Q19 `extract(minute FROM
+EventTime)` was **off by +30 min** on every row (`offload_m = (native_m+30) mod
+60`). The CH server tz is `Asia/Kolkata` (+5:30); a bare `DateTime64` inherits it,
+and `toMinute()` (the deparse of `extract(minute …)`) is tz-dependent, whereas PG
+`extract` is tz-naive. `toStartOfMinute`/ordering are tz-invariant for whole-minute
+offsets, so Q25/27/43 were exact even before the fix — only Q19 exposed it.
+Pinning `'UTC'` makes CH interpret the streamed wall-clock exactly as PG does.
+**Alternative considered:** set `session_settings` `session_timezone=UTC`.
+Rejected — fragile (relies on a session GUC for correctness) and would also shift
+any genuine tz-aware behaviour; pinning the column type is local and explicit.
+
+**Fidelity:** Q19/25/27/43 exact vs native (tie-robust for the top-N Q19/Q43).
+Logged: no deviation. **Perf** (W=8): Q19 1.51×, Q43 1.64×; **Q25 0.57×
+(offload slower)** — a cheap-filter projection whose `ORDER BY EventTime LIMIT 10`
+runs in PG, so offload pays a round-trip with nothing to amortize. Honest loss;
+motivates top-N pushdown (D0007 / Phase 3).
+
+---
+
+## D0012 — 2026-06-25 — Q24 (`SELECT *`) blocked by the 64-column SHM cap (deferred)
+
+**Finding.** Timestamp support is necessary but **not sufficient** for Q24
+(`SELECT * FROM hits …`): `hits` has 105 columns and the SHM stream caps at
+`SHM_IMPL_MAX_COLS = 64` (`src/shm_producer.c:50`) — enforced on BOTH sides
+(consumer `IMPL_MAX_COLUMNS = 64`, `Wire/Layout.h:62`). The streaming worker fails
+with `shm column count 105 out of range (1..64)` and the query returns 0 rows.
+
+**Decision.** Defer to **Phase 1b** (task #7). The schema table / per-column
+descriptor regions are **dynamically sized** (`n_columns * sizeof(...)`), so 64 is
+a soft validation cap, not a fixed-array bound — raising it to 128 on both sides
+(+ a ClickHouse rebuild/restart, keeping the consumer tests green) should unlock
+Q24. Q24 is the **only** ClickBench query needing > 64 columns. Kept separate from
+the timestamp phase because it is a distinct mechanism (column-count scaling) and
+requires a consumer rebuild.
