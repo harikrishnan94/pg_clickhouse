@@ -240,18 +240,18 @@ verify_declined() {
         && ok "$name: planner declined (no streamed_table query)" || bad "$name: unexpected offload ($before -> $after)"
 }
 
-# verify_big <name> <want_rows> <min_blocks> <extra_set> <sql>: like verify_offload, but
-# also asserts the stream adopted MANY blocks (scaling with row count, not 1). The caller
-# passes a small shm_data_region_mb in <extra_set> so the ring is far smaller than the table,
-# proving the relation streams through a bounded ring rather than being pre-buffered whole.
+# verify_big <name> <want_rows> <min_blocks> <sql>: like verify_offload, but also
+# asserts the stream adopted MANY blocks (scaling with row count, not 1). The
+# relation is far larger than one ring slot, so it can only offload by streaming
+# many blocks through the bounded ring rather than being pre-buffered whole.
 verify_big() {
-    local name="$1" want_rows="$2" min_blocks="$3" extra_set="$4" sql="$5"
+    local name="$1" want_rows="$2" min_blocks="$3" sql="$4"
     local baseline result before after read_rows shm_blocks chsql
 
     baseline=$("${PSQL[@]}" -c "$SET_OFF $sql" 2>/dev/null)
     chq "SYSTEM FLUSH LOGS" >/dev/null
     before=$(ch_count_streamed)
-    result=$("${PSQL[@]}" -c "$SET_ON $extra_set $sql" 2>/dev/null)
+    result=$("${PSQL[@]}" -c "$SET_ON $sql" 2>/dev/null)
     chq "SYSTEM FLUSH LOGS" >/dev/null
     after=$(ch_count_streamed)
     read_rows=$(ch_latest "read_rows")
@@ -327,11 +327,9 @@ verify_offload tpch_q1         $ROWS_L \
   "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, sum(l_extendedprice) AS sum_base_price, sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, avg(l_quantity) AS avg_qty, avg(l_extendedprice) AS avg_price, avg(l_discount) AS avg_disc, count(*) AS count_order FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;"
 
 # large-data streaming through a bounded ring (Task 2): the relation is far larger
-# than the configured SHM region, so it can only offload by streaming many blocks.
-verify_big big_stream  $ROWS_BIG 10 "SET pg_clickhouse.shm_data_region_mb=8;" \
-  "SELECT count(*), sum(id), sum(v) FROM big;"
-verify_big big_decimal $ROWS_BIG 10 "SET pg_clickhouse.shm_data_region_mb=4;" \
-  "SELECT sum(p) FROM big;"
+# than one ring slot, so it can only offload by streaming many blocks.
+verify_big big_stream  $ROWS_BIG 10 "SELECT count(*), sum(id), sum(v) FROM big;"
+verify_big big_decimal $ROWS_BIG 10 "SELECT sum(p) FROM big;"
 
 # fail-closed: an out-of-domain numeric (NaN) makes the streaming worker raise; the
 # offloaded query must error rather than silently corrupt, leaving no leaked SHM object.

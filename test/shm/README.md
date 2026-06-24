@@ -64,10 +64,12 @@ classifier and the MVCC oracle are never entered). Each of its cases therefore
    `visible_fast`, `invisible_fast`, `undecided`, `slow_visible`). Proves which
    classifier lane and the MVCC oracle actually executed.
 
-Every case also asserts the offloaded result equals both the scalar scan
-(`enable_shm_offload off`) and the scalar reference classifier
-(`shm_vectorized_visibility off`) — kernel, reference, and PostgreSQL all agree
-on the visible set. Coverage: each VISIBLE / INVISIBLE / UNDECIDED verdict, the
+Every case also asserts the offloaded result equals the blessed scalar scan
+(`enable_shm_offload off`) — the SoA classify kernel and PostgreSQL agree on the
+visible set. (The scalar reference classifier in `shm_page_reader.c` is retained
+purely as an assertion-build cross-check of the kernel, exercised on every tuple
+when the extension is built with assertions; there is no longer a runtime GUC to
+select it.) Coverage: each VISIBLE / INVISIBLE / UNDECIDED verdict, the
 all-visible fast page path, concurrency (in-progress insert / delete / update,
 multixact), a mixed page (visible + invisible + undecided in one scan), and a
-block-flush straddle (> `rows_per_block`).
+block-flush straddle (> the 65536-row block size).

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Correctness for the column-major (struct-of-arrays) batch deform
-# (pg_clickhouse.shm_columnar_deform). For each case the result with offload ON
-# (column-major reader) must equal the baseline with offload OFF, and the offload
-# must actually engage (last_query_used_clickhouse = on).
+# Correctness for the column-major (struct-of-arrays) batch deform (the
+# unconditional SHM vectorized-reader deform path). For each case the result with
+# offload ON (column-major reader) must equal the baseline with offload OFF, and
+# the offload must actually engage (last_query_used_clickhouse = on).
 #
 # Cases:
 #   vnn  - nullable NON-projected column (~1/3 NULL) between two projected NOT NULL
@@ -26,8 +26,6 @@ OFFLOAD_ON="LOAD 'pg_clickhouse';
 SET pg_clickhouse.local_ch_server = '${CH_SERVER}';
 SET pg_clickhouse.shm_min_rows = 0;
 SET pg_clickhouse.session_settings = 'allow_experimental_streamed_table_function 1, max_threads 1';
-SET pg_clickhouse.shm_vectorized_reader = on;
-SET pg_clickhouse.shm_columnar_deform = on;
 SET pg_clickhouse.enable_shm_offload = on;"
 
 # $1 = label, $2 = query

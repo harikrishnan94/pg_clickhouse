@@ -62,14 +62,15 @@
  *   A (cur_simple): NULL-free, full-natts  -> column-major C++ driver (no nulls)
  *   B (complex_tup): HEAP_HASNULL, full-natts -> column-major C++ driver (nulls)
  *   C (fallback_tup): short (natts < max_attno) -> row-major C path
- * With the columnar GUC off, every tuple is routed to C (exact row-major behavior).
- * The three arrays are scan-owned, each sized MaxHeapTuplesPerPage.
+ * Group C is the automatic fallback for physically short tuples (a column added
+ * by ALTER TABLE ADD COLUMN leaves older rows with fewer attrs), whose offsets
+ * the column-major prefix cannot assume; the column-major A/B path handles the
+ * common full-width tuples. The three arrays are scan-owned, each sized
+ * MaxHeapTuplesPerPage.
  */
 typedef struct PgchVisSplit
 {
     AttrNumber       max_attno;
-    bool             columnar;       /* false -> route everything to fallback (C) */
-    bool             vis_vectorized; /* classify not-all-visible pages with the SoA kernel */
     char           **cur_simple;     /* A: data-start (htup + t_hoff) */
     HeapTupleHeader *complex_tup;    /* B */
     HeapTupleHeader *fallback_tup;   /* C */
@@ -79,8 +80,8 @@ typedef struct PgchVisSplit
 static pg_attribute_always_inline void
 pgch_route(HeapTupleHeader htup, PgchVisSplit *s)
 {
-    if (!s->columnar || HeapTupleHeaderGetNatts(htup) < s->max_attno)
-        s->fallback_tup[s->nc++] = htup;                       /* group C (or GUC off: all) */
+    if (HeapTupleHeaderGetNatts(htup) < s->max_attno)
+        s->fallback_tup[s->nc++] = htup;                       /* group C: short tuple */
     else if (htup->t_infomask & HEAP_HASNULL)
         s->complex_tup[s->nb++] = htup;                        /* group B */
     else
@@ -104,6 +105,7 @@ typedef struct PgchAttrMeta
 /* Visibility kernel */
 /* --------------------------------------------------------------------- */
 
+#ifdef USE_ASSERT_CHECKING
 /*
  * Classify one tuple from its hint bits and raw xmin/xmax against the snapshot,
  * using ONLY in-memory comparisons (no clog, no xip[] scan, no subtrans). Emits
@@ -112,10 +114,12 @@ typedef struct PgchAttrMeta
  * other case is UNDECIDED and routed to the MVCC fallback. Assumes a normal
  * MVCC snapshot (guaranteed by pgch_vectorized_reader_eligible).
  *
- * This is the scalar REFERENCE classifier: it is the shm_vectorized_visibility=off
- * path, and the oracle the branch-free SoA kernel (pgch_vis_classify) is
- * cross-checked against verdict-for-verdict under USE_ASSERT_CHECKING. The two
- * must always agree; this one is the authority.
+ * This is the scalar REFERENCE classifier kept purely as the correctness oracle
+ * for the branch-free SoA kernel (pgch_vis_classify): in assertion-enabled
+ * builds the kernel's verdict is cross-checked against this one verdict-for-
+ * verdict on every classified tuple (see pgch_collect_with_visibility). The two
+ * must always agree; this one is the authority. It is compiled only when
+ * assertions are on, so production builds carry no second classifier.
  */
 static pg_attribute_always_inline PgchVisVerdict
 pgch_classify_tuple(uint16 infomask, TransactionId xmin, TransactionId xmax,
@@ -165,6 +169,7 @@ pgch_classify_tuple(uint16 infomask, TransactionId xmin, TransactionId xmax,
     }
     return PGCH_VIS_UNDECIDED;              /* no xmax hint -> fall back */
 }
+#endif                                      /* USE_ASSERT_CHECKING */
 
 /* Splice every LP_NORMAL tuple on an all-visible page into the buckets. The
  * header deref here is the same one the deform needs next (hot in cache). */
@@ -189,14 +194,13 @@ pgch_collect_all_visible(Page page, PgchVisSplit *s, PgchVisStats *stats)
  * Splice the snapshot-visible LP_NORMAL tuples on a not-all-visible page into
  * the buckets. Three phases:
  *   gather   -- header fields into parallel (SoA) arrays (heap-format walk);
- *   classify -- the branch-free SoA kernel (or the scalar reference when
- *               shm_vectorized_visibility is off) writes a verdict per tuple and
+ *   classify -- the branch-free SoA kernel writes a verdict per tuple and
  *               compacts the VISIBLE / UNDECIDED tuple indices into worklists;
  *   route    -- emit the VISIBLE worklist, then resolve the UNDECIDED worklist
  *               through the exact MVCC oracle and emit the survivors.
  * The buffer must be share-locked for the whole call (the oracle may set hint
- * bits, which dirties the buffer). The classify result is byte-for-byte the same
- * either way; the kernel and the reference are cross-checked under assertions.
+ * bits, which dirties the buffer). Under USE_ASSERT_CHECKING the kernel's verdict
+ * is cross-checked against the scalar reference classifier on every tuple.
  */
 static void
 pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page page,
@@ -238,41 +242,21 @@ pgch_collect_with_visibility(Relation rel, Buffer buf, BlockNumber blk, Page pag
         m++;
     }
 
-    /* Classify + partition: the SoA kernel, or the scalar reference. */
-    if (s->vis_vectorized)
-    {
-        pgch_vis_classify(visdesc, soa_im, soa_xmin, soa_xmax, (size_t) m,
-                          verdict, vis_idx, und_idx, &nvis, &nund);
+    /* Classify + partition with the branch-free SoA kernel. */
+    pgch_vis_classify(visdesc, soa_im, soa_xmin, soa_xmax, (size_t) m,
+                      verdict, vis_idx, und_idx, &nvis, &nund);
 
 #ifdef USE_ASSERT_CHECKING
-        /* The branch-free kernel must agree with the reference on every tuple. */
-        {
-            int j;
-
-            for (j = 0; j < m; j++)
-                Assert(verdict[j] ==
-                       (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
-                                                   visdesc->snap_xmin, visdesc->snap_xmax));
-        }
-#endif
-    }
-    else
+    /* The branch-free kernel must agree with the scalar reference on every tuple. */
     {
         int j;
 
         for (j = 0; j < m; j++)
-            verdict[j] = (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
-                                                     visdesc->snap_xmin, visdesc->snap_xmax);
-        for (j = 0; j < m; j++)
-        {
-            uint8 v = verdict[j];
-
-            vis_idx[nvis] = (uint16) j;
-            nvis += (v == PGCH_VIS_VISIBLE);
-            und_idx[nund] = (uint16) j;
-            nund += (v == PGCH_VIS_UNDECIDED);
-        }
+            Assert(verdict[j] ==
+                   (uint8) pgch_classify_tuple(soa_im[j], soa_xmin[j], soa_xmax[j],
+                                               visdesc->snap_xmin, visdesc->snap_xmax));
     }
+#endif
 
     /* Route the definite-VISIBLE worklist into the A/B/C buckets. */
     for (k = 0; k < nvis; k++)
@@ -647,7 +631,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     BlockNumber          blk;
     AttrNumber           max_attno = 0;
     PgchAttrMeta        *meta;
-    PgchRowPlan          plan;          /* group C / GUC-off row-major path */
+    PgchRowPlan          plan;          /* group C row-major path (short tuples) */
     PgchDeformCol       *col;           /* group A/B columnar driver descriptor */
     PgchDeformDesc       desc;
     PgchStep            *step_a, *step_b;   /* compiled columnar deform step plans */
@@ -664,7 +648,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     int                 *col_of;        /* attno-1 -> projected column index, else -1 */
     char               **cur_simple;    /* group A cursors; reused as group B scratch */
     HeapTupleHeader     *complex_tup;   /* group B tuples (HEAP_HASNULL, full natts) */
-    HeapTupleHeader     *fallback_tup;  /* group C tuples (short) / all when GUC off */
+    HeapTupleHeader     *fallback_tup;  /* group C tuples (short, missing-attr) */
     const bits8        **bits;          /* group B NULL-bitmap pointers */
     PgchVisSplit         s;
     int                  c;
@@ -674,7 +658,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
         if (cols[c].attno > max_attno)
             max_attno = cols[c].attno;
 
-    /* Build attno-indexed deform metadata for the row-major path (group C / off). */
+    /* Build attno-indexed deform metadata for the row-major path (group C). */
     meta = (PgchAttrMeta *) palloc0(sizeof(PgchAttrMeta) * max_attno);
     for (i = 0; i < max_attno; i++)
     {
@@ -743,8 +727,6 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     pgch_build_deform_plans(&desc, step_a, hop_a, &plan_a, step_b, hop_b, &plan_b);
 
     s.max_attno = max_attno;
-    s.columnar = pgch_use_columnar_deform;
-    s.vis_vectorized = pgch_use_vectorized_visibility;
     s.cur_simple = cur_simple;
     s.complex_tup = complex_tup;
     s.fallback_tup = fallback_tup;
@@ -754,7 +736,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     visdesc.snap_xmin = snapshot->xmin;
     visdesc.snap_xmax = snapshot->xmax;
     memset(&vis, 0, sizeof(vis));
-    vis.vectorized = s.vis_vectorized;
+    vis.used_vectorized = true;
 
     /* Match a stock seqscan: BAS_BULKREAD keeps a large scan from evicting the
      * shared-buffer working set. */
@@ -891,8 +873,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
             done += navail;
         }
 
-        /* Group C: short/missing-attr tuples (and everything when the GUC is
-         * off) via the proven row-major path. */
+        /* Group C: short/missing-attr tuples via the proven row-major path. */
         for (j = 0; j < s.nc; j++)
         {
             pgch_deform_needed((const HeapTupleHeaderData *) fallback_tup[j], &plan,

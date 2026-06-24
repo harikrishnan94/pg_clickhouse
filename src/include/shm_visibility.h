@@ -64,7 +64,7 @@ typedef struct PgchVisDesc
  */
 typedef struct PgchVisStats
 {
-    bool   vectorized;          /* true: kernel ran; false: scalar reference classify */
+    bool   used_vectorized;     /* true: vectorized page reader ran; false: scalar table-AM fallback */
     uint64 pages_total;         /* heap pages scanned */
     uint64 pages_all_visible;   /* PD_ALL_VISIBLE fast page path (zero per-tuple work) */
     uint64 pages_classified;    /* not-all-visible pages run through the classify path */

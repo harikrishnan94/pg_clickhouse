@@ -50,17 +50,11 @@ extern bool pgch_this_query_used_ch;
 /* GUCs (defined in shm_offload.c, registered by pgch_shm_offload_init). */
 extern bool  pgch_enable_shm_offload;
 extern char *pgch_local_ch_server;
-extern int   pgch_shm_ring_depth_k;
-extern int   pgch_shm_data_region_mb;
 extern int   pgch_shm_min_rows;
-extern bool  pgch_use_vectorized_reader;
-extern bool  pgch_use_columnar_deform;
-extern bool  pgch_use_vectorized_visibility;
 extern bool  pgch_log_stream_stats;
 extern bool  pgch_enable_jit_deform;
 extern int   pgch_jit_row_threshold;
 extern int   pgch_shm_stream_workers;
-extern int   pgch_shm_rows_per_block;
 
 /*
  * Hard cap on cooperating SHM streaming workers (the GUC's upper bound and the
@@ -68,6 +62,19 @@ extern int   pgch_shm_rows_per_block;
  * so every worker's control-socket connection can park alongside the consumer's.
  */
 #define PGCH_SHM_MAX_STREAM_WORKERS 64
+
+/*
+ * Fixed SHM ring geometry. These were once GUCs (shm_ring_depth_k /
+ * shm_data_region_mb / shm_rows_per_block) bake-off'd while tuning the stream;
+ * measurement (dev/bench/PARALLEL-SHM-RESULTS.md) found them invariant to the
+ * end-to-end time, so they are compile-time constants. The producer still
+ * range-checks at runtime (a published block must fit one ring slot:
+ * PGCH_SHM_DATA_REGION_BYTES / PGCH_SHM_RING_DEPTH_K), so an over-wide block
+ * fails closed rather than corrupting.
+ */
+#define PGCH_SHM_RING_DEPTH_K     4
+#define PGCH_SHM_DATA_REGION_BYTES ((Size) 64 * 1024 * 1024)
+#define PGCH_SHM_ROWS_PER_BLOCK   65536
 
 /*
  * One projected column to stream. `attno` is the 1-based heap attribute number;

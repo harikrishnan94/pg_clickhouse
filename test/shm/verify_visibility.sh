@@ -18,9 +18,10 @@
 #      MVCC oracle actually executed.
 #
 # Correctness oracle: every case asserts the offloaded result is byte-identical
-# with the blessed scalar scan (enable_shm_offload off) AND identical with the
-# scalar reference classifier (shm_vectorized_visibility off) -- so the kernel,
-# the reference, and PostgreSQL all agree on the visible set.
+# with the blessed scalar scan (enable_shm_offload off) -- so the SoA classify
+# kernel and PostgreSQL agree on the visible set. (The scalar reference
+# classifier is retained as an assertion-build cross-check of the kernel, see
+# shm_page_reader.c; an assert-enabled build exercises it on every tuple here.)
 #
 # autovacuum is DISABLED on the fixtures: an insert-triggered autovacuum will
 # otherwise asynchronously mark a table all-visible and silently defeat the
@@ -44,7 +45,7 @@ Q="SELECT count(*), sum(a), sum(b), min(d), max(d) FROM vis WHERE a >= 0;"
 RESULT=""          # query result of the most recent run_on
 VIS_LINE=""        # the "shm visibility:" LOG line from the most recent run_on
 
-# ---- session settings for an offload run; $1 = shm_vectorized_visibility on/off
+# ---- session settings for an offload run.
 on_prelude() {
   printf '%s\n' \
     "LOAD 'pg_clickhouse';" \
@@ -52,8 +53,6 @@ on_prelude() {
     "SET pg_clickhouse.shm_min_rows = 0;" \
     "SET pg_clickhouse.session_settings = 'allow_experimental_streamed_table_function 1, max_threads 1';" \
     "SET pg_clickhouse.shm_log_stream_stats = on;" \
-    "SET pg_clickhouse.shm_vectorized_reader = on;" \
-    "SET pg_clickhouse.shm_vectorized_visibility = $1;" \
     "SET pg_clickhouse.enable_shm_offload = on;"
 }
 
@@ -62,16 +61,15 @@ qx() { "${PSQL[@]}" -c "$1" >/dev/null 2>&1; }
 # Run query $1 with offload OFF (the blessed scalar table scan). Echoes result.
 run_off() { "${PSQL[@]}" -c "SET pg_clickhouse.enable_shm_offload = off; $1"; }
 
-# Run query $1 offloaded with vectorized-visibility $2 (on=kernel, off=scalar
-# reference). Sets globals RESULT (query output) and VIS_LINE (the "shm
-# visibility:" LOG line emitted by the background streaming worker; that line can
-# land in the server log slightly after the client gets its result, so poll).
-# NB: call as a statement, never as $(run_on ...) -- a command-substitution
-# subshell would discard the VIS_LINE/RESULT globals.
+# Run query $1 offloaded (vectorized page reader). Sets globals RESULT (query
+# output) and VIS_LINE (the "shm visibility:" LOG line emitted by the background
+# streaming worker; that line can land in the server log slightly after the
+# client gets its result, so poll). NB: call as a statement, never as
+# $(run_on ...) -- a command-substitution subshell would discard the globals.
 run_on() {
   local mark i line
   mark=$(sudo wc -l < "$PGLOG")
-  RESULT=$(printf '%s\n%s\n' "$(on_prelude "$2")" "$1" | "${PSQL[@]}")
+  RESULT=$(printf '%s\n%s\n' "$(on_prelude)" "$1" | "${PSQL[@]}")
   VIS_LINE=""
   for i in $(seq 1 25); do
     line=$(sudo tail -n +"$((mark+1))" "$PGLOG" | grep -E "pg_clickhouse shm visibility:" | tail -1)
@@ -82,8 +80,6 @@ run_on() {
 
 # A counter field from VIS_LINE (e.g. vf undecided).
 vf() { grep -oE "$1=[0-9]+" <<<"$VIS_LINE" | head -1 | cut -d= -f2; }
-# The vis_engine word (vectorized|scalar).
-veng() { grep -oE "vis_engine=[a-z]+" <<<"$VIS_LINE" | head -1 | cut -d= -f2; }
 
 allvis_pages() { "${PSQL[@]}" -c "SELECT count(*) FILTER (WHERE all_visible) FROM pg_visibility('$1'::regclass);"; }
 total_pages()  { "${PSQL[@]}" -c "SELECT count(*) FROM pg_visibility('$1'::regclass);"; }
@@ -95,8 +91,8 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL  %-34s %s\n' "$1" "$2"; }
 expect_eq() { [ "$2" = "$3" ] && ok "$1" "[$2]" || bad "$1" "got [$2] want [$3]"; }
 # $1 label, $2 actual, $3 threshold, $4 note
 expect_gt() { { [ -n "$2" ] && [ "$2" -gt "$3" ] 2>/dev/null; } && ok "$1" "$4 ($2 > $3)" || bad "$1" "$4: got [$2] want > $3"; }
-# $1 label, off, vec, scalar
-expect_3eq() { { [ "$2" = "$3" ] && [ "$2" = "$4" ]; } && ok "$1" "off==vec==scalar [$2]" || bad "$1" "off=[$2] vec=[$3] scalar=[$4]"; }
+# $1 label, offload-off result, offload-on result
+expect_equiv() { [ "$2" = "$3" ] && ok "$1" "off==vec [$2]" || bad "$1" "off=[$2] vec=[$3]"; }
 
 recreate() {  # fresh, autovacuum-disabled fixture (a int, b float8, c text forces a varlena, d date)
   qx "DROP TABLE IF EXISTS vis;"
@@ -117,14 +113,12 @@ qx "CREATE EXTENSION IF NOT EXISTS pg_visibility;"
 # ---------------------------------------------------------------------------
 recreate 5000
 expect_eq "1.precondition_not_all_visible" "$(allvis_pages vis)" "0"
-run_on "$Q" on; on_vec=$RESULT           # kernel run while still unhinted
-expect_eq "1.vis_engine_vectorized"   "$(veng)"            "vectorized"
+run_on "$Q"; on_vec=$RESULT              # kernel run while still unhinted
 expect_gt "1.classified_pages"        "$(vf classified)"   "0" "classify path ran"
 expect_gt "1.undecided_to_oracle"     "$(vf undecided)"    "0" "unhinted -> UNDECIDED"
 expect_gt "1.slow_path_visible"       "$(vf slow_visible)" "0" "oracle resolved visible"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "1.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "1.result_equiv" "$off" "$on_vec"
 
 # ---------------------------------------------------------------------------
 # 2) committed_hinted_not_all_visible -> definite VISIBLE fast lane.
@@ -132,13 +126,12 @@ expect_3eq "1.result_equiv" "$off" "$on_vec" "$on_sca"
 #    is still unset. The kernel now proves VISIBLE from hints alone, no oracle.
 # ---------------------------------------------------------------------------
 expect_eq "2.precondition_not_all_visible" "$(allvis_pages vis)" "0"
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"; on_vec=$RESULT
 expect_gt "2.classified_pages"   "$(vf classified)"    "0" "classify path ran"
 expect_gt "2.visible_fast"       "$(vf visible_fast)"  "0" "hinted -> fast VISIBLE"
 expect_eq "2.no_undecided"       "$(vf undecided)"     "0"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "2.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "2.result_equiv" "$off" "$on_vec"
 
 # ---------------------------------------------------------------------------
 # 3) all_visible_frozen -> all-visible page fast path (zero per-tuple work).
@@ -146,13 +139,12 @@ expect_3eq "2.result_equiv" "$off" "$on_vec" "$on_sca"
 qx "VACUUM (FREEZE, ANALYZE) vis;"
 np=$(total_pages vis)
 expect_eq "3.precondition_all_visible" "$(allvis_pages vis)" "$np"
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"; on_vec=$RESULT
 expect_eq "3.all_visible_pages"  "$(vf all_visible)" "$np"
 expect_eq "3.no_classify"        "$(vf classified)" "0"
 expect_eq "3.no_gather"          "$(vf gathered)"   "0"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "3.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "3.result_equiv" "$off" "$on_vec"
 
 # ---------------------------------------------------------------------------
 # 4) deleted_committed -> definite INVISIBLE fast lane (committed visible deleter).
@@ -164,13 +156,12 @@ expect_3eq "3.result_equiv" "$off" "$on_vec" "$on_sca"
 # ---------------------------------------------------------------------------
 qx "DELETE FROM vis WHERE a % 7 = 0;"
 expect_eq "4.precondition_not_all_visible" "$(allvis_pages vis)" "0"
-run_on "$Q" on                            # run #1: oracle hints xmax committed
-run_on "$Q" on; on_vec=$RESULT            # run #2: kernel proves INVISIBLE fast
+run_on "$Q"                               # run #1: oracle hints xmax committed
+run_on "$Q"; on_vec=$RESULT               # run #2: kernel proves INVISIBLE fast
 expect_gt "4.classified_pages"  "$(vf classified)"     "0" "classify path ran"
 expect_gt "4.invisible_fast"    "$(vf invisible_fast)" "0" "committed deleter -> fast INVISIBLE"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "4.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "4.result_equiv" "$off" "$on_vec"
 
 # ---------------------------------------------------------------------------
 # 5) hot_updated -> old version xmax=committed updater, new version xmin=committed.
@@ -180,32 +171,30 @@ expect_3eq "4.result_equiv" "$off" "$on_vec" "$on_sca"
 qx "VACUUM (FREEZE, ANALYZE) vis;"          # reset to all-visible, then dirty it
 qx "UPDATE vis SET b = b + 1 WHERE a % 11 = 0;"
 expect_eq "5.precondition_not_all_visible" "$(allvis_pages vis)" "0"
-run_on "$Q" on                               # hint the updater xmax / new xmin
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"                                  # hint the updater xmax / new xmin
+run_on "$Q"; on_vec=$RESULT
 expect_gt "5.classified_pages"  "$(vf classified)"   "0" "classify path ran"
 expect_gt "5.visible_fast"      "$(vf visible_fast)" "0" "live versions -> fast VISIBLE"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "5.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "5.result_equiv" "$off" "$on_vec"
 
 # ---------------------------------------------------------------------------
 # Concurrency: a second session holds an xact open (pg_sleep) so our snapshot
 # cannot resolve its xid from hints -> the affected tuples are UNDECIDED and go
-# to the oracle. We assert undecided>0 (path proof) AND off==vec==scalar for the
-# SAME concurrent state. Fixtures are FREEZE'd first so only the concurrently
-# touched tuples are on not-all-visible pages.
+# to the oracle. We assert undecided>0 (path proof) AND off==vec for the SAME
+# concurrent state. Fixtures are FREEZE'd first so only the concurrently touched
+# tuples are on not-all-visible pages.
 # ---------------------------------------------------------------------------
 run_under_concurrency() {  # $1 label, $2 bg-sql, $3 expect-undecided-note
   qx "VACUUM (FREEZE, ANALYZE) vis;"
   "${PSQL[@]}" -c "BEGIN; $2 SELECT pg_sleep(14); ROLLBACK;" >/dev/null 2>&1 &
   local bg=$!
   sleep 3                                   # let the bg statement land (uncommitted)
-  local on_vec on_sca off
-  run_on "$Q" on; on_vec=$RESULT
+  local on_vec off
+  run_on "$Q"; on_vec=$RESULT
   expect_gt "${1}.undecided_to_oracle" "$(vf undecided)" "0" "$3"
-  run_on "$Q" off; on_sca=$RESULT
   off=$(run_off "$Q")
-  expect_3eq "${1}.result_equiv" "$off" "$on_vec" "$on_sca"
+  expect_equiv "${1}.result_equiv" "$off" "$on_vec"
   wait "$bg" 2>/dev/null || true
 }
 
@@ -237,11 +226,10 @@ qx "VACUUM (FREEZE, ANALYZE) vis;"
 BG=$!
 sleep 3
 "${PSQL[@]}" -c "UPDATE vis SET b = b + 1 WHERE a % 17 = 0;" >/dev/null 2>&1   # creates the multixact
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"; on_vec=$RESULT
 expect_gt "9.multixact_undecided" "$(vf undecided)" "0" "HEAP_XMAX_IS_MULTI -> UNDECIDED"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "9.result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "9.result_equiv" "$off" "$on_vec"
 wait "$BG" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
@@ -251,18 +239,17 @@ wait "$BG" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 recreate 5000
 qx "DELETE FROM vis WHERE a % 7 = 0;"           # committed deletes
-run_on "$Q" on                                   # hint xmin (survivors) + xmax (deleted)
-run_on "$Q" on                                   # ensure committed-deleted now hinted INVISIBLE-fast
+run_on "$Q"                                      # hint xmin (survivors) + xmax (deleted)
+run_on "$Q"                                      # ensure committed-deleted now hinted INVISIBLE-fast
 "${PSQL[@]}" -c "BEGIN; DELETE FROM vis WHERE a % 5 = 0; SELECT pg_sleep(14); ROLLBACK;" >/dev/null 2>&1 &
 BG=$!
 sleep 3
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"; on_vec=$RESULT
 expect_gt "10.mixed_visible_fast"   "$(vf visible_fast)"   "0" "survivors VISIBLE"
 expect_gt "10.mixed_invisible_fast" "$(vf invisible_fast)" "0" "committed-deleted INVISIBLE"
 expect_gt "10.mixed_undecided"      "$(vf undecided)"      "0" "in-flight delete UNDECIDED"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "10.mixed_result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "10.mixed_result_equiv" "$off" "$on_vec"
 wait "$BG" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
@@ -272,12 +259,11 @@ wait "$BG" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 recreate 200000
 expect_eq "11.precondition_not_all_visible" "$(allvis_pages vis)" "0"
-run_on "$Q" on; on_vec=$RESULT
+run_on "$Q"; on_vec=$RESULT
 expect_gt "11.classified_pages" "$(vf classified)" "0" "classify path ran across blocks"
 expect_eq "11.gathered_all"     "$(vf gathered)"   "200000"
-run_on "$Q" off; on_sca=$RESULT
 off=$(run_off "$Q")
-expect_3eq "11.straddle_result_equiv" "$off" "$on_vec" "$on_sca"
+expect_equiv "11.straddle_result_equiv" "$off" "$on_vec"
 
 qx "DROP TABLE IF EXISTS vis;"
 

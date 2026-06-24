@@ -48,17 +48,11 @@
 /* GUCs */
 bool  pgch_enable_shm_offload = false;
 char *pgch_local_ch_server = NULL;
-int   pgch_shm_ring_depth_k = 4;
-int   pgch_shm_data_region_mb = 64;
 int   pgch_shm_min_rows = 100000;
-bool  pgch_use_vectorized_reader = true;
-bool  pgch_use_columnar_deform = true;
-bool  pgch_use_vectorized_visibility = true;
 bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_stream_workers = 0;
-int   pgch_shm_rows_per_block = 65536;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -629,9 +623,11 @@ pgch_stream_relation_scalar(Relation rel, Snapshot snapshot,
 }
 
 /*
- * Dispatcher: use the vectorized page reader when enabled and the relation /
- * snapshot / projection are eligible; otherwise the scalar path. The choice is
- * made once, before any block is published, so a stream never mixes the two.
+ * Dispatcher: use the vectorized page reader when the relation / snapshot /
+ * projection are eligible; otherwise fall back to the scalar table-AM reader
+ * (e.g. a projected Decimal column, a serializable/recovery snapshot, or a
+ * non-heap table AM -- see pgch_vectorized_reader_eligible). The choice is made
+ * once, before any block is published, so a stream never mixes the two.
  */
 uint64
 pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
@@ -639,8 +635,7 @@ pgch_stream_relation_to_shm(Relation rel, Snapshot snapshot,
                             ShmProducer *producer, size_t rows_per_block,
                             ShmBlockCursor *bcursor, PgchVisStats *out_stats)
 {
-    if (pgch_use_vectorized_reader &&
-        pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
+    if (pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
         return pgch_stream_relation_vectorized(rel, snapshot, cols, ncols,
                                                producer, rows_per_block, bcursor, out_stats);
 
@@ -723,8 +718,8 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
     }
 
     producer = shm_producer_create(shm_name, schema, ncols,
-                                   (uint32_t) pgch_shm_ring_depth_k,
-                                   (size_t) pgch_shm_data_region_mb * 1024 * 1024,
+                                   (uint32_t) PGCH_SHM_RING_DEPTH_K,
+                                   PGCH_SHM_DATA_REGION_BYTES,
                                    CurrentMemoryContext);
 
     /* Stream under the active (query) snapshot for correct MVCC visibility
@@ -757,40 +752,10 @@ pgch_shm_offload_init(void)
                                NULL, &pgch_local_ch_server, "",
                                PGC_USERSET, 0, NULL, NULL, NULL);
 
-    DefineCustomIntVariable("pg_clickhouse.shm_ring_depth_k",
-                            "Number of ring slots in the SHM block stream.",
-                            NULL, &pgch_shm_ring_depth_k, 4, 1, 256,
-                            PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomIntVariable("pg_clickhouse.shm_data_region_mb",
-                            "Size of the SHM data region in MiB.",
-                            NULL, &pgch_shm_data_region_mb, 64, 1, 65536,
-                            PGC_USERSET, 0, NULL, NULL, NULL);
-
     DefineCustomIntVariable("pg_clickhouse.shm_min_rows",
                             "Minimum estimated row count for a scan to be eligible for SHM offload.",
                             NULL, &pgch_shm_min_rows, 100000, 0, INT_MAX,
                             PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomBoolVariable("pg_clickhouse.shm_vectorized_reader",
-                             "Use the page-at-a-time vectorized columnar heap reader for SHM "
-                             "offload (off forces the tuple-at-a-time table-AM scan).",
-                             NULL, &pgch_use_vectorized_reader, true,
-                             PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomBoolVariable("pg_clickhouse.shm_columnar_deform",
-                             "Within the vectorized reader, deform a page's NULL-free tuples "
-                             "column-at-a-time (struct-of-arrays) instead of row-at-a-time.",
-                             NULL, &pgch_use_columnar_deform, true,
-                             PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomBoolVariable("pg_clickhouse.shm_vectorized_visibility",
-                             "Within the vectorized reader, classify a not-all-visible page's "
-                             "tuples with the branch-free struct-of-arrays visibility kernel "
-                             "(off uses the scalar reference classifier). The visible set is "
-                             "identical either way; undecided tuples always use the MVCC oracle.",
-                             NULL, &pgch_use_vectorized_visibility, true,
-                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     DefineCustomBoolVariable("pg_clickhouse.shm_log_stream_stats",
                              "Log the SHM producer's rows, wall time, and CPU time (LOG level) "
@@ -820,14 +785,6 @@ pgch_shm_offload_init(void)
                             "max_parallel_workers); 1 = the original single producer. The effective "
                             "value is also forced as ClickHouse max_threads for the offload query.",
                             NULL, &pgch_shm_stream_workers, 0, 0, PGCH_SHM_MAX_STREAM_WORKERS,
-                            PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomIntVariable("pg_clickhouse.shm_rows_per_block",
-                            "Rows per published SHM block. Larger blocks amortize the consumer's "
-                            "fixed per-block adoption cost (fewer, bigger ClickHouse Chunks) at the "
-                            "cost of more shared memory per ring slot; must fit a slot "
-                            "(shm_data_region_mb / shm_ring_depth_k).",
-                            NULL, &pgch_shm_rows_per_block, 65536, 1024, 1048576,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the

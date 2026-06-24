@@ -16,12 +16,13 @@
  *      ExecutorStart/End hooks maintain the read-only
  *      pg_clickhouse.last_query_used_clickhouse flag (read via SHOW).
  *
- *      Pre-buffering note: a single backend cannot both block publishing into
- *      the ring and block on the ClickHouse result, so the whole (bounded)
- *      input is streamed into the SHM region first, then the query is
- *      dispatched and drained. A size guard fails fast if the relation does not
- *      fit in pg_clickhouse.shm_data_region_mb; unbounded streaming via a
- *      background worker is a follow-up.
+ *      Streaming note: a single backend cannot both block publishing into the
+ *      ring and block on the ClickHouse result, so the heap scan + columnize +
+ *      publish loop runs in cooperating background workers (shm_worker.c) while
+ *      this backend dispatches the query and drains the result. Peak shared
+ *      memory is bounded by the per-worker ring (K slots) regardless of table
+ *      size, so an arbitrarily large relation streams through without
+ *      pre-buffering.
  *
  * Copyright (c) 2025-2026, ClickHouse, Inc.
  *
@@ -703,8 +704,7 @@ shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
     ncols = pgch_build_offload_columns(rel, attnos, &cols);
 
     /* Not eligible for the vectorized reader -> scalar path -> single producer. */
-    if (!pgch_use_vectorized_reader
-        || !pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
+    if (!pgch_vectorized_reader_eligible(rel, snapshot, cols, ncols))
     {
         table_close(rel, AccessShareLock);
         return 1;
@@ -828,10 +828,7 @@ shm_scan_access_mtd(ScanState *ss)
          * on cancel/abort) sees a still-valid handle. */
         old = MemoryContextSwitchTo(sss->batch_cxt);
         sss->worker = pgch_shm_worker_launch(sss->shm_name, sss->heap_relid, sss->attnos,
-                                             estate->es_snapshot,
-                                             pgch_shm_ring_depth_k,
-                                             (size_t) pgch_shm_data_region_mb * 1024 * 1024,
-                                             pgch_shm_rows_per_block, nworkers);
+                                             estate->es_snapshot, nworkers);
         MemoryContextSwitchTo(old);
         pgch_shm_worker_wait_ready(sss->worker);
 

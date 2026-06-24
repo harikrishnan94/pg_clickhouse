@@ -96,12 +96,6 @@ typedef struct ShmWorkerHeader
     Oid         heap_relid;
     int         ncols;
     int         nworkers;            /* number of cooperating streaming workers (W) */
-    int         ring_depth_k;
-    Size        data_region_size;
-    int         rows_per_block;
-    bool        use_vectorized;      /* honor the backend session's shm_vectorized_reader GUC */
-    bool        columnar_deform;     /* honor the backend session's shm_columnar_deform GUC */
-    bool        vectorized_visibility; /* honor the backend session's shm_vectorized_visibility GUC */
     bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
     bool        enable_jit_deform;   /* honor the backend session's enable_jit_deform GUC */
     int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
@@ -142,8 +136,7 @@ struct ShmWorkerHandle
 
 ShmWorkerHandle *
 pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
-                       Snapshot snapshot, int ring_depth_k,
-                       Size data_region_size, int rows_per_block, int nworkers)
+                       Snapshot snapshot, int nworkers)
 {
     ShmWorkerHandle *h;
     dsm_segment    *seg;
@@ -185,14 +178,8 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->heap_relid = heap_relid;
     hdr->ncols = ncols;
     hdr->nworkers = nworkers;
-    hdr->ring_depth_k = ring_depth_k;
-    hdr->data_region_size = data_region_size;
-    hdr->rows_per_block = rows_per_block;
     /* Snapshot the session GUCs here (backend side) so the worker, a fresh
      * bgworker that would otherwise see only the defaults, honors them. */
-    hdr->use_vectorized = pgch_use_vectorized_reader;
-    hdr->columnar_deform = pgch_use_columnar_deform;
-    hdr->vectorized_visibility = pgch_use_vectorized_visibility;
     hdr->log_stream_stats = pgch_log_stream_stats;
     hdr->enable_jit_deform = pgch_enable_jit_deform;
     hdr->jit_row_threshold = pgch_jit_row_threshold;
@@ -476,8 +463,8 @@ pgch_shm_worker_main(Datum main_arg)
          */
         my_shm_name = psprintf("%s_%d", hdr->shm_name, my_index);
         producer = shm_producer_create(my_shm_name, schema, ncols,
-                                       (uint32_t) hdr->ring_depth_k,
-                                       hdr->data_region_size,
+                                       (uint32_t) PGCH_SHM_RING_DEPTH_K,
+                                       PGCH_SHM_DATA_REGION_BYTES,
                                        CurTransactionContext);
 
         /* Abandon the stream (rather than hang) if the originating backend dies
@@ -490,10 +477,7 @@ pgch_shm_worker_main(Datum main_arg)
         pg_atomic_write_u32(&me->state, PGCH_WS_READY);
         SetLatch(&hdr->backend_proc->procLatch);
 
-        /* Apply the backend session's reader choices in this worker. */
-        pgch_use_vectorized_reader = hdr->use_vectorized;
-        pgch_use_columnar_deform = hdr->columnar_deform;
-        pgch_use_vectorized_visibility = hdr->vectorized_visibility;
+        /* Apply the backend session's GUC choices in this worker. */
         pgch_log_stream_stats = hdr->log_stream_stats;
         pgch_enable_jit_deform = hdr->enable_jit_deform;
         pgch_jit_row_threshold = hdr->jit_row_threshold;
@@ -519,7 +503,7 @@ pgch_shm_worker_main(Datum main_arg)
             getrusage(RUSAGE_SELF, &r0);
             w0 = GetCurrentTimestamp();
             rows = pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, bcursor, &vis);
+                                               producer, (size_t) PGCH_SHM_ROWS_PER_BLOCK, bcursor, &vis);
             w1 = GetCurrentTimestamp();
             getrusage(RUSAGE_SELF, &r1);
 
@@ -532,27 +516,26 @@ pgch_shm_worker_main(Datum main_arg)
             elog(LOG,
                  "pg_clickhouse shm stream: reader=%s rows=" UINT64_FORMAT
                  " wall=%.1fms cpu=%.1fms producer_throughput=%.2f Mrows/s(cpu)",
-                 hdr->use_vectorized ? "vectorized" : "scalar", rows, wall_ms, cpu_ms,
+                 vis.used_vectorized ? "vectorized" : "scalar", rows, wall_ms, cpu_ms,
                  cpu_ms > 0 ? (double) rows / cpu_ms / 1000.0 : 0.0);
 
             /* Visibility-path breakdown: lets a test prove which path ran (a
              * result match alone never proves the classifier/oracle executed).
              * Only meaningful for the vectorized page reader. */
-            if (hdr->use_vectorized)
+            if (vis.used_vectorized)
                 elog(LOG,
-                     "pg_clickhouse shm visibility: vis_engine=%s pages=" UINT64_FORMAT
+                     "pg_clickhouse shm visibility: pages=" UINT64_FORMAT
                      " all_visible=" UINT64_FORMAT " classified=" UINT64_FORMAT
                      " gathered=" UINT64_FORMAT " visible_fast=" UINT64_FORMAT
                      " invisible_fast=" UINT64_FORMAT " undecided=" UINT64_FORMAT
                      " slow_visible=" UINT64_FORMAT,
-                     vis.vectorized ? "vectorized" : "scalar",
                      vis.pages_total, vis.pages_all_visible, vis.pages_classified,
                      vis.tuples_gathered, vis.n_visible_fast, vis.n_invisible_fast,
                      vis.n_undecided, vis.n_slow_visible);
         }
         else
             (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,
-                                               producer, (size_t) hdr->rows_per_block, bcursor, NULL);
+                                               producer, (size_t) PGCH_SHM_ROWS_PER_BLOCK, bcursor, NULL);
 
         /*
          * This worker streamed its share into its OWN ring; signal end-of-stream
