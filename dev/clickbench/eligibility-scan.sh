@@ -116,23 +116,28 @@ for q in "${QUERIES[@]}"; do
     # socket early (Code 210 broken pipe) still PROVES the heavy fragment ran in
     # CH (Q18). Capture it as a cancelled-but-adopted offload.
     cxl_blk=0
+    qtype="QueryFinish"
     if [ "${strmd_q:-0}" -lt 1 ] 2>/dev/null; then
         cxl_blk=$(chq "SELECT sum(ProfileEvents['ShmAdoptedBlocks']) FROM system.query_log
                        WHERE log_comment='$tag' AND type='ExceptionWhileProcessing'
                          AND positionCaseInsensitive(query,'streamed_table')>0
                          AND positionCaseInsensitive(query,'query_log')=0")
         cxl_blk=${cxl_blk:-0}
+        # When the only streamed_table evidence is a client-cancelled (Code 210)
+        # row, read its metrics/SQL from the Exception row so the table is
+        # self-consistent (Q18).
+        [ "${cxl_blk:-0}" -ge 1 ] 2>/dev/null && qtype="ExceptionWhileProcessing"
     fi
     read_rows=$(chq "SELECT sum(read_rows) FROM system.query_log
-                   WHERE log_comment='$tag' AND type='QueryFinish'
+                   WHERE log_comment='$tag' AND type='$qtype'
                      AND positionCaseInsensitive(query,'streamed_table')>0
                      AND positionCaseInsensitive(query,'query_log')=0")
     shm_blocks=$(chq "SELECT sum(ProfileEvents['ShmAdoptedBlocks']) FROM system.query_log
-                   WHERE log_comment='$tag' AND type='QueryFinish'
+                   WHERE log_comment='$tag' AND type='$qtype'
                      AND positionCaseInsensitive(query,'streamed_table')>0
                      AND positionCaseInsensitive(query,'query_log')=0")
     chq "SELECT replaceRegexpAll(query,'\\\\s+',' ') FROM system.query_log
-         WHERE log_comment='$tag' AND type='QueryFinish'
+         WHERE log_comment='$tag' AND type='$qtype'
            AND positionCaseInsensitive(query,'streamed_table')>0
            AND positionCaseInsensitive(query,'query_log')=0
          ORDER BY event_time_microseconds DESC LIMIT 5" > "$OUT/q${q}.chsql.txt"

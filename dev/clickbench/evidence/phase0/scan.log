@@ -1,91 +1,91 @@
 === Phase-0 ClickBench eligibility scan: db=clickbench  CH=http://127.0.0.1:21002  out=/home/ubuntu/pg_clickhouse/dev/clickbench/evidence/phase0 ===
 Q1  none       fid=exact    shmscan=0 strmd=0 blk=0 rows=1/1 pg_agg=2 pg_sort=0 ch[g=no o=no l=no] dist=- 
-Q2  fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
-Q3  fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
-Q4  fully      fid=float!   shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- col0 rel=1 abs=2.5131e+18
-Q5  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=count(DISTINCT) 
-Q6  fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=count(DISTINCT) 
-Q7  fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
-Q8  fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=8/8 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q9  fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
+Q2  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
+Q3  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
+Q4  fully      fid=float!   shmscan=1 strmd=1 blk=163 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- col0 rel=1 abs=2.5131e+18
+Q5  fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=count(DISTINCT) 
+Q6  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=count(DISTINCT) 
+Q7  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
+Q8  fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=8/8 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q9  fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
 Q10 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
-Q11 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
-Q12 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
+Q11 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
+Q12 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
 Q13 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q14 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
-Q15 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q16 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q17 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q18 fully(cxl) fid=DIFF     shmscan=1 strmd=0 blk=0 rows=10/10 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- col1 off='' on='мебели калугуст 28 протокондициноним петро форма'
+Q14 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
+Q15 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q16 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q17 fully      fid=exact    shmscan=1 strmd=1 blk=161 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q18 fully(cxl) fid=DIFF     shmscan=1 strmd=0 blk=162 rows=10/10 pg_agg=0 pg_sort=0 ch[g=yes o=no l=no] dist=- col1 off='админивэна в материи бесплатно в хорошем к' on='смотреть онлайн'
 Q19 none       fid=exact    shmscan=0 strmd=0 blk=0 rows=10/10 pg_agg=1 pg_sort=1 ch[g=no o=no l=no] dist=- 
-Q20 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=0/0 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- both-empty
-Q21 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
-Q22 fully      fid=DIFF     shmscan=1 strmd=1 blk=161 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col0 off='в август 247 грустимошка на кристрат' on='банкоматериалы смотреть'
+Q20 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=0/0 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- both-empty
+Q21 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
+Q22 fully      fid=DIFF     shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col0 off='в август 247 грустимошка на кристрат' on='банкоматериалы смотреть'
 Q23 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=count(DISTINCT) 
 Q24 none       fid=exact    shmscan=0 strmd=0 blk=0 rows=10/10 pg_agg=0 pg_sort=1 ch[g=no o=no l=no] dist=- 
 Q25 none       fid=exact    shmscan=0 strmd=0 blk=0 rows=10/10 pg_agg=0 pg_sort=1 ch[g=no o=no l=no] dist=- 
-Q26 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=no o=no l=no] dist=- 
+Q26 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=no o=no l=no] dist=- 
 Q27 none       fid=exact    shmscan=0 strmd=0 blk=0 rows=10/10 pg_agg=0 pg_sort=1 ch[g=no o=no l=no] dist=- 
 Q28 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=12/12 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
 Q29 fully      fid=approx   shmscan=1 strmd=1 blk=166 rows=15/15 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col2 off=223329 on=223307 relerr=9.851e-05
-Q30 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
+Q30 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=1/1 pg_agg=0 pg_sort=0 ch[g=no o=no l=no] dist=- 
 Q31 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q32 fully      fid=approx   shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col1 off=-1549901295 on=2062179971 relerr=1.752
-Q33 fully      fid=approx   shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col1 off=1121341007 on=-999897621 relerr=1.892
+Q32 fully      fid=approx   shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col1 off=-1549901295 on=1727387074 relerr=1.897
+Q33 fully      fid=approx   shmscan=1 strmd=1 blk=161 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col1 off=2090333595 on=-2069566517 relerr=1.99
 Q34 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q35 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q36 fully      fid=exact    shmscan=1 strmd=1 blk=164 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q37 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q35 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q36 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
+Q37 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
 Q38 fully      fid=exact    shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- 
-Q39 fully      fid=DIFF     shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col0 off='http://3dnews/741' on='http%3A//union/vacancy/instvo.ru/download'
-Q40 fully      fid=DIFF     shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col4 off='http://irr.ru/index.php?showalbum/login-rent/option_objects/bank/sberbank.ru/5' on='http://irr.ru/index.php?showalbum/logabass.ru/cation&op_category_id=0&saledParams%3Drhost'
-Q41 fully      fid=approx   shmscan=1 strmd=1 blk=163 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col0 off=-1285046671250476833 on=1387759335351574242 relerr=1.926
-Q42 fully      fid=exact    shmscan=1 strmd=1 blk=163 rows=0/0 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- both-empty
+Q39 fully      fid=DIFF     shmscan=1 strmd=1 blk=161 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col0 off='http://3dnews/741' on='http%3A//union/vacancy/instvo.ru/download'
+Q40 fully      fid=DIFF     shmscan=1 strmd=1 blk=162 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- col4 off='http://irr.ru/index.php?showalbum/login-rent/option_objects/bank/sberbank.ru/5' on='http://irr.ru/index.php?showalbum/login-9649.html_params%3Drhost%3Dad.adriver.ru'
+Q41 fully      fid=approx   shmscan=1 strmd=1 blk=161 rows=10/10 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- int col0 off=5588583429439052564 on=3756346524397046411 relerr=0.3279
+Q42 fully      fid=exact    shmscan=1 strmd=1 blk=161 rows=0/0 pg_agg=0 pg_sort=1 ch[g=yes o=no l=no] dist=- both-empty
 Q43 none       fid=exact    shmscan=0 strmd=0 blk=0 rows=10/10 pg_agg=1 pg_sort=1 ch[g=no o=no l=no] dist=- 
 
 === SUMMARY (/home/ubuntu/pg_clickhouse/dev/clickbench/evidence/phase0/SUMMARY.md) ===
 | Q | verdict | fidelity | shmscan | strmd | ShmBlk | read_rows | pg_agg | pg_sort | pg_lim | ch_grpby | ch_ord | ch_lim | ch_distinct | rows off/on |
 |--:|---------|----------|--------:|------:|-------:|----------:|-------:|--------:|-------:|:--------:|:------:|:------:|:-----------:|------------|
 | 1 | none | exact | 0 | 0 | 0 | 0 | 2 | 0 | 0 | no | no | no | - | 1/1 |
-| 2 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
-| 3 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
-| 4 | fully | float! | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
-| 5 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | count(DISTINCT) | 1/1 |
-| 6 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 0 | 0 | no | no | no | count(DISTINCT) | 1/1 |
-| 7 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
-| 8 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 1 | 0 | yes | no | no | - | 8/8 |
-| 9 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
+| 2 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 3 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 4 | fully | float! | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 5 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | count(DISTINCT) | 1/1 |
+| 6 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | count(DISTINCT) | 1/1 |
+| 7 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 8 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 0 | yes | no | no | - | 8/8 |
+| 9 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
 | 10 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
-| 11 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
-| 12 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
+| 11 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
+| 12 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
 | 13 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 14 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
-| 15 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 16 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 17 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 18 | fully(cxl) | DIFF | 1 | 0 | 0 | 0 | 0 | 0 | 1 | no | no | no | - | 10/10 |
+| 14 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
+| 15 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 16 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 17 | fully | exact | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 18 | fully(cxl) | DIFF | 1 | 0 | 162 | 10000000 | 0 | 0 | 1 | yes | no | no | - | 10/10 |
 | 19 | none | exact | 0 | 0 | 0 | 0 | 1 | 1 | 1 | no | no | no | - | 10/10 |
-| 20 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | - | 0/0 |
-| 21 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
-| 22 | fully | DIFF | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 20 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 0/0 |
+| 21 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 22 | fully | DIFF | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
 | 23 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | count(DISTINCT) | 10/10 |
 | 24 | none | exact | 0 | 0 | 0 | 0 | 0 | 1 | 1 | no | no | no | - | 10/10 |
 | 25 | none | exact | 0 | 0 | 0 | 0 | 0 | 1 | 1 | no | no | no | - | 10/10 |
-| 26 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | no | no | no | - | 10/10 |
+| 26 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | no | no | no | - | 10/10 |
 | 27 | none | exact | 0 | 0 | 0 | 0 | 0 | 1 | 1 | no | no | no | - | 10/10 |
 | 28 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 12/12 |
 | 29 | fully | approx | 1 | 1 | 166 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 15/15 |
-| 30 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
+| 30 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 0 | 0 | no | no | no | - | 1/1 |
 | 31 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
 | 32 | fully | approx | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 33 | fully | approx | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 33 | fully | approx | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
 | 34 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 35 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 36 | fully | exact | 1 | 1 | 164 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 37 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 35 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 36 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 37 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
 | 38 | fully | exact | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 39 | fully | DIFF | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 40 | fully | DIFF | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 41 | fully | approx | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
-| 42 | fully | exact | 1 | 1 | 163 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 0/0 |
+| 39 | fully | DIFF | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 40 | fully | DIFF | 1 | 1 | 162 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 41 | fully | approx | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 10/10 |
+| 42 | fully | exact | 1 | 1 | 161 | 10000000 | 0 | 1 | 1 | yes | no | no | - | 0/0 |
 | 43 | none | exact | 0 | 0 | 0 | 0 | 1 | 1 | 1 | no | no | no | - | 10/10 |

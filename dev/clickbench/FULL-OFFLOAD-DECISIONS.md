@@ -96,8 +96,10 @@ col)`. ClickHouse's `count_distinct_implementation` setting **defaults to
 `uniqExact`** (exact), so the offloaded result is **bit-exact** to PostgreSQL — NOT
 approximate HyperLogLog. Measured exact for **every** ClickBench count(DISTINCT)
 query: Q5, Q6, Q9, Q10, Q11, Q12, Q14, Q23 all `fidelity=exact` vs native (incl.
-the tiebroken top-N variants). Independent re-derivation: Q5
-`count(DISTINCT UserID)` native vs offload both `2037258` (0 abs/rel error).
+the tiebroken top-N variants). Independent re-derivation (confirmed by the
+adversarial review): Q5 `count(DISTINCT UserID)` native == offload == CH
+`uniqExact` == CH `count(DISTINCT)` all `1530334` (0 abs/rel error); Q6
+`count(DISTINCT SearchPhrase)` all `835093`.
 
 **Decision.** **Accept as-is.** No deparse change, no fidelity deviation. This is
 the single biggest fidelity trap called out in the spec, and it is a non-issue

@@ -118,7 +118,9 @@ Comparison is offload-ON vs native (offload-OFF), numeric-aware and tie-robust.
 
 **Independent re-derivations** (≥2 sources, per the evidence standard):
 - **count(DISTINCT) exact:** (1) `cmp_results.py` → `exact|0|0` for all 8; (2)
-  manual `count(DISTINCT UserID)` native `2037258` == offload `2037258`.
+  manual `count(DISTINCT UserID)` native `1530334` == offload `1530334` == CH
+  `uniqExact`/`count(DISTINCT)` `1530334`; `count(DISTINCT SearchPhrase)` all
+  `835093` (independently confirmed by adversarial review).
 - **Q4 avg overflow:** (1) native `2513100748938099884` vs offload
   `-653315757734.87`; (2) CH-direct `avg(UserID)` = `-653315757734.87` (same wrong
   value — a CH `avg(Int64)` property, reproduced off the offload path), while
