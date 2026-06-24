@@ -1,0 +1,26 @@
+Sort
+  Output: supplier.s_name, supplier.s_address
+  Sort Key: supplier.s_name
+  ->  Hash Right Semi Join
+        Output: supplier.s_name, supplier.s_address
+        Hash Cond: (partsupp.ps_suppkey = supplier.s_suppkey)
+        ->  Hash Join
+              Output: partsupp.ps_suppkey
+              Inner Unique: true
+              Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+              ->  Custom Scan (ClickHouseShmScan) on pg.partsupp
+                    Output: partsupp.ps_partkey, partsupp.ps_suppkey
+                    Filter: ((partsupp.ps_availqty)::numeric > (SubPlan 1))
+                    SubPlan 1
+                      ->  Aggregate
+                            Output: (0.5 * sum(lineitem.l_quantity))
+                            ->  Custom Scan (ClickHouseShmScan) on pg.lineitem
+                                  Output: lineitem.l_quantity
+              ->  Hash
+                    Output: part.p_partkey
+                    ->  Custom Scan (ClickHouseShmScan) on pg.part
+                          Output: part.p_partkey
+        ->  Hash
+              Output: supplier.s_name, supplier.s_address, supplier.s_suppkey
+              ->  Custom Scan (ClickHouseShmScan)
+                    Output: supplier.s_name, supplier.s_address, supplier.s_suppkey

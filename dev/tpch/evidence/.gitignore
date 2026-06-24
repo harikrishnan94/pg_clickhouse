@@ -1,0 +1,5 @@
+# Bulky, regenerable raw result dumps (regenerate via dev/tpch/eligibility-scan.sh).
+# Keep the diagnostic artifacts that prove the mechanism: SUMMARY.md, *.plan.txt,
+# *.chsql.txt, *.err.
+*.out
+*.sorted

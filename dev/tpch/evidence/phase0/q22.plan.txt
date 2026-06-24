@@ -1,0 +1,23 @@
+Limit
+  Output: (SUBSTRING(customer.c_phone FROM 1 FOR 2)), (count(*)), (sum(customer.c_acctbal))
+  InitPlan 1
+    ->  Aggregate
+          Output: avg(customer_1.c_acctbal)
+          ->  Custom Scan (ClickHouseShmScan) on pg.customer customer_1
+                Output: customer_1.c_acctbal
+  ->  GroupAggregate
+        Output: (SUBSTRING(customer.c_phone FROM 1 FOR 2)), count(*), sum(customer.c_acctbal)
+        Group Key: (SUBSTRING(customer.c_phone FROM 1 FOR 2))
+        ->  Sort
+              Output: (SUBSTRING(customer.c_phone FROM 1 FOR 2)), customer.c_acctbal
+              Sort Key: (SUBSTRING(customer.c_phone FROM 1 FOR 2))
+              ->  Hash Right Anti Join
+                    Output: SUBSTRING(customer.c_phone FROM 1 FOR 2), customer.c_acctbal
+                    Inner Unique: true
+                    Hash Cond: (orders.o_custkey = customer.c_custkey)
+                    ->  Custom Scan (ClickHouseShmScan) on pg.orders
+                          Output: orders.o_custkey
+                    ->  Hash
+                          Output: customer.c_phone, customer.c_acctbal, customer.c_custkey
+                          ->  Custom Scan (ClickHouseShmScan) on pg.customer
+                                Output: customer.c_phone, customer.c_acctbal, customer.c_custkey

@@ -1,0 +1,10 @@
+GroupAggregate
+  Output: nation.n_name, (EXTRACT(year FROM orders.o_orderdate)), sum(((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) - (partsupp.ps_supplycost * lineitem.l_quantity)))
+  Group Key: nation.n_name, (EXTRACT(year FROM orders.o_orderdate))
+  ->  Sort
+        Output: nation.n_name, (EXTRACT(year FROM orders.o_orderdate)), lineitem.l_extendedprice, lineitem.l_discount, partsupp.ps_supplycost, lineitem.l_quantity
+        Sort Key: nation.n_name, (EXTRACT(year FROM orders.o_orderdate)) DESC
+        ->  Result
+              Output: nation.n_name, EXTRACT(year FROM orders.o_orderdate), lineitem.l_extendedprice, lineitem.l_discount, partsupp.ps_supplycost, lineitem.l_quantity
+              ->  Custom Scan (ClickHouseShmScan)
+                    Output: lineitem.l_extendedprice, lineitem.l_discount, lineitem.l_quantity, partsupp.ps_supplycost, orders.o_orderdate, nation.n_name

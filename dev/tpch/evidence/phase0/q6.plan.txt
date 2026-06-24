@@ -1,0 +1,4 @@
+Aggregate
+  Output: sum((l_extendedprice * l_discount))
+  ->  Custom Scan (ClickHouseShmScan) on pg.lineitem
+        Output: l_extendedprice, l_discount

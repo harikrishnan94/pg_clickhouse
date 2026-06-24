@@ -1,0 +1,15 @@
+Limit
+  Output: supplier.s_acctbal, supplier.s_name, nation.n_name, part.p_partkey, part.p_mfgr, supplier.s_address, supplier.s_phone, supplier.s_comment
+  ->  Sort
+        Output: supplier.s_acctbal, supplier.s_name, nation.n_name, part.p_partkey, part.p_mfgr, supplier.s_address, supplier.s_phone, supplier.s_comment
+        Sort Key: supplier.s_acctbal DESC, nation.n_name, supplier.s_name, part.p_partkey
+        ->  Result
+              Output: supplier.s_acctbal, supplier.s_name, nation.n_name, part.p_partkey, part.p_mfgr, supplier.s_address, supplier.s_phone, supplier.s_comment
+              ->  Custom Scan (ClickHouseShmScan)
+                    Output: part.p_partkey, part.p_mfgr, supplier.s_acctbal, supplier.s_name, supplier.s_address, supplier.s_phone, supplier.s_comment, nation.n_name
+                    Filter: (partsupp.ps_supplycost = (SubPlan 1))
+                    SubPlan 1
+                      ->  Aggregate
+                            Output: min(partsupp_1.ps_supplycost)
+                            ->  Custom Scan (ClickHouseShmScan)
+                                  Output: partsupp_1.ps_supplycost

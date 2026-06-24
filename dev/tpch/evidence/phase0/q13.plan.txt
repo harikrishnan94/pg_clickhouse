@@ -1,0 +1,13 @@
+Sort
+  Output: c_orders.c_count, (count(*))
+  Sort Key: (count(*)) DESC, c_orders.c_count DESC
+  ->  GroupAggregate
+        Output: c_orders.c_count, count(*)
+        Group Key: c_orders.c_count
+        ->  Sort
+              Output: c_orders.c_count
+              Sort Key: c_orders.c_count DESC
+              ->  Subquery Scan on c_orders
+                    Output: c_orders.c_count
+                    ->  Custom Scan (ClickHouseShmScan)
+                          Output: c_custkey, (count(o_orderkey))

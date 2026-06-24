@@ -1,0 +1,21 @@
+Limit
+  Output: supplier.s_name, (count(*))
+  ->  Sort
+        Output: supplier.s_name, (count(*))
+        Sort Key: (count(*)) DESC, supplier.s_name
+        ->  GroupAggregate
+              Output: supplier.s_name, count(*)
+              Group Key: supplier.s_name
+              ->  Sort
+                    Output: supplier.s_name
+                    Sort Key: supplier.s_name
+                    ->  Hash Right Anti Join
+                          Output: supplier.s_name
+                          Hash Cond: (l3.l_orderkey = l1.l_orderkey)
+                          Join Filter: (l3.l_suppkey <> l1.l_suppkey)
+                          ->  Custom Scan (ClickHouseShmScan) on pg.lineitem l3
+                                Output: l3.l_orderkey, l3.l_suppkey
+                          ->  Hash
+                                Output: supplier.s_name, l1.l_suppkey, l1.l_orderkey
+                                ->  Custom Scan (ClickHouseShmScan)
+                                      Output: supplier.s_name, l1.l_suppkey, l1.l_orderkey

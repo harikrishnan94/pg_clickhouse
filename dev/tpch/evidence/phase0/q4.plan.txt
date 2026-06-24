@@ -1,0 +1,5 @@
+Sort
+  Output: orders.o_orderpriority, (count(*))
+  Sort Key: orders.o_orderpriority
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: orders.o_orderpriority, (count(*))

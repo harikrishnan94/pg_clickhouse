@@ -1,0 +1,23 @@
+Sort
+  Output: part.p_brand, part.p_type, part.p_size, (count(DISTINCT partsupp.ps_suppkey))
+  Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+  ->  GroupAggregate
+        Output: part.p_brand, part.p_type, part.p_size, count(DISTINCT partsupp.ps_suppkey)
+        Group Key: part.p_brand, part.p_type, part.p_size
+        ->  Sort
+              Output: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+              Sort Key: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+              ->  Hash Join
+                    Output: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+                    Inner Unique: true
+                    Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+                    ->  Custom Scan (ClickHouseShmScan) on pg.partsupp
+                          Output: partsupp.ps_suppkey, partsupp.ps_partkey
+                          Filter: (NOT (ANY (partsupp.ps_suppkey = (hashed SubPlan 1).col1)))
+                          SubPlan 1
+                            ->  Custom Scan (ClickHouseShmScan) on pg.supplier
+                                  Output: supplier.s_suppkey
+                    ->  Hash
+                          Output: part.p_brand, part.p_type, part.p_size, part.p_partkey
+                          ->  Custom Scan (ClickHouseShmScan) on pg.part
+                                Output: part.p_brand, part.p_type, part.p_size, part.p_partkey

@@ -1,0 +1,10 @@
+Aggregate
+  Output: (sum(lineitem.l_extendedprice) / 7.0)
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: lineitem.l_extendedprice
+        Filter: (lineitem.l_quantity < (SubPlan 1))
+        SubPlan 1
+          ->  Aggregate
+                Output: (0.2 * avg(lineitem_1.l_quantity))
+                ->  Custom Scan (ClickHouseShmScan) on pg.lineitem lineitem_1
+                      Output: lineitem_1.l_quantity
