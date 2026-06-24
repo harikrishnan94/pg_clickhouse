@@ -90,10 +90,43 @@ fix is Phase 2 — next, not deferred.
 - **correlated-subquery param unbound (Phase 4):** Q22.
 - **anti-join rejected `fdw.c:1865` (Phase 4):** Q16 (NOT IN), Q21, Q22 (NOT EXISTS).
 
+## D0003 — 2026-06-24 — Phase 1: single-table Decimal/numeric aggregate output unlocked
+
+**Change.** `src/shm_customscan.c` `shm_create_upper_paths`: the NUMERICOID-output
+decline is now gated to **join inputs only** (`!ifpinfo->is_heap_offload`). A
+single-table aggregate over a heap-offload base relation now pushes its numeric
+`sum`/`avg`/`min`/`max` output to ClickHouse. Unlocks **Q1, Q6** to fully offload
+(oracle-proven: Q1 CH SQL carries `sum×4, avg×3, count(*) GROUP BY`,
+read_rows=59986052, ShmAdoptedBlocks=927, PG plan `Sort → CustomScan` with no
+residual aggregate; Q6 likewise). Aggregate-over-join numeric output stays
+declined until the Phase-2 ClickHouse join fix.
+
+**Regression test.** `test/shm/verify_offload.sh` previously asserted byte
+identity; the pushed Decimal aggregates legitimately differ in display scale and
+`avg`→Float64. Added `check_result_equiv`/`rows_equiv`: exact match else
+numeric value-equivalence within a 1e-9 relative tolerance, **printing the
+observed max deviation** so it is never hidden. Suite is green: 137 PASS / 0 FAIL
+(was 131/6).
+
+**No code change needed for read-back**: `char_to_datum`→`numeric_in` is driven by
+the PG output tuple descriptor, so a numeric output column always parses CH's
+text (Decimal or Float64) correctly; finite values never fail.
+
 ## Intentional fidelity deviations (bounded, quantified)
 
-_(none yet — populated as coverage is unlocked; each entry: query, column, max abs
-error, max rel error, root cause, why bounded)_
+| # | query/col | engine diff | max abs err | max rel err | bound / cause |
+|---|-----------|-------------|-------------|-------------|---------------|
+| F1 | Q1 `sum_qty,sum_base_price,sum_disc_price,sum_charge` (SF10) | CH Decimal sum vs PG numeric sum | 0 | 0 | exact; only display-scale trailing zeros (`377518399` vs `377518399.00`), equal as numeric |
+| F2 | Q1 `count_order` (SF10) | count → Int | 0 | 0 | exact |
+| F3 | Q1 `avg_qty,avg_price,avg_disc` (SF10) | CH `avg(Decimal)`→Float64 vs PG exact numeric | avg_price 6e-12 | **1.57e-16** | Float64 round-off; ≤ machine epsilon (~2.2e-16). Per fidelity policy: bounded, intentional. Measured `dev/tpch/evidence/phase1/`. |
+| F4 | Q6 `revenue` (SF10) | CH Decimal sum | 0 | 0 | exact (`1230113636.0101` both) |
+
+**Root cause of F3.** ClickHouse `avg()` over a Decimal returns Float64 (it does
+not keep Decimal accumulation), so the mean carries ~15–16 significant digits vs
+PostgreSQL's exact numeric. This is the explicitly-allowed Decimal→Float64
+deviation. It could be removed by deparsing `avg(x)` over a Decimal as
+`sum(x)/count(x)` (both exact Decimal) — deferred unless a consumer needs exact
+`avg`; recorded so the option is on the table.
 
 ---
 

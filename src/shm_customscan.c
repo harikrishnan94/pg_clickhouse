@@ -518,17 +518,29 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
     }
 
     /*
-     * Decimal aggregates: keep the math in PostgreSQL for bit-identical results.
-     * A pushed aggregate that RETURNS a numeric value is not reproducible across
-     * the two engines -- ClickHouse formats a Decimal without PostgreSQL's
-     * display-scale trailing zeros (e.g. "0.5" vs "0.50") and avg() over a
-     * Decimal yields Float64. So decline the grouped push-down whenever any
-     * output column is numeric: the base scan still offloads (ClickHouse adopts
-     * the Decimal columns zero-copy and read_rows still covers the whole table)
-     * and PostgreSQL computes the exact decimal aggregate over the streamed rows.
-     * Non-numeric outputs (count, integer/float aggregates, and HAVING-only
-     * decimal comparisons that return a bool) are unaffected and still push down.
+     * Decimal/numeric aggregate output.
+     *
+     * SINGLE-TABLE aggregate (input is a heap-offload base relation): push the
+     * whole scan+filter+aggregate fragment to ClickHouse even when output columns
+     * are numeric. ClickHouse computes sum/min/max over a Decimal AS a Decimal
+     * (parsed back exactly by numeric_in, modulo PostgreSQL display-scale trailing
+     * zeros -- e.g. "0.5" vs "0.50" -- which compare equal as numeric values), and
+     * avg() over a Decimal as Float64 (a bounded, documented fidelity deviation;
+     * see dev/tpch/FULL-OFFLOAD-DECISIONS.md). This is what unlocks the sum/avg
+     * revenue queries (Q1, Q6, ...) to fully offload. The result read-back path
+     * (char_to_datum -> numeric_in, driven by the PG output tuple descriptor)
+     * accepts any finite decimal/float text ClickHouse emits.
+     *
+     * AGGREGATE OVER A JOIN: still decline numeric output. The ClickHouse
+     * join-squashing path currently mishandles zero-copy adopted columns
+     * (SimpleSquashingTransform -> reserve() on an adopted column => Code 164
+     * READONLY, or a silently-empty join when filters swallow the exception), so
+     * pushing the aggregate over a join would compute over wrong/empty input.
+     * Until that consumer bug is fixed (Phase 2), keep the numeric aggregate in
+     * PostgreSQL. Non-numeric outputs (count, integer/float aggregates, HAVING-only
+     * decimal comparisons returning bool) push down in both cases.
      */
+    if (!ifpinfo->is_heap_offload)
     {
         ListCell *lc;
 

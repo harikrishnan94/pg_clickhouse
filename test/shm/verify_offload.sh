@@ -4,8 +4,12 @@
 #
 # For every query in the matrix this script proves, from ClickHouse's OWN system
 # tables (not the PostgreSQL plan), that the query was offloaded:
-#   1. Correctness: the result with pg_clickhouse.enable_shm_offload = on is
-#      byte-identical to the result with it off.
+#   1. Correctness: the result with pg_clickhouse.enable_shm_offload = on equals
+#      the result with it off -- byte-identical for everything except pushed-down
+#      Decimal/numeric aggregates, where it is value-equivalent within a bounded
+#      tolerance (CH Decimal display scale, and avg()->Float64 within ~1 ulp; see
+#      check_result_equiv and dev/tpch/FULL-OFFLOAD-DECISIONS.md). The observed
+#      deviation is printed, never hidden.
 #   2. Push-down happened: running the query with offload on adds exactly one new
 #      `streamed_table(...)` entry to ClickHouse system.query_log, and that entry
 #      adopted >= 1 block from shared memory (ProfileEvents['ShmAdoptedBlocks'])
@@ -47,6 +51,55 @@ ch_count_streamed() {
 }
 ch_latest() {  # field of the most-recent genuine streamed_table QueryFinish
     chq "SELECT $1 FROM system.query_log WHERE $CH_FILTER ORDER BY event_time_microseconds DESC LIMIT 1"
+}
+
+# Compare two pipe-separated multi-row result sets for VALUE equivalence rather
+# than byte identity. Non-numeric fields must match exactly; numeric fields are
+# compared as numbers within a relative tolerance. This is required for the
+# Decimal/numeric aggregate tests once the whole aggregate is pushed to
+# ClickHouse: CH prints a Decimal at its value scale (e.g. "0.5", "-250.5")
+# whereas PostgreSQL prints the column's declared display scale ("0.50",
+# "-250.500000") -- numerically identical -- and avg() over a Decimal returns
+# Float64, which matches PostgreSQL's exact numeric to within ~1 ulp. These are
+# bounded, DOCUMENTED fidelity deviations (dev/tpch/FULL-OFFLOAD-DECISIONS.md),
+# not bugs. The comparator prints the max relative deviation it observed, so the
+# deviation stays VISIBLE and a real error (row/col mismatch, text diff, or a
+# numeric diff above tolerance) still fails. Default tolerance 1e-9 sits ~7
+# orders of magnitude above Float64 epsilon yet far below any real agg error.
+rows_equiv() {  # <baseline> <result> [reltol]; exit 0 + prints "OK maxrel=..." if equivalent
+    python3 - "$1" "$2" "${3:-1e-9}" <<'PY'
+import sys
+from decimal import Decimal, InvalidOperation
+base, res, tol = sys.argv[1], sys.argv[2], Decimal(sys.argv[3])
+b=[l for l in base.split("\n") if l!=""]; r=[l for l in res.split("\n") if l!=""]
+if len(b)!=len(r): print("ROWMISMATCH %d vs %d"%(len(b),len(r))); sys.exit(1)
+maxrel=Decimal(0)
+for lb,lr in zip(b,r):
+    fb=lb.split("|"); fr=lr.split("|")
+    if len(fb)!=len(fr): print("COLMISMATCH %d vs %d"%(len(fb),len(fr))); sys.exit(1)
+    for a,c in zip(fb,fr):
+        if a==c: continue
+        try: da,dc=Decimal(a),Decimal(c)
+        except InvalidOperation: print("TEXTDIFF %r != %r"%(a,c)); sys.exit(1)
+        if da==dc: continue
+        rel=abs(da-dc)/abs(da) if da!=0 else abs(dc)
+        if rel>maxrel: maxrel=rel
+        if rel>tol: print("NUMDIFF rel=%.2e %r != %r"%(float(rel),a,c)); sys.exit(1)
+print("OK maxrel=%.2e"%float(maxrel)); sys.exit(0)
+PY
+}
+
+# result == baseline by value: exact byte match, else numeric-equivalent (bounded
+# Decimal/Float64 deviation). Emits the deviation so it is never hidden.
+check_result_equiv() {  # <name> <baseline> <result>
+    local name="$1" baseline="$2" result="$3" eq
+    if [ "$result" = "$baseline" ]; then
+        ok "$name: offload result == baseline (exact)"
+    elif eq=$(rows_equiv "$baseline" "$result"); then
+        ok "$name: offload result == baseline by value ($eq; bounded Decimal/Float64 deviation)"
+    else
+        bad "$name: result mismatch ($(rows_equiv "$baseline" "$result" 2>&1 | head -1))"
+    fi
 }
 
 # ------------------------------------------------------------------ ClickHouse
@@ -210,7 +263,7 @@ verify_offload() {
     say "    CH executed : $chsql"
     say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks  (streamed_table queries: $before -> $after)"
 
-    [ "$result" = "$baseline" ] && ok "$name: offload result == baseline" || bad "$name: result mismatch"
+    check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
         && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query in system.query_log"
     [ "${shm_blocks:-0}" -ge 1 ] 2>/dev/null \
@@ -278,7 +331,7 @@ verify_big() {
     say "    CH executed : $chsql"
     say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
 
-    [ "$result" = "$baseline" ] && ok "$name: offload result == baseline" || bad "$name: result mismatch"
+    check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
         && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query"
     [ "${shm_blocks:-0}" -ge "$min_blocks" ] 2>/dev/null \
@@ -313,7 +366,7 @@ verify_join() {
     say "    CH executed : $chsql"
     say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
 
-    [ "$result" = "$baseline" ] && ok "$name: offload result == baseline" || bad "$name: result mismatch"
+    check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
         && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query"
     { echo "$chsql" | grep -qi 'join'; } \
