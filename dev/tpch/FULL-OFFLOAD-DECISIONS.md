@@ -99,10 +99,16 @@ which trips `SHM_PRODUCER_STALL` at 30s. Root-caused as a genuine multi-ring
 `streamed_table` JOIN-build consumption deadlock — **independently of** the
 READONLY fix, `max_threads` (tested `total_producers+16`; no change), `final`, and
 `group_by_use_nulls` (all ruled out by experiment). It is a deeper ClickHouse
-pipeline/`PollableShmSource` scheduling issue (the join build over a UNION-ALL of
-per-ring sources adopts one block then waits on a source whose producer is blocked
-on a ring the consumer never drains). A fix needs CH-side pipeline work and is
-deferred. Evidence: `dev/tpch/evidence/phase0/q{9,14}.on.err`, live probes showing
+pipeline/`PollableShmSource` scheduling issue: the hash-join **build** side adopts
+one block then waits on a source whose producer is blocked on a ring the consumer
+never drains. **Additionally ruled out: it is NOT the UNION-ALL multi-ring** — Q14
+with `parallel_workers=1` per table (a bare
+`streamed_table(lineitem) JOIN streamed_table(part)`, one ring each, no UNION ALL)
+still freezes (read_rows stuck at 262144 on the part build side). So it is a
+fundamental 2-source `streamed_table` hash-join-build deadlock for this shape,
+while 3–6-way joins (Q3, Q5, Q7, Q10) work — i.e. shape-specific, not arity. A fix
+needs CH-side pipeline work (the build-side `PollableShmSource` consumption /
+hash-join build scheduling) and is deferred. Evidence: `dev/tpch/evidence/phase0/q{9,14}.on.err`, live probes showing
 frozen read_rows.
 
 **Trade-off decision (logged).** Q8 and Q11 were scan_only-CORRECT after Phase 2
