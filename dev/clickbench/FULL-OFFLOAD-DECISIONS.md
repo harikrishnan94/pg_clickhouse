@@ -127,6 +127,20 @@ Q4 hits this at ClickBench scale (every other `avg()` is over `ResolutionWidth`
 SMALLINT or `length(...)`, whose sums stay well within range). Until fixed, Q4 is
 logged as **offloaded-but-WRONG**, not accepted.
 
+**RESOLVED (Phase 2).** `src/deparse.c` `deparseAggref`: when `node->aggfnoid ==
+F_AVG_INT8` (i.e. `avg(bigint)`), the argument is wrapped `avg(toFloat64(<arg>))`.
+Scoped to int8 only — `avg(int2/int4)` sums stay far inside Int64 even at 100M
+rows, so those remain **bit-exact** (verified: `avg(ResolutionWidth)` native ==
+offload == `1508.8046441`, unchanged). After the fix Q4 native
+`2513100748938099884` vs offload `≈2513100748938099700` (the low digits are
+Float64-rounding noise; summation-order-dependent): **max abs err ≈ 184–1900, max
+rel err ≈ 6.1e-16 — Float64 epsilon**, the accepted avg()→Float64 deviation.
+Independent: dispatched CH SQL is `avg(toFloat64(userid))`. Q4 reclassified from
+**offloaded-WRONG** to **offloaded + bounded avg→Float64** (logged in the ledger).
+Perf W=8: 1.29×. The comparator labels it `approx` (the avg result prints without
+a decimal point, so its column reads as integer-valued); the deviation is the
+avg→Float64 rounding, not an integer-count approximation — disambiguated here.
+
 ---
 
 ## D0006 — 2026-06-25 — Top-N tie-boundary reshuffle is a benign, documented deviation

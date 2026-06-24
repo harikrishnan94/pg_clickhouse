@@ -4388,6 +4388,18 @@ deparseAggref(Aggref* node, deparse_expr_cxt* context) {
             bool signMultiply =
                 (context->func && (context->func->cf_type == CF_SIGN_AVG ||
                                    context->func->cf_type == CF_SIGN_SUM));
+            /*
+             * avg(bigint) fidelity: ClickHouse `avg(Int64)` accumulates the
+             * numerator in a fixed Int64 and OVERFLOWS over a full-range Int64
+             * column (e.g. ClickBench Q4 `AVG(UserID)`: 10M values up to ~9.2e18
+             * overflow -> a wrong, sign-flipped result). PostgreSQL `avg(bigint)`
+             * sums in arbitrary-precision numeric. Cast the argument to Float64 so
+             * ClickHouse accumulates in Float64 (no overflow), matching native to
+             * ~1e-15 relative -- the spec's accepted avg()->Float64 deviation.
+             * Scoped to int8 only: avg(int2/int4) sums stay far inside Int64 even
+             * at 100M rows, so those remain bit-exact (no needless Float64 error).
+             */
+            bool avg_int8_to_float = (node->aggfnoid == F_AVG_INT8);
 
             /* Add all the arguments */
             if (sign_count_filter) {
@@ -4417,6 +4429,10 @@ deparseAggref(Aggref* node, deparse_expr_cxt* context) {
                         /* Convert variadic array to list of arguments. */
                         Assert(nodeTag(n) == T_ArrayExpr);
                         deparseArrayList((ArrayExpr*)n, context);
+                    } else if (avg_int8_to_float) {
+                        appendStringInfoString(buf, "toFloat64(");
+                        deparseExpr((Expr*)n, context);
+                        appendStringInfoChar(buf, ')');
                     } else {
                         deparseExpr((Expr*)n, context);
                     }
