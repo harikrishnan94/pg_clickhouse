@@ -146,6 +146,7 @@ struct ShmProducer {
     pthread_t   pump_thread;
     bool        pump_running;
     volatile sig_atomic_t pump_stop;
+    int         pump_stop_fd;   /* eventfd; cleanup writes it to wake the pump out of poll() at once */
 
     MemoryContext owner_cxt;
     MemoryContextCallback cleanup_cb;
@@ -313,13 +314,34 @@ pump_thread_main(void *arg)
 
     while (!p->pump_stop)
     {
-        struct pollfd pfd;
+        struct pollfd pfd[2];
+        nfds_t        nfds = 0;
+        int           listen_idx;
+        int           stop_idx = -1;
 
-        pfd.fd = p->listen_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN))
-            pump_control_socket(p);
+        pfd[nfds].fd = p->listen_fd;
+        pfd[nfds].events = POLLIN;
+        pfd[nfds].revents = 0;
+        listen_idx = (int) nfds++;
+        if (p->pump_stop_fd >= 0)
+        {
+            pfd[nfds].fd = p->pump_stop_fd;
+            pfd[nfds].events = POLLIN;
+            pfd[nfds].revents = 0;
+            stop_idx = (int) nfds++;
+        }
+
+        /* The 50ms timeout still bounds the parked-connection prune cadence; the
+         * stop eventfd makes teardown wake the thread immediately regardless. */
+        if (poll(pfd, nfds, 50) > 0)
+        {
+            if (stop_idx >= 0 && (pfd[stop_idx].revents & POLLIN))
+                break;                              /* teardown asked us to stop */
+            if (pfd[listen_idx].revents & POLLIN)
+                pump_control_socket(p);
+            else
+                prune_parked_conns(p);
+        }
         else
             prune_parked_conns(p);
     }
@@ -347,6 +369,16 @@ producer_cleanup(ShmProducer *p)
     if (p->pump_running)
     {
         p->pump_stop = 1;
+        /* Wake the pump out of poll() at once; otherwise it sleeps up to the poll
+         * timeout before noticing pump_stop, and that latency lands on the query's
+         * critical path via the backend's WaitForBackgroundWorkerShutdown. */
+        if (p->pump_stop_fd >= 0)
+        {
+            uint64_t one = 1;
+            ssize_t  wr;
+
+            do { wr = write(p->pump_stop_fd, &one, sizeof(one)); } while (wr < 0 && errno == EINTR);
+        }
         pthread_join(p->pump_thread, NULL);
         p->pump_running = false;
     }
@@ -357,6 +389,7 @@ producer_cleanup(ShmProducer *p)
 
     if (p->listen_fd >= 0) { close(p->listen_fd); p->listen_fd = -1; }
     if (p->event_fd >= 0)  { close(p->event_fd);  p->event_fd = -1; }
+    if (p->pump_stop_fd >= 0) { close(p->pump_stop_fd); p->pump_stop_fd = -1; }
     if (p->mapping && p->mapping != MAP_FAILED)
     {
         munmap(p->mapping, p->mapping_size);
@@ -391,6 +424,7 @@ shm_producer_create(const char *name,
     int i;
 
     p->shm_fd = p->event_fd = p->listen_fd = -1;
+    p->pump_stop_fd = -1;
     p->mapping = NULL;
     p->owner_cxt = owner_cxt;
 
@@ -512,8 +546,15 @@ shm_producer_create(const char *name,
     if (listen(p->listen_fd, 16) < 0)
         ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: listen() failed: %m")));
 
-    /* Start the socket-pump thread (serves the readiness eventfd to consumers). */
+    /* Start the socket-pump thread (serves the readiness eventfd to consumers).
+     * The stop eventfd lets teardown wake the thread out of poll() immediately
+     * rather than waiting up to one poll timeout -- otherwise ~half the poll
+     * interval is added to every query's worker-reap on the critical path. */
     p->pump_stop = 0;
+    p->pump_stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (p->pump_stop_fd < 0)
+        ereport(ERROR, (errcode_for_file_access(),
+                        errmsg("pg_clickhouse: eventfd() failed for control-socket pump: %m")));
     if (pthread_create(&p->pump_thread, NULL, pump_thread_main, p) != 0)
         ereport(ERROR, (errmsg("pg_clickhouse: could not start SHM control-socket pump thread")));
     p->pump_running = true;
