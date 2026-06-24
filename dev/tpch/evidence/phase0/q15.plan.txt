@@ -1,27 +1,16 @@
 Sort
-  Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_phone, revenue0.total_revenue
+  Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_phone, (sum((l_extendedprice * ('1'::numeric - l_discount))))
   Sort Key: supplier.s_suppkey
   InitPlan 1
     ->  Aggregate
-          Output: max((sum((lineitem_1.l_extendedprice * ('1'::numeric - lineitem_1.l_discount)))))
-          ->  HashAggregate
-                Output: lineitem_1.l_suppkey, sum((lineitem_1.l_extendedprice * ('1'::numeric - lineitem_1.l_discount)))
-                Group Key: lineitem_1.l_suppkey
-                ->  Custom Scan (ClickHouseShmScan) on pg.lineitem lineitem_1
-                      Output: lineitem_1.l_suppkey, lineitem_1.l_extendedprice, lineitem_1.l_discount
-  ->  Hash Join
-        Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_phone, revenue0.total_revenue
+          Output: max((sum((l_extendedprice * ('1'::numeric - l_discount)))))
+          ->  Custom Scan (ClickHouseShmScan)
+                Output: l_suppkey, (sum((l_extendedprice * ('1'::numeric - l_discount))))
+  ->  Nested Loop
+        Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_phone, (sum((l_extendedprice * ('1'::numeric - l_discount))))
         Inner Unique: true
-        Hash Cond: (supplier.s_suppkey = revenue0.supplier_no)
-        ->  Custom Scan (ClickHouseShmScan) on pg.supplier
-              Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_phone
-        ->  Hash
-              Output: revenue0.total_revenue, revenue0.supplier_no
-              ->  Subquery Scan on revenue0
-                    Output: revenue0.total_revenue, revenue0.supplier_no
-                    ->  HashAggregate
-                          Output: lineitem.l_suppkey, sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))
-                          Group Key: lineitem.l_suppkey
-                          Filter: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))) = (InitPlan 1).col1)
-                          ->  Custom Scan (ClickHouseShmScan) on pg.lineitem
-                                Output: lineitem.l_suppkey, lineitem.l_extendedprice, lineitem.l_discount
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: l_suppkey, (sum((l_extendedprice * ('1'::numeric - l_discount))))
+        ->  Index Scan using supplier_pkey on pg.supplier
+              Output: supplier.s_suppkey, supplier.s_name, supplier.s_address, supplier.s_nationkey, supplier.s_phone, supplier.s_acctbal, supplier.s_comment
+              Index Cond: (supplier.s_suppkey = l_suppkey)

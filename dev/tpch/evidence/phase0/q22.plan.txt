@@ -1,10 +1,8 @@
 Limit
   Output: (SUBSTRING(customer.c_phone FROM 1 FOR 2)), (count(*)), (sum(customer.c_acctbal))
   InitPlan 1
-    ->  Aggregate
-          Output: avg(customer_1.c_acctbal)
-          ->  Custom Scan (ClickHouseShmScan) on pg.customer customer_1
-                Output: customer_1.c_acctbal
+    ->  Custom Scan (ClickHouseShmScan)
+          Output: (avg(c_acctbal))
   ->  GroupAggregate
         Output: (SUBSTRING(customer.c_phone FROM 1 FOR 2)), count(*), sum(customer.c_acctbal)
         Group Key: (SUBSTRING(customer.c_phone FROM 1 FOR 2))

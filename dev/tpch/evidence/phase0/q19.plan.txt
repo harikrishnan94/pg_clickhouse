@@ -1,4 +1,2 @@
-Aggregate
-  Output: sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))
-  ->  Custom Scan (ClickHouseShmScan)
-        Output: lineitem.l_extendedprice, lineitem.l_discount
+Custom Scan (ClickHouseShmScan)
+  Output: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))))

@@ -1,10 +1,5 @@
 Sort
   Output: nation.n_name, (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))))
   Sort Key: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC
-  ->  HashAggregate
-        Output: nation.n_name, sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))
-        Group Key: nation.n_name
-        ->  Result
-              Output: nation.n_name, lineitem.l_extendedprice, lineitem.l_discount
-              ->  Custom Scan (ClickHouseShmScan)
-                    Output: lineitem.l_extendedprice, lineitem.l_discount, nation.n_name
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: nation.n_name, (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))))

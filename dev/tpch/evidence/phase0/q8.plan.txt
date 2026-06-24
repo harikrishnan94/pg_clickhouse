@@ -1,10 +1,5 @@
 Sort
   Output: (EXTRACT(year FROM orders.o_orderdate)), ((sum(CASE WHEN (n2.n_name = 'BRAZIL'::bpchar) THEN (lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) ELSE '0'::numeric END) / sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))))
   Sort Key: (EXTRACT(year FROM orders.o_orderdate))
-  ->  HashAggregate
-        Output: (EXTRACT(year FROM orders.o_orderdate)), (sum(CASE WHEN (n2.n_name = 'BRAZIL'::bpchar) THEN (lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) ELSE '0'::numeric END) / sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))))
-        Group Key: EXTRACT(year FROM orders.o_orderdate)
-        ->  Result
-              Output: EXTRACT(year FROM orders.o_orderdate), n2.n_name, lineitem.l_extendedprice, lineitem.l_discount
-              ->  Custom Scan (ClickHouseShmScan)
-                    Output: lineitem.l_extendedprice, lineitem.l_discount, orders.o_orderdate, n2.n_name
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: (EXTRACT(year FROM orders.o_orderdate)), ((sum(CASE WHEN (n2.n_name = 'BRAZIL'::bpchar) THEN (lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) ELSE '0'::numeric END) / sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))))

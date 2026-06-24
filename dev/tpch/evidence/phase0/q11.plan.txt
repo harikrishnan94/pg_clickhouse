@@ -2,13 +2,7 @@ Sort
   Output: partsupp.ps_partkey, (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric)))
   Sort Key: (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric))) DESC
   InitPlan 1
-    ->  Aggregate
-          Output: (sum((partsupp_1.ps_supplycost * (partsupp_1.ps_availqty)::numeric)) * 0.0000100000)
-          ->  Custom Scan (ClickHouseShmScan)
-                Output: partsupp_1.ps_supplycost, partsupp_1.ps_availqty
-  ->  HashAggregate
-        Output: partsupp.ps_partkey, sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric))
-        Group Key: partsupp.ps_partkey
-        Filter: (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric)) > (InitPlan 1).col1)
-        ->  Custom Scan (ClickHouseShmScan)
-              Output: partsupp.ps_partkey, partsupp.ps_supplycost, partsupp.ps_availqty
+    ->  Custom Scan (ClickHouseShmScan)
+          Output: ((sum((partsupp_1.ps_supplycost * (partsupp_1.ps_availqty)::numeric)) * 0.0000100000))
+  ->  Custom Scan (ClickHouseShmScan)
+        Output: partsupp.ps_partkey, (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric)))

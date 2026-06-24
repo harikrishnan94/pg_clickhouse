@@ -1,0 +1,1 @@
+ERROR:  pg_clickhouse: rescan of a SHM-offload scan is not supported in phase 1

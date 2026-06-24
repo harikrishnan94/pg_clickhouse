@@ -1,3 +1,28 @@
+=== Phase-0 eligibility scan: db=tpch_sf10  CH=http://127.0.0.1:21002  out=/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase0 ===
+Q1  fully      shmscan=1 strmd=1 blocks=926 rows=4/4 fid=DIFF(8 lines)
+Q2  scan_only? shmscan=2 strmd=0 blocks=0 rows=100/0 fid=ON_ERR
+Q3  fully      shmscan=1 strmd=1 blocks=1194 rows=10/10 fid=DIFF(4 lines)
+Q4  fully      shmscan=1 strmd=1 blocks=1164 rows=5/5 fid=exact
+Q5  fully      shmscan=1 strmd=1 blocks=1199 rows=5/5 fid=exact
+Q6  fully      shmscan=1 strmd=1 blocks=926 rows=1/1 fid=exact
+Q7  fully      shmscan=1 strmd=1 blocks=1200 rows=4/4 fid=exact
+Q8  scan_only? shmscan=1 strmd=0 blocks=0 rows=2/0 fid=ON_ERR
+Q9  scan_only? shmscan=1 strmd=0 blocks=0 rows=175/0 fid=ON_ERR
+Q10 fully      shmscan=1 strmd=1 blocks=1196 rows=381105/381105 fid=DIFF(200846 lines)
+Q11 scan_only? shmscan=2 strmd=0 blocks=0 rows=8685/0 fid=ON_ERR
+Q12 fully      shmscan=1 strmd=1 blocks=1165 rows=2/2 fid=exact
+Q13 scan_only  shmscan=1 strmd=1 blocks=268 rows=46/46 fid=exact
+Q14 scan_only? shmscan=1 strmd=0 blocks=0 rows=1/0 fid=ON_ERR
+Q15 scan_only? shmscan=2 strmd=0 blocks=0 rows=1/0 fid=ON_ERR
+Q16 scan_only? shmscan=3 strmd=0 blocks=0 rows=27840/0 fid=ON_ERR
+Q17 scan_only? shmscan=2 strmd=0 blocks=0 rows=1/0 fid=ON_ERR
+Q18 scan_only  shmscan=1 strmd=1 blocks=926 rows=624/624 fid=exact
+Q19 fully      shmscan=1 strmd=1 blocks=963 rows=1/1 fid=exact
+Q20 scan_only  shmscan=4 strmd=1 blocks=5 rows=1804/0 fid=ON_ERR
+Q21 scan_only? shmscan=2 strmd=0 blocks=0 rows=100/0 fid=ON_ERR
+Q22 scan_only? shmscan=3 strmd=0 blocks=0 rows=7/0 fid=ON_ERR
+
+=== SUMMARY (/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase0/SUMMARY.md) ===
 | Q | verdict | shmscan | strmd_q | ShmBlocks | read_rows | pg_join | pg_agg | ch_join | ch_grpby | rows off/on | fidelity |
 |---|---------|--------:|--------:|----------:|----------:|--------:|-------:|:-------:|:--------:|------------|----------|
 | 1 | fully | 1 | 1 | 926 | 59986052 | 0 | 0 | no | yes | 4/4 | DIFF(8 lines) |
