@@ -3255,7 +3255,22 @@ deparseFuncExpr(FuncExpr* node, deparse_expr_cxt* context) {
                 deparseExpr((Expr*)list_nth(node->args, 1), context);
                 appendStringInfoChar(buf, ')');
             } else {
+                /*
+                 * PostgreSQL's default regex matching is dotall: `.` (and a
+                 * bracket expression) matches newline because newline-sensitive
+                 * matching is OFF by default. ClickHouse's RE2 defaults the other
+                 * way (`.` does NOT match newline). Prepend RE2's dotall flag
+                 * (?s) so an offloaded regexp_replace matches PostgreSQL's newline
+                 * semantics exactly. Without this, a pattern like
+                 * '^https?://(?:www\.)?([^/]+)/.*$' fails on a Referer with an
+                 * embedded newline under RE2 (returns the string unchanged) while
+                 * PG extracts the host -- shifting GROUP BY counts (ClickBench Q29,
+                 * ~1e-4). RE2 `^`/`$` already match PG's default (string anchors,
+                 * not multiline), so only the dotall flag is needed.
+                 */
+                appendStringInfoString(buf, "concat('(?s)', ");
                 deparseExpr((Expr*)list_nth(node->args, 1), context);
+                appendStringInfoChar(buf, ')');
             }
 
             /* Emit the replacement string and finish. */
