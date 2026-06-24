@@ -172,4 +172,11 @@ extern void shm_producer_destroy(ShmProducer *p);
 /* The SHM object name actually used (with a leading '/'). */
 extern const char *shm_producer_shm_name(const ShmProducer *p);
 
+/*
+ * Set the originating backend PID for liveness checks. When set, the producer's
+ * ring-full wait (and drain) abort if that backend dies, so a worker cannot hang
+ * forever after the backend (and thus the ClickHouse consumer) has gone away.
+ */
+extern void shm_producer_set_origin_pid(ShmProducer *p, int pid);
+
 #endif /* PG_CLICKHOUSE_SHM_PRODUCER_H */

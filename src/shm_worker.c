@@ -110,6 +110,7 @@ typedef struct ShmWorkerHeader
     int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
+    int         backend_pid;         /* originating backend PID, for liveness checks */
     Size        attnos_offset;
     Size        snapshot_offset;
     Size        snapshot_len;
@@ -200,6 +201,7 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->jit_row_threshold = pgch_jit_row_threshold;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
+    hdr->backend_pid = MyProcPid;
     hdr->attnos_offset = hdr_sz;
     hdr->snapshot_offset = hdr_sz + attnos_sz;
     hdr->snapshot_len = snap_sz;
@@ -492,6 +494,11 @@ pgch_shm_worker_main(Datum main_arg)
                                            hdr->data_region_size, &coord->publish,
                                            CurTransactionContext);
         }
+
+        /* Abandon the stream (rather than hang) if the originating backend dies
+         * while we are blocked on a full ring -- a dead backend means the
+         * ClickHouse consumer was cancelled and the ring will never drain. */
+        shm_producer_set_origin_pid(producer, hdr->backend_pid);
 
         /* Mark this worker ready. Once every worker is ready the backend dispatches
          * the ClickHouse query (the consumer can attach to the owner's control

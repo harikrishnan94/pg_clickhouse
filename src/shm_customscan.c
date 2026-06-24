@@ -104,6 +104,7 @@ typedef struct ShmScanState {
     AttInMetadata  *attinmeta;
     MemoryContext   batch_cxt;
     MemoryContext   temp_cxt;
+    MemoryContextCallback worker_cb;   /* reaps the workers on query end OR abort */
 } ShmScanState;
 
 static void shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
@@ -558,6 +559,27 @@ shm_create_custom_scan_state(CustomScan *cscan)
     return (Node *) sss;
 }
 
+/*
+ * Reap the streaming workers when the scan's batch context is destroyed. This
+ * fires on BOTH a normal end (EndCustomScan already reaped, so this is a no-op)
+ * AND on transaction abort / query cancel, where EndCustomScan is NOT called --
+ * so a cancelled mid-scan offload never leaves a worker, fd, /dev/shm object, or
+ * control socket behind. The worker handle is allocated in this same context, so
+ * it is still valid when the reset callback runs (callbacks fire before the
+ * context's memory is freed).
+ */
+static void
+shm_worker_cleanup_cb(void *arg)
+{
+    ShmScanState *sss = (ShmScanState *) arg;
+
+    if (sss->worker)
+    {
+        pgch_shm_worker_shutdown(sss->worker);
+        sss->worker = NULL;
+    }
+}
+
 static void
 shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -583,6 +605,13 @@ shm_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
                                            "pg_clickhouse shm scan", ALLOCSET_DEFAULT_SIZES);
     sss->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
                                           "pg_clickhouse shm scan tmp", ALLOCSET_SMALL_SIZES);
+
+    /* Guarantee the workers are reaped even on query cancel / transaction abort,
+     * where EndCustomScan is not called: a reset callback on batch_cxt fires when
+     * the executor tears the context down for any reason. */
+    sss->worker_cb.func = shm_worker_cleanup_cb;
+    sss->worker_cb.arg = sss;
+    MemoryContextRegisterResetCallback(sss->batch_cxt, &sss->worker_cb);
 
     /* The heap scan + columnize + ring publish runs in a background worker
      * (launched on the first ExecCustomScan call, once the query snapshot is
@@ -752,11 +781,15 @@ shm_scan_access_mtd(ScanState *ss)
          *    the SHM producer so the ClickHouse consumer can attach. */
         nworkers = shm_choose_stream_workers(sss->heap_relid, sss->attnos,
                                              estate->es_snapshot);
+        /* Allocate the handle in batch_cxt so the reset-callback reap (which fires
+         * on cancel/abort) sees a still-valid handle. */
+        old = MemoryContextSwitchTo(sss->batch_cxt);
         sss->worker = pgch_shm_worker_launch(sss->shm_name, sss->heap_relid, sss->attnos,
                                              estate->es_snapshot,
                                              pgch_shm_ring_depth_k,
                                              (size_t) pgch_shm_data_region_mb * 1024 * 1024,
                                              65536, nworkers);
+        MemoryContextSwitchTo(old);
         pgch_shm_worker_wait_ready(sss->worker);
 
         /* 2. Dispatch the ClickHouse query; it attaches to the SHM stream and

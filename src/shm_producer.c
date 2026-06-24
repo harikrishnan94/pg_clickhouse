@@ -136,6 +136,14 @@ struct ShmProducer {
     bool        is_owner;        /* owns the SHM object + control socket + pump */
     bool        eos_published;
     bool        cleaned;
+    /*
+     * Originating backend PID (0 = no check). When set, the ring-full wait polls
+     * it so a producer cannot block forever if the backend has died (which
+     * cancels the ClickHouse consumer, so nothing will ever drain the ring) --
+     * the wait then errors out and the worker tears itself down. Query *cancel*
+     * (backend still alive) is handled separately by the backend reaping workers.
+     */
+    int         origin_pid;
 
     int         parked_conns[MAX_PARKED_CONNS];
     int         n_parked;
@@ -214,6 +222,17 @@ static char *
 data_region(ShmProducer *p)
 {
     return (char *) p->mapping + hs_of(p)->data_region_offset;
+}
+
+#include <signal.h>             /* kill() for backend-liveness checks */
+
+/* True if a configured originating backend has gone away (so the ClickHouse
+ * consumer has been cancelled and the ring will never drain again). kill(pid, 0)
+ * probes existence; ESRCH means the process is gone. */
+static inline bool
+origin_backend_dead(ShmProducer *p)
+{
+    return p->origin_pid > 0 && kill((pid_t) p->origin_pid, 0) < 0 && errno == ESRCH;
 }
 
 /* /tmp/clickhouse_shm_<sanitized>.sock — must match ClickHouse
@@ -724,6 +743,12 @@ shm_producer_shm_name(const ShmProducer *p)
     return p->shm_name;
 }
 
+void
+shm_producer_set_origin_pid(ShmProducer *p, int pid)
+{
+    p->origin_pid = pid;
+}
+
 /* --------------------------------------------------------------------- */
 /* Publish */
 /* --------------------------------------------------------------------- */
@@ -766,6 +791,10 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         /* The pump thread services the control socket; just wait for the
          * consumer to free a slot (honouring query cancel). */
         CHECK_FOR_INTERRUPTS();
+        if (origin_backend_dead(p))
+            ereport(ERROR,
+                    (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                            "abandoning SHM stream", p->origin_pid)));
         pg_usleep(1000L);       /* 1 ms */
     }
 
@@ -933,6 +962,10 @@ shm_producer_destroy(ShmProducer *p)
         if (all_empty)
             break;
         if (++spins > 60000)    /* ~60s cap */
+            break;
+        /* If the backend has gone, the consumer was cancelled and will never
+         * release its retains -- stop waiting and reclaim immediately. */
+        if (origin_backend_dead(p))
             break;
         CHECK_FOR_INTERRUPTS();
         pg_usleep(1000L);
