@@ -345,3 +345,45 @@ If a future workload sums a full-range int8 column, the fix mirrors Phase 2: dep
 `sum(int8)` → `sum(toInt128(col))` (Int128 accumulator: 10M×9.2e18 = 9.2e25 ≪ Int128
 max 1.7e38 → exact, and PG `sum(bigint)`→numeric matches). Not implemented now to
 avoid out-of-scope risk; flagged so it is not forgotten.
+
+---
+
+## D0015 — 2026-06-25 — Phase 3: top-N (ORDER BY/LIMIT/OFFSET) pushdown ATTEMPTED, REVERTED
+
+**What.** Tried to push ORDER BY + LIMIT + OFFSET into the dispatched ClickHouse
+SQL for the SHM offload (so CH returns only the top-k grouped rows instead of
+streaming the whole grouped result for PG to Sort+Limit). Added UPPERREL_ORDERED /
+UPPERREL_FINAL CustomPath creation in `shm_customscan.c` (mirroring the FDW's
+`add_foreign_ordered_paths`/`add_foreign_final_paths`), with the ordered/final
+fpinfo a shallow copy of the grouped fpinfo, and passed pathkeys/has_final_sort/
+has_limit to the deparser.
+
+**Result: the deparse was CORRECT but the execution was WRONG — reverted.** The
+dispatched CH SQL was verified right (e.g. Q43 `... GROUP BY (toStartOfMinute(
+eventtime)) ORDER BY count(*) DESC NULLS FIRST, ... LIMIT 10 OFFSET 1000`, and the
+PG plan correctly collapsed to `Custom Scan` with no residual Sort, no double-apply
+Limit). **But the ordered/final CustomScan returned 0 rows** (even a trivial
+`GROUP BY AdvEngineID ORDER BY c DESC LIMIT 5` returned empty, while native
+returned 5; CH logged a Code-210 broken pipe — PG closed the read early). Results
+were also **intermittent** (10 rows once, 0 rows on repeat), a signature of state
+corruption from the shallow `memcpy` of `CHFdwRelationInfo` (it shares List
+pointers — grouped_tlist/remote_conds — with the grouped rel's fpinfo, which the
+planner/executor can mutate). The bug is in the CustomScan result read-back / plan
+tuple-descriptor setup for the new upper rels, not the deparse.
+
+**Decision: revert** (`git checkout` of `src/shm_customscan.c`; deparse.c untouched).
+Per the spec, a perf optimization must never produce a wrong/empty answer; coverage
+is already 42/43 without it. Top-N therefore **stays in PostgreSQL** above the
+offloaded GROUP BY — which is **correct** (CH computes the exact grouped result,
+PG Sorts+Limits it). The only cost is perf: for high-cardinality GROUP BYs (Q16
+UserID, Q34/35 URL, Q31-33) and cheap-filter projections (Q25), CH streams the full
+grouped/filtered relation back instead of k rows (Q25 measured 0.57× — offload
+slower). All top-N queries remain **fully offloaded** by the coverage oracle (the
+GROUP BY/aggregate heavy fragment runs in CH; the residual PG Sort/Limit does not
+demote `fully`, D0003).
+
+**To finish later (not in scope now):** the correct fix is (a) a deep-copy (or
+fresh) fpinfo for the ordered/final rel rather than a shared shallow copy, and
+(b) correct CustomScan `custom_scan_tlist` / output-tlist wiring for the
+ordered/final upper rel so the executor reads the bounded CH result. Worth
+revisiting as a dedicated perf effort with executor-level gating.
