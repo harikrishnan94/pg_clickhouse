@@ -723,6 +723,54 @@ overflow:
                            slot_pos, p->per_slot_capacity)));
 }
 
+/*
+ * Usable per-slot data-region capacity in bytes (the budget a single published
+ * block's payload must fit within). The columnizer uses this to size byte-bounded
+ * blocks so a wide projection never trips publish_block's overflow.
+ */
+size_t
+shm_producer_slot_capacity(const ShmProducer *p)
+{
+    return p->per_slot_capacity;
+}
+
+/*
+ * Bytes a block of `row_count` rows would occupy in a slot, given each column's
+ * staged string-chars length in `string_lens[i]` (ignored for fixed-width
+ * columns; pass 0). MUST mirror publish_block's slot layout exactly (per-column
+ * alignment, SIMD padding, and the per-string offsets sentinel) so the columnizer
+ * can publish a short block before the next sub-batch would overflow the slot.
+ */
+size_t
+shm_producer_block_footprint(const ShmProducer *p, const size_t *string_lens,
+                             size_t row_count)
+{
+    size_t cursor = p->per_slot_payload_offset;
+    int    i;
+
+    for (i = 0; i < p->n_columns; i++)
+    {
+        ShmWireType wire = p->schema[i].wire;
+
+        if (wire == SHM_WIRE_STRING)
+        {
+            size_t chars_bytes = string_lens ? string_lens[i] : 0;
+            size_t offs_bytes = row_count * sizeof(uint64_t);
+
+            cursor = align_up(cursor, 8) + chars_bytes + SHM_PADDING_FOR_SIMD;  /* chars */
+            cursor = align_up(cursor, 8) + sizeof(uint64_t);                    /* sentinel */
+            cursor = align_up(cursor, 8) + offs_bytes + SHM_PADDING_FOR_SIMD;   /* offsets */
+        }
+        else
+        {
+            size_t elem = shm_wire_fixed_width_size(wire);
+
+            cursor = align_up(cursor, elem > 8 ? elem : 8) + row_count * elem + SHM_PADDING_FOR_SIMD;
+        }
+    }
+    return cursor;
+}
+
 void
 shm_producer_publish(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
                      size_t row_count)

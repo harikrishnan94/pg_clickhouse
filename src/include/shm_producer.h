@@ -118,6 +118,18 @@ extern void shm_producer_publish(ShmProducer *p,
 extern void shm_producer_signal_eos(ShmProducer *p);
 
 /*
+ * Slot sizing helpers for byte-bounded blocks. shm_producer_slot_capacity returns
+ * the usable per-slot byte budget; shm_producer_block_footprint returns the bytes a
+ * block of `row_count` rows would occupy given each string column's staged chars
+ * length in string_lens[] (0 for fixed columns). The columnizer publishes a short
+ * block before the next sub-batch would push the footprint past the capacity, so a
+ * wide projection no longer trips publish_block's per-slot overflow ERROR.
+ */
+extern size_t shm_producer_slot_capacity(const ShmProducer *p);
+extern size_t shm_producer_block_footprint(const ShmProducer *p,
+                                           const size_t *string_lens, size_t row_count);
+
+/*
  * Block (cooperatively) until every published slot's retain_refcount is back
  * to zero, then unmap, close fds, and unlink the SHM object and socket. Safe to
  * call more than once. Also invoked automatically by the owner-context cleanup

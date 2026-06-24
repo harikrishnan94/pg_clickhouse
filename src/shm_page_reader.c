@@ -463,16 +463,17 @@ pgch_vectorized_reader_eligible(Relation rel, Snapshot snapshot,
     if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
         return false;
 
+    /*
+     * Decimals (numeric -> ClickHouse Decimal) are eligible: they are varlena in
+     * the heap but their wire form is fixed-width, deformed by the FILL_DECIMAL
+     * kernel (varlena-positioned, fixed-filled) the same way as the other wires.
+     * Making them eligible also lifts shm_choose_stream_workers's W=1 fail-close,
+     * so a decimal scan fans out W-way like the float64 path.
+     */
     tupdesc = RelationGetDescr(rel);
     for (c = 0; c < ncols; c++)
     {
-        ShmWireType        w = cols[c].wire;
         Form_pg_attribute  att;
-
-        /* Decimals stay on the scalar producer (separate Decimal-over-SHM
-         * blocker); the deform is otherwise byte-identical. */
-        if (w == SHM_WIRE_DECIMAL32 || w == SHM_WIRE_DECIMAL64 || w == SHM_WIRE_DECIMAL128)
-            return false;
 
         /* A fast-default (ALTER TABLE ADD COLUMN ... DEFAULT) leaves older
          * tuples physically short; the value comes from attmissingval, which
@@ -527,15 +528,23 @@ pgch_build_deform_desc(Relation rel, ShmColumnizer *cz, const ShmOffloadColumn *
         col[i].disp = 0;
         if (cix >= 0)
         {
-            col[i].wire = cols[cix].wire;
-            col[i].is_string = (cols[cix].wire == SHM_WIRE_STRING);
+            ShmWireType w = cols[cix].wire;
+
+            col[i].wire = w;
+            col[i].is_string = (w == SHM_WIRE_STRING);
+            col[i].is_decimal = (w == SHM_WIRE_DECIMAL32 || w == SHM_WIRE_DECIMAL64 ||
+                                 w == SHM_WIRE_DECIMAL128);
+            col[i].dec_scale = (uint8) cols[cix].scale;
             col[i].col_index = cix;
+            /* Fixed-width output buffer for fixed AND decimal cols; strings stage
+             * separately. (A decimal is varlena-positioned but fixed-filled.) */
             col[i].dst_base = col[i].is_string ? NULL : pgch_columnizer_fixed_base(cz, cix);
         }
         else
         {
             col[i].wire = SHM_WIRE_STRING;     /* unused */
             col[i].is_string = false;
+            col[i].is_decimal = false;
             col[i].col_index = -1;
             col[i].dst_base = NULL;
         }
@@ -845,6 +854,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
             else
                 pgch_columnar_deform_run(&plan_a, cur_simple + done, NULL, (size_t) navail,
                                          dst, cz, pgch_str_fill_cb);
+            /* Resolve any deferred decimal faults before the block is published. */
+            pgch_columnizer_resolve_dec_faults(cz);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }
@@ -869,6 +880,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
             else
                 pgch_columnar_deform_run(&plan_b, cur_simple, bits, (size_t) navail,
                                          dst, cz, pgch_str_fill_cb);
+            /* Resolve any deferred decimal faults before the block is published. */
+            pgch_columnizer_resolve_dec_faults(cz);
             pgch_columnizer_advance(cz, (size_t) navail);
             done += navail;
         }

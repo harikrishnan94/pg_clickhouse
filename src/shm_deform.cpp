@@ -42,9 +42,23 @@ extern "C"
 }
 
 #include "shm_deform.h"
+#include "shm_numeric.h"        /* pgch_numeric_to_decimal_wire_core (shared C/C++ converter) */
 
 namespace
 {
+
+/* Wire width in bytes for a Decimal wire tag (4 / 8 / 16). */
+static inline uint32
+dec_width_of(ShmWireType w)
+{
+    switch (w)
+    {
+        case SHM_WIRE_DECIMAL32:  return 4;
+        case SHM_WIRE_DECIMAL64:  return 8;
+        case SHM_WIRE_DECIMAL128: return 16;
+        default:                  return 0;
+    }
+}
 
 /* Alignment-safe typed load; lowers to a single load under -O2. */
 template <typename T>
@@ -215,6 +229,44 @@ k_fill_string(const PgchStep *st, char **cur, const bits8 **,
     sf(cz, st->col_index, dst_row, cur, n);
     for (size_t r = 0; r < n; ++r)
         cur[r] += VARSIZE_ANY(cur[r]);
+}
+
+/*
+ * FILL_DECIMAL: a projected heap numeric (varlena, attlen = -1) whose ClickHouse
+ * wire form is a fixed-width Decimal (4/8/16). Positioned exactly like a string
+ * (align only for a 4-byte header; advance past each datum by VARSIZE_ANY), but
+ * converted inline into the column's fixed dst_base via the shared, allocation-free
+ * core converter. A value it cannot convert in place (stored NaN/Inf, compressed/
+ * external, or out of range) is recorded as a deferred fault (resolved on the C
+ * side before the block is published) and a zero placeholder is written; the
+ * common case never leaves this kernel.
+ */
+static void
+k_fill_decimal(const PgchStep *st, char **cur, const bits8 **,
+               size_t n, size_t dst_row, void *cz, PgchStringFill)
+{
+    uint8  al    = st->align;
+    uint32 scale = st->dec_scale;
+    uint32 width = st->dec_width;
+    char  *base  = (char *) st->dst_base;
+
+    for (size_t r = 0; r < n; ++r)
+    {
+        char *c = cur[r];
+        if (!VARATT_NOT_PAD_BYTE(c))               /* 4-byte-header form must align */
+            c = (char *) TYPEALIGN(al, (uintptr_t) c);
+        cur[r] = c;
+
+        char       *dst = base + (dst_row + r) * width;
+        PgchDecConv rc = pgch_numeric_to_decimal_wire_core(c, scale, width, dst);
+        if (rc != PGCH_DECCONV_OK)
+        {
+            __builtin_memset(dst, 0, width);
+            pgch_columnizer_note_dec_fault(cz, dst, c, scale, width,
+                                           st->col_index, (int) rc);
+        }
+        cur[r] = c + VARSIZE_ANY(c);
+    }
 }
 
 /*
@@ -409,7 +461,7 @@ tail_fixed_run(const PgchDeformCol *col, int max_attno, int start, bool nullable
     uint32              off = 0;
     int                 j;
 
-    if (!first->is_needed || first->is_string || first->attlen <= 0)
+    if (!first->is_needed || first->is_string || first->is_decimal || first->attlen <= 0)
         return false;
 
     ba = align_bytes(first->attalign);
@@ -418,7 +470,7 @@ tail_fixed_run(const PgchDeformCol *col, int max_attno, int start, bool nullable
         const PgchDeformCol *c = &col[j];
         uint8               a;
 
-        if (c->attlen <= 0 || c->is_string)
+        if (c->attlen <= 0 || c->is_string || c->is_decimal)
             break;
         if (nullable_group && c->nullable && !c->is_needed)
             break;
@@ -576,6 +628,18 @@ build_plan(const PgchDeformDesc *d, int prefix_len, uint32 walk_start_off,
                 s->align = align_bytes(c->attalign);
                 s->col_index = c->col_index;
                 s->dst_base = nullptr; s->disp = 0; s->hops = nullptr; s->nhop = 0;
+            }
+            else if (c->is_decimal)
+            {
+                /* Varlena-positioned like a string, but filled fixed-width inline. */
+                s->kind = PGCH_STEP_FILL_DECIMAL;
+                s->run = k_fill_decimal;
+                s->align = align_bytes(c->attalign);
+                s->col_index = c->col_index;
+                s->dst_base = c->dst_base;
+                s->dec_scale = c->dec_scale;
+                s->dec_width = (uint8) dec_width_of(c->wire);
+                s->disp = 0; s->hops = nullptr; s->nhop = 0;
             }
             else
             {

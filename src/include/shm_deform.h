@@ -49,10 +49,13 @@ typedef struct PgchDeformCol
     bool        nullable;     /* !attnotnull (a non-projected col may be NULL) */
     bool        is_needed;    /* projected column? */
     bool        is_string;    /* wire == SHM_WIRE_STRING */
+    bool        is_decimal;   /* wire in {DECIMAL32,DECIMAL64,DECIMAL128}: a varlena
+                               * (heap numeric) whose wire form is fixed-width */
     ShmWireType wire;         /* fixed-width fill dispatch */
     int         col_index;    /* columnizer column index (fill / str_fill); -1 if !is_needed */
-    void       *dst_base;     /* ColBuf.fixed for fixed projected cols; NULL otherwise */
+    void       *dst_base;     /* ColBuf.fixed for fixed (incl. decimal) projected cols; NULL for strings */
     uint32      disp;         /* constant no-NULL-layout byte offset (prefix cols) */
+    uint8       dec_scale;    /* decimal column scale S (digits after the point) */
 } PgchDeformCol;
 
 /*
@@ -113,7 +116,8 @@ typedef enum PgchStepKind
     PGCH_STEP_WALK = 1,
     PGCH_STEP_FILL_CONST,
     PGCH_STEP_FILL_WALK,
-    PGCH_STEP_FILL_STRING
+    PGCH_STEP_FILL_STRING,
+    PGCH_STEP_FILL_DECIMAL      /* varlena-positioned, fixed-width filled (numeric) */
 } PgchStepKind;
 
 struct PgchStep
@@ -123,7 +127,9 @@ struct PgchStep
     void           *dst_base;   /* fixed-fill target (ColBuf.fixed) */
     int             col_index;  /* columnizer column (string fill) */
     uint8           kind;       /* PgchStepKind, for diagnostics / test harness dumps */
-    uint8           align;      /* string-fill alignment, or WALK final fixed-run alignment */
+    uint8           align;      /* string/decimal-fill alignment, or WALK final fixed-run alignment */
+    uint8           dec_scale;  /* FILL_DECIMAL: column scale S */
+    uint8           dec_width;  /* FILL_DECIMAL: wire width in bytes (4/8/16) */
     const PgchHop  *hops;       /* WALK: hop list (into the caller's hop buffer) */
     int             nhop;
 };
@@ -154,6 +160,22 @@ extern void pgch_columnar_deform_run(const PgchDeformPlan *plan,
                                      char **cur, const bits8 **bits,
                                      size_t n, size_t dst_row,
                                      void *cz, PgchStringFill str_fill);
+
+/*
+ * Decimal-fill fault channel (C side, in shm_offload.c). The allocation-free C++
+ * FILL_DECIMAL kernel cannot raise or detoast, so on a value it cannot convert
+ * inline (a stored NaN/Inf, a compressed/external numeric, or an out-of-range
+ * magnitude) it records the offending value via pgch_columnizer_note_dec_fault and
+ * writes a zero placeholder. After each sub-batch (before the columnizer advances,
+ * so faults are resolved before the block is published) the reader calls
+ * pgch_columnizer_resolve_dec_faults, which detoasts + converts toasted values into
+ * their slot and ereports the clean diagnostic for NaN/Inf / overflow. `status` is
+ * a PgchDecConv value.
+ */
+extern void pgch_columnizer_note_dec_fault(void *cz, char *dst, const char *valptr,
+                                           uint32 scale, uint32 width, int col_index,
+                                           int status);
+extern void pgch_columnizer_resolve_dec_faults(void *cz);
 
 #ifdef __cplusplus
 }

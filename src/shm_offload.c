@@ -38,6 +38,7 @@
 #include "utils/snapmgr.h"
 
 #include "shm_deform.h"          /* PGCH_DATE_EPOCH_DIFF (shared with the C++ deform TU) */
+#include "shm_numeric.h"         /* pgch_numeric_to_decimal_wire_core */
 #include "shm_offload.h"
 #include "shm_page_reader.h"
 #include "shm_producer.h"
@@ -192,24 +193,20 @@ typedef struct ColBuf {
     uint64_t    *offsets;       /* rows_per_block end-offsets */
 } ColBuf;
 
+#ifdef USE_ASSERT_CHECKING
 /*
- * Convert a PostgreSQL numeric Datum to a ClickHouse Decimal wire value: the
- * unscaled integer round(value * 10^scale) as a two's-complement signed
- * little-endian integer of `width` bytes (4/8/16 for Decimal32/64/128), written
- * to `out`. Fails closed (raises ERROR) on NaN/Infinity and on any magnitude
- * that does not fit the signed `width` range — which, for a column typed
- * numeric(P, S) whose wire width was chosen from P, means a value outside the
- * declared precision. A value already stored in a numeric(P, S) column is always
- * representable, so this never wrongly rejects valid stored data.
- *
- * The conversion goes through `numeric_out` (exact decimal text), so the result
- * is bit-exact: no float intermediate. The text is parsed digit-by-digit into a
- * 256-bit magnitude (ample headroom for the <=38-digit values we accept), then
- * range-checked and folded into the requested width.
+ * Reference (oracle) numeric -> Decimal-wire converter, compiled only in
+ * assertion builds. This is the former text-based encoder, retained verbatim as
+ * an INDEPENDENT cross-check of the fast limb-walk converter: it goes through
+ * `numeric_out` (exact decimal text) and accumulates the unscaled integer
+ * digit-by-digit into a 256-bit magnitude, by a wholly different code path from
+ * pgch_numeric_to_decimal_wire_core. numeric_to_decimal_wire Asserts the two
+ * agree byte-for-byte on every converted value (mirrors the visibility
+ * classifier's reference oracle). Raises on NaN/Inf/overflow like the fast path.
  */
 static void
-numeric_to_decimal_wire(Datum num_datum, uint32 scale, size_t width,
-                        char *out, const char *colname)
+numeric_to_decimal_wire_oracle(Datum num_datum, uint32 scale, size_t width,
+                               char *out, const char *colname)
 {
     Numeric     num = DatumGetNumeric(num_datum);
     char       *s;
@@ -265,12 +262,6 @@ numeric_to_decimal_wire(Datum num_datum, uint32 scale, size_t width,
         }
     }
 
-    /*
-     * Overflow / precision guard: the magnitude must be < 2^(8*width-1) so it
-     * fits the signed `width` range with room for the sign. Require every word
-     * at or above the width to be zero AND the top in-width word's sign bit to
-     * be clear. (10^38 < 2^127, so a valid numeric(38, S) value always passes.)
-     */
     for (i = limit_words; i < 8; i++)
         if (mag[i] != 0)
             goto overflow;
@@ -301,6 +292,60 @@ overflow:
             (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
              errmsg("pg_clickhouse: column \"%s\" value \"%s\" exceeds the declared "
                     "ClickHouse Decimal precision/range", colname, s)));
+}
+#endif                          /* USE_ASSERT_CHECKING */
+
+/*
+ * Convert a PostgreSQL numeric Datum to a ClickHouse Decimal wire value: the
+ * unscaled integer round(value * 10^scale) as a two's-complement signed
+ * little-endian integer of `width` bytes (4/8/16 for Decimal32/64/128), written
+ * to `out`. Fails closed (raises ERROR) on NaN/Infinity and on any magnitude that
+ * does not fit the signed `width` range -- which, for a column typed numeric(P, S)
+ * whose wire width was chosen from P, means a value outside the declared
+ * precision. A value already stored in a numeric(P, S) column is always
+ * representable, so this never wrongly rejects valid stored data.
+ *
+ * This is the row-at-a-time (scalar / group-C) path. It walks the on-disk
+ * base-10000 limbs directly via the shared allocation-free core converter (no
+ * `numeric_out`, no detoast for the common short / 4-byte-uncompressed forms),
+ * detoasting only a genuinely compressed/external numeric. In assertion builds it
+ * cross-checks every result against the independent text-based oracle above.
+ */
+static void
+numeric_to_decimal_wire(Datum num_datum, uint32 scale, size_t width,
+                        char *out, const char *colname)
+{
+    void       *vp = (void *) DatumGetPointer(num_datum);   /* raw varlena, no detoast */
+    PgchDecConv rc = pgch_numeric_to_decimal_wire_core(vp, scale, (uint32) width, out);
+
+    if (rc == PGCH_DECCONV_TOASTED)
+    {
+        /* Cold path: a compressed-inline / external numeric (never seen at normal
+         * TOAST thresholds for tiny numerics). Detoast and retry on the plain form. */
+        struct varlena *dt = PG_DETOAST_DATUM(num_datum);
+
+        rc = pgch_numeric_to_decimal_wire_core((void *) dt, scale, (uint32) width, out);
+    }
+
+    if (rc == PGCH_DECCONV_SPECIAL)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_clickhouse: column \"%s\" holds NaN/Infinity, which is not "
+                        "representable as a ClickHouse Decimal", colname)));
+    if (rc == PGCH_DECCONV_OVERFLOW)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_clickhouse: column \"%s\" value exceeds the declared "
+                        "ClickHouse Decimal precision/range", colname)));
+
+#ifdef USE_ASSERT_CHECKING
+    {
+        char oracle_out[16];
+
+        numeric_to_decimal_wire_oracle(num_datum, scale, width, oracle_out, colname);
+        Assert(memcmp(out, oracle_out, width) == 0);
+    }
+#endif
 }
 
 static void
@@ -375,6 +420,25 @@ write_fixed_value(ColBuf *cb, const ShmOffloadColumn *col, size_t row, Datum d)
  * already-deformed row at a time via pgch_columnizer_add_row, so the published
  * SHM blocks are byte-identical regardless of how the rows were produced.
  */
+/*
+ * Deferred decimal-fill faults recorded by the allocation-free C++ FILL_DECIMAL
+ * kernel and resolved on this (C) side before the block is published. A fault is
+ * a value the inline kernel could not convert: a stored NaN/Inf, a compressed/
+ * external numeric (needs detoast), or an out-of-range magnitude. In practice the
+ * list stays empty (TPC-H numerics are tiny + finite); the cap bounds the rare
+ * case and overflowing it fails closed.
+ */
+#define PGCH_DEC_FAULT_CAP 64
+typedef struct PgchDecFaultRec
+{
+    char       *dst;        /* wire slot to (re)fill */
+    const char *valptr;     /* offending varlena (pinned page or staging) */
+    uint32      scale;
+    uint32      width;
+    int         col_index;
+    int         status;     /* PgchDecConv */
+} PgchDecFaultRec;
+
 struct ShmColumnizer
 {
     const ShmOffloadColumn *cols;
@@ -386,6 +450,19 @@ struct ShmColumnizer
     ShmColumnPayload       *payloads;
     size_t                  in_block;
     uint64                  total;
+    /* Byte-bounded blocks: publish a short block before the next sub-batch would
+     * push the slot footprint past capacity, so a wide projection never trips
+     * publish_block's per-slot overflow. slot_cap = usable slot bytes; blk_reserve
+     * = running max sub-batch footprint growth (headroom for one more sub-batch);
+     * blk_last_fp = footprint at the previous advance within the current block;
+     * string_lens = per-column staged chars length scratch for the footprint calc. */
+    size_t                  slot_cap;
+    size_t                  blk_reserve;
+    size_t                  blk_last_fp;
+    size_t                 *string_lens;
+    int                     dec_nfault;        /* recorded decimal faults this sub-batch */
+    bool                    dec_fault_overflow; /* > CAP faults: resolve fails closed */
+    PgchDecFaultRec         dec_faults[PGCH_DEC_FAULT_CAP];
 };
 
 ShmColumnizer *
@@ -406,11 +483,15 @@ pgch_columnizer_begin(const ShmOffloadColumn *cols, int ncols,
     cz->rows_per_block = rows_per_block;
     cz->in_block = 0;
     cz->total = 0;
+    cz->slot_cap = shm_producer_slot_capacity(producer);
+    cz->blk_reserve = 0;
+    cz->blk_last_fp = 0;
     cz->block_cxt = AllocSetContextCreate(CurrentMemoryContext,
                                           "pg_clickhouse shm block",
                                           ALLOCSET_DEFAULT_SIZES);
     cz->payloads = palloc0(sizeof(ShmColumnPayload) * ncols);
     cz->bufs = palloc0(sizeof(ColBuf) * ncols);
+    cz->string_lens = palloc0(sizeof(size_t) * ncols);
 
     /* Allocate per-column staging in the block context (reset per block). */
     old = MemoryContextSwitchTo(cz->block_cxt);
@@ -459,10 +540,87 @@ columnizer_publish_block(ShmColumnizer *cz)
     shm_producer_publish(cz->producer, cz->payloads, cz->ncols, cz->in_block);
     cz->total += cz->in_block;
     cz->in_block = 0;
+    cz->blk_last_fp = 0;        /* the next block starts empty */
     /* Reset string accumulators (fixed buffers are overwritten in place). */
     for (c = 0; c < cz->ncols; c++)
         if (cz->bufs[c].is_string)
             resetStringInfo(&cz->bufs[c].chars);
+}
+
+/*
+ * Would publishing the current block (in_block rows of staged data) exceed the
+ * slot, or come within one sub-batch of it? Computes the exact slot footprint of
+ * the staged block and compares against the per-slot capacity, reserving headroom
+ * for one more sub-batch of the largest size seen so far. Updates the reserve.
+ */
+static bool
+columnizer_should_flush_bytes(ShmColumnizer *cz)
+{
+    size_t fp;
+    size_t grow;
+    int    c;
+
+    if (cz->slot_cap == 0 || cz->in_block == 0)
+        return false;
+
+    for (c = 0; c < cz->ncols; c++)
+        cz->string_lens[c] = cz->bufs[c].is_string ? (size_t) cz->bufs[c].chars.len : 0;
+
+    fp = shm_producer_block_footprint(cz->producer, cz->string_lens, cz->in_block);
+    grow = (fp > cz->blk_last_fp) ? fp - cz->blk_last_fp : 0;
+    if (grow > cz->blk_reserve)
+        cz->blk_reserve = grow;
+    cz->blk_last_fp = fp;
+
+    /* Flush if the footprint already exceeds capacity (a single sub-batch wider
+     * than the slot still falls through to publish_block's overflow guard), or if
+     * one more like-sized sub-batch would. */
+    return fp + cz->blk_reserve >= cz->slot_cap;
+}
+
+/*
+ * Read a string column's payload (bytes + length) WITHOUT detoasting the common
+ * short (1-byte header) and 4-byte-uncompressed varlena forms -- a heap text/
+ * varchar/bpchar value is almost always one of these, so we avoid the per-row
+ * palloc that DatumGetTextP does for a short varlena. A genuinely compressed-
+ * inline or external value (rare: only above the TOAST threshold) is detoasted
+ * into *to_free, which the caller pfrees. EXTERNAL is tested before SHORT because
+ * an external datum also reports a 1-byte header. bpchar trailing blanks and
+ * empty strings are preserved verbatim (we copy VARSIZE-VARHDRSZ bytes, exactly
+ * as DatumGetTextP would have).
+ */
+static inline void
+pgch_string_payload(char *p, const char **data, size_t *len, struct varlena **to_free)
+{
+    *to_free = NULL;
+    if (VARATT_IS_EXTERNAL(p))
+    {
+        struct varlena *dt = pg_detoast_datum((struct varlena *) p);
+
+        *data = VARDATA(dt);
+        *len = (size_t) (VARSIZE(dt) - VARHDRSZ);
+        if ((char *) dt != p)
+            *to_free = dt;
+    }
+    else if (VARATT_IS_SHORT(p))
+    {
+        *data = VARDATA_SHORT(p);
+        *len = (size_t) (VARSIZE_SHORT(p) - VARHDRSZ_SHORT);
+    }
+    else if (VARATT_IS_COMPRESSED(p))
+    {
+        struct varlena *dt = pg_detoast_datum((struct varlena *) p);
+
+        *data = VARDATA(dt);
+        *len = (size_t) (VARSIZE(dt) - VARHDRSZ);
+        if ((char *) dt != p)
+            *to_free = dt;
+    }
+    else
+    {
+        *data = VARDATA(p);
+        *len = (size_t) (VARSIZE(p) - VARHDRSZ);
+    }
 }
 
 void
@@ -482,9 +640,15 @@ pgch_columnizer_add_row(ShmColumnizer *cz, const Datum *values, const bool *isnu
 
         if (cz->bufs[c].is_string)
         {
-            text *t = DatumGetTextP(d);     /* detoasts */
-            appendBinaryStringInfo(&cz->bufs[c].chars, VARDATA(t), VARSIZE(t) - VARHDRSZ);
+            const char     *data;
+            size_t          len;
+            struct varlena *tofree;
+
+            pgch_string_payload((char *) DatumGetPointer(d), &data, &len, &tofree);
+            appendBinaryStringInfo(&cz->bufs[c].chars, data, (int) len);
             cz->bufs[c].offsets[cz->in_block] = (uint64_t) cz->bufs[c].chars.len;
+            if (tofree)
+                pfree(tofree);
         }
         else
         {
@@ -492,7 +656,7 @@ pgch_columnizer_add_row(ShmColumnizer *cz, const Datum *values, const bool *isnu
         }
     }
 
-    if (++cz->in_block == cz->rows_per_block)
+    if (++cz->in_block >= cz->rows_per_block || columnizer_should_flush_bytes(cz))
         columnizer_publish_block(cz);
 }
 
@@ -509,6 +673,7 @@ pgch_columnizer_finish(ShmColumnizer *cz)
 
     total = cz->total;
     MemoryContextDelete(cz->block_cxt);
+    pfree(cz->string_lens);
     pfree(cz->bufs);
     pfree(cz->payloads);
     pfree(cz);
@@ -550,7 +715,7 @@ void
 pgch_columnizer_advance(ShmColumnizer *cz, size_t nrows)
 {
     cz->in_block += nrows;
-    if (cz->in_block == cz->rows_per_block)
+    if (cz->in_block >= cz->rows_per_block || columnizer_should_flush_bytes(cz))
         columnizer_publish_block(cz);
 }
 
@@ -572,14 +737,131 @@ pgch_columnizer_fill_string(ShmColumnizer *cz, int col, size_t dst_row,
 {
     ColBuf *cb = &cz->bufs[col];
     size_t  r;
+    size_t  base = (size_t) cb->chars.len;
+    size_t  total = 0;
+    char   *dest;
 
+    /*
+     * Pass 1: per-row length -> offsets prefix-sum (ClickHouse end-offsets) and
+     * the sub-batch total. The common short / 4-byte forms cost no palloc; a
+     * genuinely toasted datum is detoasted here only to size it (and again in
+     * pass 2 -- rare). This replaces the per-row appendBinaryStringInfo capacity
+     * check / repalloc churn with a single growth below.
+     */
     for (r = 0; r < nrows; r++)
     {
-        text *t = DatumGetTextP(PointerGetDatum(cur[r]));   /* detoasts */
+        const char     *data;
+        size_t          len;
+        struct varlena *tofree;
 
-        appendBinaryStringInfo(&cb->chars, VARDATA(t), VARSIZE(t) - VARHDRSZ);
-        cb->offsets[dst_row + r] = (uint64_t) cb->chars.len;
+        pgch_string_payload(cur[r], &data, &len, &tofree);
+        if (tofree)
+            pfree(tofree);
+        total += len;
+        cb->offsets[dst_row + r] = (uint64_t) (base + total);
     }
+
+    /* One growth for the whole sub-batch, then copy each datum into place. */
+    enlargeStringInfo(&cb->chars, (int) total);
+    dest = cb->chars.data + base;
+    for (r = 0; r < nrows; r++)
+    {
+        const char     *data;
+        size_t          len;
+        struct varlena *tofree;
+
+        pgch_string_payload(cur[r], &data, &len, &tofree);
+        memcpy(dest, data, len);
+        dest += len;
+        if (tofree)
+            pfree(tofree);
+    }
+
+    /* We wrote directly past chars.len; restore the StringInfo invariants so the
+     * accumulated length is correct and the buffer stays null-terminated. */
+    cb->chars.len = (int) (base + total);
+    cb->chars.data[cb->chars.len] = '\0';
+}
+
+/*
+ * Record a decimal-fill fault from the C++ FILL_DECIMAL kernel (see shm_deform.h).
+ * Allocation-free, never raises -- it only stashes the offending value so the
+ * reader can resolve it before publishing the block.
+ */
+void
+pgch_columnizer_note_dec_fault(void *czp, char *dst, const char *valptr,
+                               uint32 scale, uint32 width, int col_index, int status)
+{
+    ShmColumnizer   *cz = (ShmColumnizer *) czp;
+    PgchDecFaultRec *f;
+
+    if (cz->dec_nfault >= PGCH_DEC_FAULT_CAP)
+    {
+        cz->dec_fault_overflow = true;
+        return;
+    }
+    f = &cz->dec_faults[cz->dec_nfault++];
+    f->dst = dst;
+    f->valptr = valptr;
+    f->scale = scale;
+    f->width = width;
+    f->col_index = col_index;
+    f->status = status;
+}
+
+/*
+ * Resolve the decimal faults recorded for the current sub-batch, called by the
+ * vectorized reader after each FILL_DECIMAL run and BEFORE the columnizer
+ * advances (so a faulted value is corrected or the query aborts before the block
+ * reaches the ring). NaN/Inf and out-of-range fail closed (clean ERROR);
+ * compressed/external numerics are detoasted and converted into their slot.
+ */
+void
+pgch_columnizer_resolve_dec_faults(void *czp)
+{
+    ShmColumnizer *cz = (ShmColumnizer *) czp;
+    int            i;
+
+    if (cz->dec_nfault == 0 && !cz->dec_fault_overflow)
+        return;
+
+    if (cz->dec_fault_overflow)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_clickhouse: too many untranslatable decimal values in one SHM "
+                        "sub-batch (compressed/external numerics unsupported on the fast path)")));
+
+    for (i = 0; i < cz->dec_nfault; i++)
+    {
+        PgchDecFaultRec *f = &cz->dec_faults[i];
+        const char      *colname = cz->cols[f->col_index].name;
+        struct varlena  *dt;
+        PgchDecConv      rc;
+
+        if (f->status == PGCH_DECCONV_SPECIAL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                     errmsg("pg_clickhouse: column \"%s\" holds NaN/Infinity, which is not "
+                            "representable as a ClickHouse Decimal", colname)));
+        if (f->status == PGCH_DECCONV_OVERFLOW)
+            ereport(ERROR,
+                    (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                     errmsg("pg_clickhouse: column \"%s\" value exceeds the declared "
+                            "ClickHouse Decimal precision/range", colname)));
+
+        /* PGCH_DECCONV_TOASTED: detoast and convert into the slot. */
+        Assert(f->status == PGCH_DECCONV_TOASTED);
+        dt = pg_detoast_datum((struct varlena *) (uintptr_t) f->valptr);
+        rc = pgch_numeric_to_decimal_wire_core((void *) dt, f->scale, f->width, f->dst);
+        if (rc != PGCH_DECCONV_OK)
+            ereport(ERROR,
+                    (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                     errmsg("pg_clickhouse: column \"%s\" value is not representable as a "
+                            "ClickHouse Decimal", colname)));
+        if ((char *) dt != f->valptr)
+            pfree(dt);
+    }
+    cz->dec_nfault = 0;
 }
 
 /* --------------------------------------------------------------------- */
