@@ -117,6 +117,25 @@ states are "not a correct full offload"; at the ORIGINAL baseline Q8/Q11 were wr
 no regression; (ii) per-shape gate → cannot predict the deadlock statically. The
 deadlock fix (when done) unlocks Q8/Q9/Q11/Q14 fully and erases the trade-off.
 
+## D0007 — 2026-06-25 — Phase 2/3 adversarial review: PASS + literal-trim fix
+
+Independent reviewer (fresh context) attacked join correctness, bpchar safety, the
+READONLY fix, the deadlock diagnosis, and regressions. **No blocking findings for
+TPC-H.** Confirmed: Q3/Q5/Q6/Q7/Q19 exact (maxrel 0), Q1 avg 1.57e-16, Q10
+set-exact (only an unordered tie reorder), oracle not fooled (full join+GROUP BY+sum
+in dispatched CH SQL, no residual PG aggregate), READONLY fix sound (67/67 adoption
+unit tests; a no-filter 3-table join returns 100000 == native), Q8/Q9/Q11/Q14
+deadlock genuine (read_rows frozen at 1 block, clean teardown), no Q1/Q6 regression.
+
+**One non-blocking finding addressed:** the bpchar fix trimmed the COLUMN but not
+the comparison LITERAL, so `col = 'literal '` (literal with a trailing blank)
+under-matched under offload (e.g. `n_name = 'GERMANY '` → 0 vs native 1). No TPC-H
+query carries a trailing-blank literal (verified all 22), so it was not a TPC-H
+correctness issue, but it is a real general-SQL gap. **Fixed:** `deparseConst` now
+also strips trailing blanks from bpchar (BPCHAROID) constants, so both sides are
+trimmed consistently. Verified `n_name = 'GERMANY '` → 1 == native; verify_offload
+137/0. (Closes the robustness follow-up noted in D0005.)
+
 ## Queries provisionally NOT-YET-offloadable (root-caused, pending phase work)
 
 - **CH join READONLY/empty (Phase 2):** Q2, Q3, Q5, Q7, Q8, Q11, Q12, Q17, Q19, Q20.

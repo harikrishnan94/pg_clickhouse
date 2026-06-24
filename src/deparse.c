@@ -2487,6 +2487,19 @@ deparseConst(Const* node, deparse_expr_cxt* context, int showtype) {
             appendStringInfoChar(buf, '0');
         }
         break;
+    case BPCHAROID: {
+        /*
+         * bpchar (CHAR(n)) comparison ignores trailing blanks, and the SHM
+         * producer strips trailing blanks from stored CHAR(n) values
+         * (pgch_bpchar_trim_len). Strip them from the literal too so a pushed-down
+         * comparison stays consistent on both sides: e.g. `col = 'X  '` must match
+         * a stored, trimmed "X". Trailing blanks are never significant in bpchar.
+         */
+        size_t l = strlen(extval);
+        while (l > 0 && extval[l - 1] == ' ')
+            extval[--l] = '\0';
+        deparseStringLiteral(buf, extval);
+    } break;
     default:
         deparseStringLiteral(buf, extval);
         break;
