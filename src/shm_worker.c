@@ -225,11 +225,20 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
     h->bgw = (BackgroundWorkerHandle **) palloc0(sizeof(BackgroundWorkerHandle *) * nworkers);
     h->shut_down = false;
 
+    /*
+     * Spawn in two passes so the postmaster forks all W workers concurrently.
+     * Pass 1 registers every worker -- RegisterDynamicBackgroundWorker only
+     * enqueues a slot and signals the postmaster, it does not block -- and pass
+     * 2 waits for them to come up. The previous register-then-wait-per-worker
+     * loop serialized startup (~W x single-worker fork+InitPostgres latency on
+     * the critical path, before any streaming begins); registering all of them
+     * first lets the postmaster fork them in parallel, so the wait pass blocks
+     * for roughly the slowest single worker (~1x) rather than the sum.
+     */
     for (w = 0; w < nworkers; w++)
     {
         BackgroundWorker bgw;
         BackgroundWorkerHandle *bgwhandle = NULL;
-        pid_t pid;
 
         memset(&bgw, 0, sizeof(bgw));
         bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -259,8 +268,14 @@ pgch_shm_worker_launch(const char *shm_name, Oid heap_relid, List *attnos,
         }
         h->bgw[w] = bgwhandle;
         launched++;
+    }
 
-        if (WaitForBackgroundWorkerStartup(bgwhandle, &pid) != BGWH_STARTED)
+    /* Pass 2: wait for the concurrently-forking workers to reach startup. */
+    for (w = 0; w < nworkers; w++)
+    {
+        pid_t pid;
+
+        if (WaitForBackgroundWorkerStartup(h->bgw[w], &pid) != BGWH_STARTED)
         {
             pgch_shm_worker_shutdown(h);
             ereport(ERROR, (errmsg("pg_clickhouse: SHM streaming background worker %d/%d failed to start",
