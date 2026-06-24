@@ -1,0 +1,7 @@
+Limit
+  Output: (date_trunc('minute'::text, eventtime)), (count(*))
+  ->  Sort
+        Output: (date_trunc('minute'::text, eventtime)), (count(*))
+        Sort Key: (date_trunc('minute'::text, hits.eventtime))
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: (date_trunc('minute'::text, eventtime)), (count(*))

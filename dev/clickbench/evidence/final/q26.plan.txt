@@ -1,0 +1,7 @@
+Limit
+  Output: searchphrase
+  ->  Sort
+        Output: searchphrase
+        Sort Key: hits.searchphrase
+        ->  Custom Scan (ClickHouseShmScan) on pg.hits
+              Output: searchphrase

@@ -1,0 +1,7 @@
+Limit
+  Output: searchphrase, (count(*))
+  ->  Sort
+        Output: searchphrase, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: searchphrase, (count(*))

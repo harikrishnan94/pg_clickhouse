@@ -1,0 +1,1 @@
+DIFF|10|10|0|0|3|17|col4 off='http://irr.ru/index.php?showalbum/login-rent/option_objects/bank/sberbank.ru/5' on='http://irr.ru/index.php?showalbum/login-9649.html_params%3Drhost%3Dad.adriver.ru'

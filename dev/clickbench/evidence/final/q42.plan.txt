@@ -1,0 +1,7 @@
+Limit
+  Output: windowclientwidth, windowclientheight, (count(*))
+  ->  Sort
+        Output: windowclientwidth, windowclientheight, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: windowclientwidth, windowclientheight, (count(*))

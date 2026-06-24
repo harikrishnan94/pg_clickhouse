@@ -1,0 +1,7 @@
+Limit
+  Output: watchid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))
+  ->  Sort
+        Output: watchid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: watchid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))

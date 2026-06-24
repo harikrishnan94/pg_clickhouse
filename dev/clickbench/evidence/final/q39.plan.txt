@@ -1,0 +1,7 @@
+Limit
+  Output: url, (count(*))
+  ->  Sort
+        Output: url, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: url, (count(*))

@@ -1,0 +1,7 @@
+Limit
+  Output: searchphrase, eventtime
+  ->  Sort
+        Output: searchphrase, eventtime
+        Sort Key: hits.eventtime
+        ->  Custom Scan (ClickHouseShmScan) on pg.hits
+              Output: searchphrase, eventtime

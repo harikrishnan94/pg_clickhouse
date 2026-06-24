@@ -1,0 +1,7 @@
+Limit
+  Output: userid, (count(*))
+  ->  Sort
+        Output: userid, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: userid, (count(*))

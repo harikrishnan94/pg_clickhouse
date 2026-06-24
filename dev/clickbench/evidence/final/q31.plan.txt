@@ -1,0 +1,7 @@
+Limit
+  Output: searchengineid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))
+  ->  Sort
+        Output: searchengineid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: searchengineid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))

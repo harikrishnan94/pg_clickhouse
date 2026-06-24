@@ -1,0 +1,7 @@
+Limit
+  Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, (count(*))
+  ->  Sort
+        Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, (count(*))
+        Sort Key: (count(*)) DESC
+        ->  Custom Scan (ClickHouseShmScan)
+              Output: userid, (EXTRACT(minute FROM eventtime)), searchphrase, (count(*))
