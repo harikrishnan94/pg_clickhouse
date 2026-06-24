@@ -44,6 +44,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -664,31 +665,23 @@ shm_fetch_into_slot(ShmScanState *sss, TupleTableSlot *slot)
 }
 
 /*
- * Auto worker count when pg_clickhouse.shm_stream_workers = 0. Mirrors the core
- * planner's geometric growth (compute_parallel_worker): one extra worker per ~3x
- * over min_parallel_table_scan_size (~1024 blocks / 8 MB). Small relations get a
- * single producer; large ones scale up to the cap.
- */
-static int
-shm_auto_stream_workers(BlockNumber nblocks)
-{
-    int      w = 1;
-    uint64   threshold = 1024;   /* uint64: threshold*3 must not overflow on huge heaps */
-
-    while (nblocks >= threshold * 3 && w < PGCH_SHM_MAX_STREAM_WORKERS)
-    {
-        threshold *= 3;
-        w++;
-    }
-    return w;
-}
-
-/*
- * Decide how many cooperating streaming workers to launch for this offload.
- * Fail-closed to 1 when the scan is not eligible for the parallel vectorized
- * reader (the scalar fallback is single-producer), so parallelism is applied
- * only where it is provably correct. Otherwise honor the GUC (0 = auto) clamped
- * to [1, min(cap, max_parallel_workers, nblocks)].
+ * Decide how many cooperating streaming workers to launch for this offload from
+ * PostgreSQL's own parallel-query budget -- there is no dedicated GUC. The count
+ * is the relation's `parallel_workers` reloption when set, otherwise the same
+ * geometric growth over `min_parallel_table_scan_size` that core's
+ * compute_parallel_worker() applies to a sequential scan (one extra worker per
+ * ~3x). It is then clamped to:
+ *   - max_parallel_workers_per_gather (the per-query degree of parallelism; 0
+ *     disables query parallelism and so forces a single producer),
+ *   - max_parallel_workers (the cluster-wide pool),
+ *   - PGCH_SHM_MAX_STREAM_WORKERS (the producer's control-socket parking ceiling),
+ *   - the number of heap blocks to scan,
+ *   - and a floor of 1.
+ * The chosen count is also forced as ClickHouse max_threads
+ * (shm_settings_force_max_threads), so producers and consumer threads stay matched.
+ *
+ * Fail-closed to a single producer when the scan is not eligible for the parallel
+ * vectorized reader (the scalar fallback is single-producer).
  */
 static int
 shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
@@ -697,6 +690,7 @@ shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
     ShmOffloadColumn *cols;
     int               ncols;
     BlockNumber       nblocks;
+    int               reloption;
     int               w;
     int               cap;
 
@@ -710,17 +704,46 @@ shm_choose_stream_workers(Oid heap_relid, List *attnos, Snapshot snapshot)
         return 1;
     }
 
-    nblocks = RelationGetNumberOfBlocks(rel);
-    w = (pgch_shm_stream_workers > 0) ? pgch_shm_stream_workers
-                                      : shm_auto_stream_workers(nblocks);
+    /* Per-query degree of parallelism. 0 (parallel query disabled) -> single producer. */
+    cap = max_parallel_workers_per_gather;
+    if (cap < 1)
+    {
+        table_close(rel, AccessShareLock);
+        return 1;
+    }
 
-    /* Clamp: never more than the cap, the cluster's parallel-worker budget, or
-     * the number of blocks there are to scan; always at least 1. */
-    cap = PGCH_SHM_MAX_STREAM_WORKERS;
-    if (max_parallel_workers > 0 && cap > max_parallel_workers)
-        cap = max_parallel_workers;
+    nblocks = RelationGetNumberOfBlocks(rel);
+
+    /*
+     * Worker count, mirroring compute_parallel_worker(): the per-table
+     * `parallel_workers` reloption wins if set (>= 0), else one extra worker per
+     * ~3x over min_parallel_table_scan_size.
+     */
+    reloption = RelationGetParallelWorkers(rel, -1);
+    if (reloption >= 0)
+        w = reloption;
+    else
+    {
+        int threshold = Max(min_parallel_table_scan_size, 1);
+
+        w = 1;
+        while (nblocks >= (BlockNumber) (threshold * 3))
+        {
+            w++;
+            if (threshold > INT_MAX / 3)
+                break;
+            threshold *= 3;
+        }
+    }
+
+    /* Clamp to the per-query DOP, the cluster pool, the SHM parking ceiling, the
+     * blocks available, and a floor of 1. */
     if (w > cap)
         w = cap;
+    if (max_parallel_workers > 0 && w > max_parallel_workers)
+        w = max_parallel_workers;
+    if (w > PGCH_SHM_MAX_STREAM_WORKERS)
+        w = PGCH_SHM_MAX_STREAM_WORKERS;
     if (nblocks > 0 && (BlockNumber) w > nblocks)
         w = (int) nblocks;
     if (w < 1)

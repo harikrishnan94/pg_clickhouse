@@ -52,7 +52,6 @@ int   pgch_shm_min_rows = 100000;
 bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
-int   pgch_shm_stream_workers = 0;
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -776,15 +775,6 @@ pgch_shm_offload_init(void)
                             "(amortizes the one-time compile cost; subsequent scans of the same "
                             "shape reuse the cached code).",
                             NULL, &pgch_jit_row_threshold, 2000000, 0, INT_MAX,
-                            PGC_USERSET, 0, NULL, NULL, NULL);
-
-    DefineCustomIntVariable("pg_clickhouse.shm_stream_workers",
-                            "Number of cooperating background workers that stream a heap relation "
-                            "into the shared-memory ring in parallel (the eligible vectorized "
-                            "reader only). 0 = auto (scale with the relation's size, capped by "
-                            "max_parallel_workers); 1 = the original single producer. The effective "
-                            "value is also forced as ClickHouse max_threads for the offload query.",
-                            NULL, &pgch_shm_stream_workers, 0, 0, PGCH_SHM_MAX_STREAM_WORKERS,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the

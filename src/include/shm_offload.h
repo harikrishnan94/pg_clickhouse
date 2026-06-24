@@ -54,12 +54,12 @@ extern int   pgch_shm_min_rows;
 extern bool  pgch_log_stream_stats;
 extern bool  pgch_enable_jit_deform;
 extern int   pgch_jit_row_threshold;
-extern int   pgch_shm_stream_workers;
 
 /*
- * Hard cap on cooperating SHM streaming workers (the GUC's upper bound and the
- * auto/clamp ceiling). Stays comfortably below the producer's MAX_PARKED_CONNS
- * so every worker's control-socket connection can park alongside the consumer's.
+ * Hard cap on cooperating SHM streaming workers: the final clamp on the count
+ * derived from PostgreSQL's parallel-query budget. Stays comfortably below the
+ * producer's MAX_PARKED_CONNS so every worker's control-socket connection can
+ * park alongside the consumer's.
  */
 #define PGCH_SHM_MAX_STREAM_WORKERS 64
 
