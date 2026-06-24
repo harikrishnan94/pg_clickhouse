@@ -47,7 +47,10 @@
 #define SHM_MAGIC          UINT64_C(0x504F44415F4D4853)
 #define SHM_ABI_VERSION_1  1u
 #define SHM_IMPL_MAX_K     256u
-#define SHM_IMPL_MAX_COLS  64u
+#define SHM_IMPL_MAX_COLS  128u   /* raised 64->128 for ClickBench Q24 SELECT * (105 cols);
+                                   * must match consumer IMPL_MAX_COLUMNS (Wire/Layout.h).
+                                   * Soft validation bound -- schema/descriptor regions are
+                                   * sized dynamically by n_columns, not a fixed [64] array. */
 #define SHM_IMPL_MAX_ROWS  (1u << 20)
 #define SHM_PADDING_FOR_SIMD 64u
 #define SHM_SCHEMA_STR_MAX 64u

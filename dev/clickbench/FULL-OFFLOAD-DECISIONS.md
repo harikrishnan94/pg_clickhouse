@@ -270,3 +270,45 @@ a soft validation cap, not a fixed-array bound — raising it to 128 on both sid
 Q24. Q24 is the **only** ClickBench query needing > 64 columns. Kept separate from
 the timestamp phase because it is a distinct mechanism (column-count scaling) and
 requires a consumer rebuild.
+
+**RESOLVED (Phase 1b).** Raised `SHM_IMPL_MAX_COLS 64→128` (`src/shm_producer.c`)
+and the consumer `IMPL_MAX_COLUMNS 64→128` (`ClickHouse .../Wire/Layout.h:62`),
+rebuilt + restarted ClickHouse. This is the **only consumer/ABI-side change in the
+whole ClickBench effort** (top-N pushdown, avg→Float64, regex are all PG-side
+deparse). It is ABI-compatible: the schema table and per-column descriptor regions
+are sized dynamically by `schema_count` (no fixed `[64]` array on either side), so
+a 64-column stream still validates under a 128 cap. Verified:
+- **Consumer tests green:** `unit_tests_dbms` SharedMemory/Adoption/Wire suites —
+  **49 PASSED** against the new constant.
+- **Q24 offloads + exact:** `SELECT *` (105 cols incl. 3 timestamp cols) →
+  oracle `QueryFinish, read_rows=10M, ShmAdoptedBlocks=499`; `cmp_results.py` =
+  `exact|10|10|0|0` vs native (tie-robust ORDER BY EventTime, WatchID). PG plan:
+  `Limit → Sort → ClickHouseShmScan` (filter pushed; top-N in PG — per the
+  non-agg-projection definition this is `fully`).
+- **No regression:** `sanity.sh` green (PASS=17), zero `/dev/shm/pgch_*` leaks,
+  zero stray stream workers.
+
+Coverage after Phase 1b: **42/43 offload** the heavy fragment; only Q1 (no-column
+decline, D0010) is intentionally native.
+
+---
+
+## D0013 — 2026-06-25 — Operational: CH manifest `CH_PID` is stale; restart by port
+
+**Finding (cost me a debugging loop).** `dev/bench/ch-bench-server.sh stop` keys off
+the manifest `CH_PID`, which is **stale** (the spec warned this). After a `stop;
+start` the old server kept running (its watchdog respawns the server child), the
+new server grabbed a different port, and the FDW pointed at the wrong one — so Q24
+still hit the *old in-memory binary* (a running process keeps its loaded code even
+after the on-disk binary is rebuilt) and reported the old `[1, 64]` limit.
+
+**Decision / procedure for any CH restart (e.g. to load a rebuilt binary):**
+1. Resolve the LIVE pid from the listening port (`ss -ltnp | grep :PORT`), not the
+   manifest; kill the **watchdog + server** together (SIGTERM, graceful — lets SHM
+   clean up) so the watchdog can't respawn the old child.
+2. Confirm nothing is listening on the bench ports, then `start` fresh.
+3. The start may pick a **new port** — re-point the FDW:
+   `ALTER SERVER ch_bench OPTIONS (SET port '<new>')` (D0001 recurs on every
+   restart). Harnesses read the port from the manifest, so they self-adjust; only
+   the FDW server option must be re-set.
+This is also why `wsweep.sh`/`sweep-capped.sh` resolve the CH pid from the port.
