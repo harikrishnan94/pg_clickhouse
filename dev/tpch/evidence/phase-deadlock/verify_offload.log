@@ -1,0 +1,304 @@
+Waiting for ClickHouse (/home/ubuntu/ClickHouse/build/reldeb/programs/clickhouse) ...
+ClickHouse up: 26.6.1.1
+NOTICE:  extension "pg_clickhouse" already exists, skipping
+NOTICE:  drop cascades to user mapping for postgres on server local_ch
+
+================ SHM offload verification matrix ================
+
+[count_filtered]
+    pg(off): 5|   pg(on): 5|
+    CH executed : SELECT count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3262600_1_1_0\', \'id Int64\')) WHERE ((id > 0))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1112 -> 1113)
+  PASS  count_filtered: offload result == baseline (exact)
+  PASS  count_filtered: ClickHouse executed a new streamed_table() query
+  PASS  count_filtered: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  count_filtered: CH read_rows == 5 (full table streamed)
+
+[sum_filtered]
+    pg(off): 4|14|140|94.5|   pg(on): 4|14|140|94.5|
+    CH executed : SELECT count(*), sum(id), sum(n), sum(f) FROM (SELECT * FROM streamed_table(\'/pgch_3262629_1_1_0\', \'id Int64, n Int64, f Float64\')) WHERE ((id >= 2))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1113 -> 1114)
+  PASS  sum_filtered: offload result == baseline (exact)
+  PASS  sum_filtered: ClickHouse executed a new streamed_table() query
+  PASS  sum_filtered: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  sum_filtered: CH read_rows == 5 (full table streamed)
+
+[multi_agg]
+    pg(off): 15|10|50|96|   pg(on): 15|10|50|96|
+    CH executed : SELECT sum(id), min(n), max(n), sum(f) FROM (SELECT * FROM streamed_table(\'/pgch_3262655_1_1_0\', \'id Int64, n Int64, f Float64\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1114 -> 1115)
+  PASS  multi_agg: offload result == baseline (exact)
+  PASS  multi_agg: ClickHouse executed a new streamed_table() query
+  PASS  multi_agg: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  multi_agg: CH read_rows == 5 (full table streamed)
+
+[string_len]
+    pg(off): 21|   pg(on): 21|
+    CH executed : SELECT sum(lengthUTF8(s)) FROM (SELECT * FROM streamed_table(\'/pgch_3262680_1_1_0\', \'s String\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1115 -> 1116)
+  PASS  string_len: offload result == baseline (exact)
+  PASS  string_len: ClickHouse executed a new streamed_table() query
+  PASS  string_len: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  string_len: CH read_rows == 5 (full table streamed)
+
+[date_minmax]
+    pg(off): 1970-01-01|2024-12-31|   pg(on): 1970-01-01|2024-12-31|
+    CH executed : SELECT min(d), max(d) FROM (SELECT * FROM streamed_table(\'/pgch_3262705_1_3_0\', \'d Date\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1116 -> 1117)
+  PASS  date_minmax: offload result == baseline (exact)
+  PASS  date_minmax: ClickHouse executed a new streamed_table() query
+  PASS  date_minmax: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  date_minmax: CH read_rows == 5 (full table streamed)
+
+[groupby_string]
+    pg(off): |1|0|alpha|1|1.5|beta|1|2.25|delta|1|100|epsilon|1|-7.75|   pg(on): |1|0|alpha|1|1.5|beta|1|2.25|delta|1|100|epsilon|1|-7.75|
+    CH executed : SELECT s, count(*), sum(f) FROM (SELECT * FROM streamed_table(\'/pgch_3262730_1_1_0\', \'s String, f Float64\')) GROUP BY s ORDER BY s ASC NULLS LAST
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1117 -> 1118)
+  PASS  groupby_string: offload result == baseline (exact)
+  PASS  groupby_string: ClickHouse executed a new streamed_table() query
+  PASS  groupby_string: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  groupby_string: CH read_rows == 5 (full table streamed)
+
+[groupby_having]
+    pg(off): 3|30|4|40|5|50|   pg(on): 3|30|4|40|5|50|
+    CH executed : SELECT id, sum(n) FROM (SELECT * FROM streamed_table(\'/pgch_3262755_1_1_0\', \'id Int64, n Int64\')) GROUP BY id HAVING ((sum(n) > 25)) ORDER BY id ASC NULLS LAST
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1118 -> 1119)
+  PASS  groupby_having: offload result == baseline (exact)
+  PASS  groupby_having: ClickHouse executed a new streamed_table() query
+  PASS  groupby_having: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  groupby_having: CH read_rows == 5 (full table streamed)
+
+[float_filter]
+    pg(off): 3|   pg(on): 3|
+    CH executed : SELECT count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3262781_1_1_0\', \'f Float64\')) WHERE ((f > 1))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1119 -> 1120)
+  PASS  float_filter: offload result == baseline (exact)
+  PASS  float_filter: ClickHouse executed a new streamed_table() query
+  PASS  float_filter: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  float_filter: CH read_rows == 5 (full table streamed)
+
+[date_filter]
+    pg(off): 3|90|   pg(on): 3|90|
+    CH executed : SELECT count(*), sum(n) FROM (SELECT * FROM streamed_table(\'/pgch_3262806_1_1_0\', \'n Int64, d Date\')) WHERE ((d >= \'1995-01-01\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1120 -> 1121)
+  PASS  date_filter: offload result == baseline (exact)
+  PASS  date_filter: ClickHouse executed a new streamed_table() query
+  PASS  date_filter: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  date_filter: CH read_rows == 5 (full table streamed)
+
+[w_sum]
+    pg(off): 15|1500|15|   pg(on): 15|1500|15|
+    CH executed : SELECT sum(a), sum(b), sum(c) FROM (SELECT * FROM streamed_table(\'/pgch_3262831_1_1_0\', \'a Int16, b Int32, c Float32\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1121 -> 1122)
+  PASS  w_sum: offload result == baseline (exact)
+  PASS  w_sum: ClickHouse executed a new streamed_table() query
+  PASS  w_sum: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  w_sum: CH read_rows == 5 (full table streamed)
+
+[w_groupby_flag]
+    pg(off): f|2|600|t|3|900|   pg(on): f|2|600|t|3|900|
+    CH executed : SELECT flag, count(*), sum(b) FROM (SELECT * FROM streamed_table(\'/pgch_3262856_1_1_0\', \'b Int32, flag UInt8\')) GROUP BY flag ORDER BY flag ASC NULLS LAST
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1122 -> 1123)
+  PASS  w_groupby_flag: offload result == baseline (exact)
+  PASS  w_groupby_flag: ClickHouse executed a new streamed_table() query
+  PASS  w_groupby_flag: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  w_groupby_flag: CH read_rows == 5 (full table streamed)
+
+[w_groupby_str]
+    pg(off): x|2|y|2|z|1|   pg(on): x|2|y|2|z|1|
+    CH executed : SELECT g, count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3262881_1_1_0\', \'g String\')) GROUP BY g ORDER BY g ASC NULLS LAST
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1123 -> 1124)
+  PASS  w_groupby_str: offload result == baseline (exact)
+  PASS  w_groupby_str: ClickHouse executed a new streamed_table() query
+  PASS  w_groupby_str: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  w_groupby_str: CH read_rows == 5 (full table streamed)
+
+[num_sum]
+    pg(off): 10000001000055.55|11000011.73|1000000000000000112095.178901|   pg(on): 10000001000055.55|11000011.73|1000000000000000112095.178901|
+    CH executed : SELECT sum(price), sum(qty), sum(big) FROM (SELECT * FROM streamed_table(\'/pgch_3262906_1_1_0\', \'price Decimal(15, 2), qty Decimal(9, 2), big Decimal(30, 6)\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1124 -> 1125)
+  PASS  num_sum: offload result == baseline (exact)
+  PASS  num_sum: ClickHouse executed a new streamed_table() query
+  PASS  num_sum: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  num_sum: CH read_rows == 5 (full table streamed)
+
+[num_minmax]
+    pg(off): -67.89|9999999999999.99|0.50|9999999.99|-250.500000|999999999999999999999.999999|   pg(on): -67.89|9999999999999.99|0.5|9999999.99|-250.5|999999999999999999999.999999|
+    CH executed : SELECT min(price), max(price), min(qty), max(qty), min(big), max(big) FROM (SELECT * FROM streamed_table(\'/pgch_3262931_1_3_0\', \'price Decimal(15, 2), qty Decimal(9, 2), big Decimal(30, 6)\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1125 -> 1126)
+  PASS  num_minmax: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  num_minmax: ClickHouse executed a new streamed_table() query
+  PASS  num_minmax: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  num_minmax: CH read_rows == 5 (full table streamed)
+
+[num_count_filt]
+    pg(off): 3|10000001000123.44|   pg(on): 3|10000001000123.44|
+    CH executed : SELECT count(*), sum(price) FROM (SELECT * FROM streamed_table(\'/pgch_3262964_1_1_0\', \'price Decimal(15, 2)\')) WHERE ((price > 0))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1126 -> 1127)
+  PASS  num_count_filt: offload result == baseline (exact)
+  PASS  num_count_filt: ClickHouse executed a new streamed_table() query
+  PASS  num_count_filt: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  num_count_filt: CH read_rows == 5 (full table streamed)
+
+[num_groupby]
+    pg(off): 1|123.45|100000.000001|2|-67.89|-250.500000|3|0.00|0.000000|4|1000000.00|999999999999999999999.999999|5|9999999999999.99|12345.678901|   pg(on): 1|123.45|100000.000001|2|-67.89|-250.5|3|0|0|4|1000000|999999999999999999999.999999|5|9999999999999.99|12345.678901|
+    CH executed : SELECT id, sum(price), sum(big) FROM (SELECT * FROM streamed_table(\'/pgch_3262989_1_1_0\', \'id Int64, price Decimal(15, 2), big Decimal(30, 6)\')) GROUP BY id ORDER BY id ASC NULLS LAST
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1127 -> 1128)
+  PASS  num_groupby: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  num_groupby: ClickHouse executed a new streamed_table() query
+  PASS  num_groupby: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  num_groupby: CH read_rows == 5 (full table streamed)
+
+[num_avg]
+    pg(off): 2000000200011.1100|2200002.346000000000|   pg(on): 2000000200011.11|2200002.346|
+    CH executed : SELECT avg(price), avg(qty) FROM (SELECT * FROM streamed_table(\'/pgch_3263016_1_1_0\', \'price Decimal(15, 2), qty Decimal(9, 2)\'))
+    CH read_rows=5  ShmAdoptedBlocks=2  (streamed_table queries: 1128 -> 1129)
+  PASS  num_avg: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  num_avg: ClickHouse executed a new streamed_table() query
+  PASS  num_avg: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  num_avg: CH read_rows == 5 (full table streamed)
+
+[tpch_q6]
+    pg(off): 157.1256|   pg(on): 157.1256|
+    CH executed : SELECT l_quantity, l_extendedprice, l_discount, l_shipdate FROM (SELECT * FROM streamed_table(\'/pgch_3263043_1_1_0\', \'l_quantity Decimal(15, 2), l_extendedprice Decimal(15, 2), l_discount Decimal(15, 2), l_shipdate Date\')) WHERE ((l_shipdate >= \'1994-01-01\')) AND ((l_shipdate < \'1995-01-01\')) AND ((l_discount >= 0.05)) AND ((l_discount <= 0.07)) AND ((l_quantity < 24))
+    CH read_rows=8  ShmAdoptedBlocks=2  (streamed_table queries: 1129 -> 1130)
+  PASS  tpch_q6: offload result == baseline (exact)
+  PASS  tpch_q6: ClickHouse executed a new streamed_table() query
+  PASS  tpch_q6: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  tpch_q6: CH read_rows == 8 (full table streamed)
+
+[tpch_q18_inner]
+    pg(off): 1|53.00|3|94.00|5|670.00|   pg(on): 1|53|3|94|5|670|
+    CH executed : SELECT l_orderkey, sum(l_quantity) FROM (SELECT * FROM streamed_table(\'/pgch_3263068_1_1_0\', \'l_orderkey Int64, l_quantity Decimal(15, 2)\')) GROUP BY l_orderkey HAVING ((sum(l_quantity) > 50)) ORDER BY l_orderkey ASC NULLS LAST
+    CH read_rows=8  ShmAdoptedBlocks=2  (streamed_table queries: 1130 -> 1131)
+  PASS  tpch_q18_inner: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  tpch_q18_inner: ClickHouse executed a new streamed_table() query
+  PASS  tpch_q18_inner: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  tpch_q18_inner: CH read_rows == 8 (full table streamed)
+
+[tpch_q1]
+    pg(off): A|F|399.00|135738.26|126611.5235|129991.311520|199.5000000000000000|67869.130000000000|0.07500000000000000000|2|N|O|91.00|111845.85|106860.6364|112012.469952|30.3333333333333333|37281.950000000000|0.04333333333333333333|3|R|F|367.00|128208.01|119800.2174|125146.755024|122.3333333333333333|42736.003333333333|0.06333333333333333333|3|   pg(on): A|F|399|135738.26|126611.5235|129991.31152|199.5|67869.13|0.075|2|N|O|91|111845.85|106860.6364|112012.469952|30.333333333333332|37281.950000000004|0.043333333333333335|3|R|F|367|128208.01|119800.2174|125146.755024|122.33333333333333|42736.003333333334|0.06333333333333334|3|
+    CH executed : SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice), sum((l_extendedprice * (1 - l_discount))), sum(((l_extendedprice * (1 - l_discount)) * (1 + l_tax))), avg(l_quantity), avg(l_extendedprice), avg(l_discount), count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3263095_1_1_0\', \'l_quantity Decimal(15, 2), l_extendedprice Decimal(15, 2), l_discount Decimal(15, 2), l_tax Decimal(15, 2), l_returnflag String, l_linestatus String, l_shipdate Date\')) WHERE ((l_shipdate <= \'1998-09-02\')) GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag ASC NULLS LAST, l_linestatus ASC NULLS LAST
+    CH read_rows=8  ShmAdoptedBlocks=2  (streamed_table queries: 1131 -> 1132)
+  PASS  tpch_q1: offload result == baseline by value (OK maxrel=1.07e-16; bounded Decimal/Float64 deviation)
+  PASS  tpch_q1: ClickHouse executed a new streamed_table() query
+  PASS  tpch_q1: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=2)
+  PASS  tpch_q1: CH read_rows == 8 (full table streamed)
+
+[join_inner_project] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 1|alpha|5|1|alpha|7|2|beta|9|3||2|3||4|   pg(on): 1|alpha|5|1|alpha|7|2|beta|9|3||2|3||4|
+    CH executed : SELECT r1.id, r1.s, r2.amt FROM (SELECT * FROM streamed_table(\'/pgch_3263122_1_1_0\', \'id Int64, s String\')) r1 ALL INNER JOIN (SELECT * FROM streamed_table(\'/pgch_3263122_2_2_0\', \'t_id Int64, amt Int64\')) r2 ON (((r1.id = r2.t_id))) ORDER BY r1.id ASC NULLS LAST, r2.amt ASC NULLS LAST
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_inner_project: offload result == baseline (exact)
+  PASS  join_inner_project: ClickHouse executed a new streamed_table() query
+  PASS  join_inner_project: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_inner_project: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_inner_project: CH read_rows == 11 (every base relation streamed)
+
+[join_agg] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 5|27|   pg(on): 5|27|
+    CH executed : SELECT count(*), sum(r2.amt) FROM (SELECT * FROM streamed_table(\'/pgch_3263151_1_1_0\', \'id Int64\')) r1 ALL INNER JOIN (SELECT * FROM streamed_table(\'/pgch_3263151_2_2_0\', \'t_id Int64, amt Int64\')) r2 ON (((r1.id = r2.t_id)))
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_agg: offload result == baseline (exact)
+  PASS  join_agg: ClickHouse executed a new streamed_table() query
+  PASS  join_agg: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_agg: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_agg: CH read_rows == 11 (every base relation streamed)
+
+[join_groupby] (JOIN pushdown: one SHM source per base relation)
+    pg(off): a|3|18|b|2|9|   pg(on): a|3|18|b|2|9|
+    CH executed : SELECT r2.cat, count(*), sum(r2.amt) FROM (SELECT * FROM streamed_table(\'/pgch_3263180_1_1_0\', \'id Int64\')) r1 ALL INNER JOIN (SELECT * FROM streamed_table(\'/pgch_3263180_2_2_0\', \'t_id Int64, amt Int64, cat String\')) r2 ON (((r1.id = r2.t_id))) GROUP BY r2.cat ORDER BY r2.cat ASC NULLS LAST
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_groupby: offload result == baseline (exact)
+  PASS  join_groupby: ClickHouse executed a new streamed_table() query
+  PASS  join_groupby: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_groupby: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_groupby: CH read_rows == 11 (every base relation streamed)
+
+[join_numeric_agg] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 138.50|   pg(on): 138.5|
+    CH executed : SELECT sum(r2.price) FROM (SELECT * FROM streamed_table(\'/pgch_3263209_1_1_0\', \'id Int64\')) r1 ALL INNER JOIN (SELECT * FROM streamed_table(\'/pgch_3263209_2_2_0\', \'t_id Int64, price Decimal(15, 2)\')) r2 ON (((r1.id = r2.t_id)))
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_numeric_agg: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  join_numeric_agg: ClickHouse executed a new streamed_table() query
+  PASS  join_numeric_agg: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_numeric_agg: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_numeric_agg: CH read_rows == 11 (every base relation streamed)
+
+[join_left] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 6|   pg(on): 6|
+    CH executed : SELECT count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3263240_1_1_0\', \'t_id Int64\')) r1 ALL LEFT JOIN (SELECT * FROM streamed_table(\'/pgch_3263240_2_2_0\', \'id Int64\')) r2 ON (((r1.t_id = r2.id)))
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_left: offload result == baseline (exact)
+  PASS  join_left: ClickHouse executed a new streamed_table() query
+  PASS  join_left: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_left: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_left: CH read_rows == 11 (every base relation streamed)
+
+[join_left_project] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 1|1|10|2|1|10|3|2|20|4|3|30|5|3|30|6|||   pg(on): 1|1|10|2|1|10|3|2|20|4|3|30|5|3|30|6|||
+    CH executed : SELECT r1.oid, r2.id, r2.n FROM (SELECT * FROM streamed_table(\'/pgch_3263269_1_1_0\', \'oid Int64, t_id Int64\')) r1 ALL LEFT JOIN (SELECT * FROM streamed_table(\'/pgch_3263269_2_2_0\', \'id Int64, n Int64\')) r2 ON (((r1.t_id = r2.id))) ORDER BY r1.oid ASC NULLS LAST
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_left_project: offload result == baseline (exact)
+  PASS  join_left_project: ClickHouse executed a new streamed_table() query
+  PASS  join_left_project: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_left_project: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_left_project: CH read_rows == 11 (every base relation streamed)
+
+[join_full_project] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 1|1|5|1|2|7|2|3|9|3|4|2|3|5|4|4|||5||||6|99|   pg(on): 1|1|5|1|2|7|2|3|9|3|4|2|3|5|4|4|||5||||6|99|
+    CH executed : SELECT r1.id, r2.oid, r2.amt FROM (SELECT * FROM streamed_table(\'/pgch_3263298_1_1_0\', \'id Int64\')) r1 ALL FULL JOIN (SELECT * FROM streamed_table(\'/pgch_3263298_2_2_0\', \'oid Int64, t_id Int64, amt Int64\')) r2 ON (((r1.id = r2.t_id))) ORDER BY r1.id ASC NULLS LAST, r2.oid ASC NULLS LAST
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_full_project: offload result == baseline (exact)
+  PASS  join_full_project: ClickHouse executed a new streamed_table() query
+  PASS  join_full_project: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_full_project: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_full_project: CH read_rows == 11 (every base relation streamed)
+
+[join_semi] (JOIN pushdown: one SHM source per base relation)
+    pg(off): 3|   pg(on): 3|
+    CH executed : SELECT count(*) FROM (SELECT * FROM streamed_table(\'/pgch_3263327_1_1_0\', \'id Int64\')) r1 LEFT SEMI JOIN (SELECT * FROM streamed_table(\'/pgch_3263327_2_2_0\', \'t_id Int64\')) r2 ON (((r1.id = r2.t_id)))
+    CH read_rows=11  ShmAdoptedBlocks=4 (>= 2 expected)
+  PASS  join_semi: offload result == baseline (exact)
+  PASS  join_semi: ClickHouse executed a new streamed_table() query
+  PASS  join_semi: ClickHouse query is a JOIN over streamed_table() sources
+  PASS  join_semi: adopted >= 2 SHM blocks (one per source) (ShmAdoptedBlocks=4)
+  PASS  join_semi: CH read_rows == 11 (every base relation streamed)
+
+[big_stream] (bounded-ring streaming of a large relation)
+    pg(off): 1000000|500000500000|1000001000000|   pg(on): 1000000|500000500000|1000001000000|
+    CH executed : SELECT count(*), sum(id), sum(v) FROM (SELECT * FROM streamed_table(\'/pgch_3263364_1_1_0\', \'id Int64, v Int64\') UNION ALL SELECT * FROM streamed_table(\'/pgch_3263364_1_1_1\', \'id Int64, v Int64\'))
+    CH read_rows=1000000  ShmAdoptedBlocks=18 (>= 10 expected)
+  PASS  big_stream: offload result == baseline (exact)
+  PASS  big_stream: ClickHouse executed a new streamed_table() query
+  PASS  big_stream: adopted many SHM blocks (ShmAdoptedBlocks=18 >= 10)
+  PASS  big_stream: CH read_rows == 1000000 (whole relation streamed)
+
+[big_decimal] (bounded-ring streaming of a large relation)
+    pg(off): 5000005000.00|   pg(on): 5000005000|
+    CH executed : SELECT sum(p) FROM (SELECT * FROM streamed_table(\'/pgch_3263409_1_1_0\', \'p Decimal(15, 2)\') UNION ALL SELECT * FROM streamed_table(\'/pgch_3263409_1_1_1\', \'p Decimal(15, 2)\'))
+    CH read_rows=1000000  ShmAdoptedBlocks=18 (>= 10 expected)
+  PASS  big_decimal: offload result == baseline by value (OK maxrel=0.00e+00; bounded Decimal/Float64 deviation)
+  PASS  big_decimal: ClickHouse executed a new streamed_table() query
+  PASS  big_decimal: adopted many SHM blocks (ShmAdoptedBlocks=18 >= 10)
+  PASS  big_decimal: CH read_rows == 1000000 (whole relation streamed)
+  PASS  nan_fail_closed: offloaded query failed closed on an out-of-domain value
+  PASS  nan_fail_closed: no leaked /dev/shm object after the failed offload
+
+[disabled] (offload disabled)
+  PASS  disabled: result correct
+  PASS  disabled: ClickHouse saw no streamed_table query (not offloaded)
+
+[bare_count] (offload enabled, but ineligible)
+  PASS  bare_count: result correct
+  PASS  bare_count: planner declined (no streamed_table query)
+
+[teardown] (no leaked resources after the full matrix)
+  PASS  teardown: no leaked /dev/shm pgch objects
+  PASS  teardown: no leaked control sockets
+  PASS  teardown: no leaked streaming background workers
+
+================================================================
+PASS=137  FAIL=0
+ALL CHECKS PASSED
+VOF_DONE_EXIT=0

@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: (EXTRACT(year FROM orders.o_orderdate)), ((sum(CASE WHEN (n2.n_name = 'BRAZIL'::bpchar) THEN (lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) ELSE '0'::numeric END) / sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))))

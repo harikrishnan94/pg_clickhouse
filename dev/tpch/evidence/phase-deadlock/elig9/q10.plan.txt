@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: customer.c_custkey, customer.c_name, (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))), customer.c_acctbal, nation.n_name, customer.c_address, customer.c_phone, customer.c_comment

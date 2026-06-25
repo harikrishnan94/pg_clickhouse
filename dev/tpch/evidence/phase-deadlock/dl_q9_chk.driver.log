@@ -1,0 +1,1 @@
+EXIT=0 tag=dl_q9_chk out=/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase-deadlock/dl_q9_chk.out err=/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase-deadlock/dl_q9_chk.err

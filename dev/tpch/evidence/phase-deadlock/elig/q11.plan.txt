@@ -1,0 +1,5 @@
+Custom Scan (ClickHouseShmScan)
+  Output: partsupp.ps_partkey, (sum((partsupp.ps_supplycost * (partsupp.ps_availqty)::numeric)))
+  InitPlan 1
+    ->  Custom Scan (ClickHouseShmScan)
+          Output: ((sum((partsupp_1.ps_supplycost * (partsupp_1.ps_availqty)::numeric)) * 0.0000100000))

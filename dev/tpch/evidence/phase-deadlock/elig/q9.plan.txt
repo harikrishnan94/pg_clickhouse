@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: nation.n_name, (EXTRACT(year FROM orders.o_orderdate)), (sum(((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)) - (partsupp.ps_supplycost * lineitem.l_quantity))))

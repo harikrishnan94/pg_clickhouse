@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: l_returnflag, l_linestatus, (sum(l_quantity)), (sum(l_extendedprice)), (sum((l_extendedprice * ('1'::numeric - l_discount)))), (sum(((l_extendedprice * ('1'::numeric - l_discount)) * ('1'::numeric + l_tax)))), (avg(l_quantity)), (avg(l_extendedprice)), (avg(l_discount)), (count(*))

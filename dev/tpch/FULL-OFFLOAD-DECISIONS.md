@@ -142,10 +142,117 @@ also strips trailing blanks from bpchar (BPCHAROID) constants, so both sides are
 trimmed consistently. Verified `n_name = 'GERMANY '` → 1 == native; verify_offload
 137/0. (Closes the robustness follow-up noted in D0005.)
 
+## D0008 — 2026-06-25 — Phase 4: hash-join-BUILD deadlock ROOT-CAUSED & FIXED
+
+The Q8/Q9/Q11/Q14 deadlock from D0006 is fixed. **One CH-side change**, in
+`/home/ubuntu/ClickHouse/src/Interpreters/HashJoin/HashJoin.cpp` free function
+`materializeColumnsFromRightBlock` (the single chokepoint for `HashJoin::addBlockToJoin`
+AND `ConcurrentHashJoin::addBlockToJoin`): materialise build-side adopted columns with
+`actual_column = actual_column->convertToFullColumnIfAdopted();` (no-op for non-adopted).
+
+**Root cause (3 converging evidence classes; raw logs `dev/tpch/evidence/phase-deadlock/`).**
+The hash-join BUILD (right) side stores its blocks for the whole query. Those columns
+arrive from `streamed_table()` as zero-copy *adopted* columns aliasing a slot in the
+producer's bounded SHM ring (K=4 slots/ring, `PGCH_SHM_RING_DEPTH_K`). The hash table
+retained them → the slot's `RetainToken` never released → slot never returned to EMPTY.
+With only 4 slots/ring, once the build table outgrew the ring the PG producer blocked
+forever in `publish_block` (`shm_producer.c:622`, the `while state!=EMPTY` wait) → the
+build never completed → the probe never started → the CH consumer parked in
+`Epoll::getManyReady(timeout=-1)`. Evidence at the freeze (Q14, lineitem×part):
+- Liveness: `system.processes.read_rows` frozen at 1,048,576 (=16×65536) while elapsed
+  climbed 26.9s→174s (`dl_q14_diag.liveness.log`).
+- CH stacks: executor master in `ExecutorTasks::processAsyncTasks`/`PollingQueue`
+  epoll-wait; all 11 workers parked in `tryGetTask` (`dl_q14_diag.gdb.txt`).
+- PG stacks: all 11 producers blocked in `publish_block` ring-full wait
+  (`dl_q14_diag.producers.txt`).
+- Ring states (`dl_q14_diag.ringstates.txt`): the 16 `part` (build) slots all
+  `PUBLISHED/seq1/refcount=1` (drained AND retained); the 28 `lineitem` (probe) slots
+  `PUBLISHED/refcount=0` (never drained). 16×65536 = read_rows exactly.
+Canonical symptom reproduced with default 30s stall: `Code 781 SHM_PRODUCER_STALL
+'/pgch_..._2_2_0'` on the **part build** producer (`dl_q14_default.err`).
+**Why 3–6-way joins (Q3/Q5/Q7/Q10) never deadlocked:** their build (right) sides are
+small/filtered dimension tables that fit inside the retained ring capacity; only build
+sides that *exceed* the ring (unfiltered part 2M; partsupp 8M) trip it. Shape-specific,
+not arity. (Q19 is also lineitem×part but its selective part filter is pushed, so its
+build fits — it worked pre-fix.)
+
+**The fix is correct & necessary, not a workaround.** A hash table that retains its
+build blocks for the whole query cannot safely alias a *bounded streaming ring*; it must
+OWN the data. Materialising on the build side bounds SHM residency to the in-flight
+block, so slots recycle as the build advances and the build completes regardless of size.
+The probe/left side stays zero-copy (the real win — lineitem is the huge probe). NOT a
+producer-side change and does NOT raise `shm_source_stall_timeout_ms`.
+
+**Results (oracle = CH query_log; native compared per query). The deadlock is gone for
+ALL FOUR (read_rows advances past 1,048,576; no Code 781; clean teardown each run). But
+"fully offload CORRECTLY" holds only for Q9 and Q14; Q8 and Q11 reveal SEPARATE residual
+bugs (below).**
+- **Q14** ✅ fully offload + correct: read_rows 61,986,052, ShmAdoptedBlocks 961; full
+  JOIN+sum in CH; native `16.6475949416150953` vs offload `16.647594941615093` (rel
+  ~1.4e-16, F3-class).
+- **Q9** ✅ fully offload + correct: read_rows 85,086,077, blocks 1335, 175 rows; the
+  full 6-way JOIN+GROUP BY+sum is pushed; diff vs native is ONLY Decimal display-scale
+  trailing zeros (F1, normalized diff = 0).
+- **Q8** ⚠ pushes the full JOIN+aggregate to CH (oracle fires: read_rows 78,586,107,
+  blocks 1238, ch_join+ch_grpby, pg_agg=0) but the RESULT is DEGRADED by a *separate*
+  CH Decimal-division issue (below) — NOT "fully offload correctly".
+- **Q11** ⚠ deadlock GONE — now dispatches the full JOIN+GROUP BY+HAVING — but ERRORS
+  (Code 456, returns no rows) on a *separate* HAVING-subquery param-binding bug (below).
+
+**Regression evidence.** Adoption unit tests 84/84 (incl. new
+`Ac3AdoptionProof.BuildSideRetainedAdoptedColumnsAreMaterializedAndDrainTheRing`, which
+streams 120 blocks through a K=4 ring while a build-like consumer retains every
+materialised block and proves all ring slots release). `verify_offload.sh` 137/0, no
+leaks. The 9 prior queries (Q1,Q3,Q4,Q5,Q6,Q7,Q10,Q12,Q19) still fully offload with the
+same documented Decimal/Float/ordering fidelity. Single-table queries (Q1,Q6) never reach
+the changed (join-only) function. W-sweep: see RESULTS (build-side copy is of the small
+build tables only; probe path unchanged).
+
+**Two residual blockers UNMASKED by the fix (SEPARATE from the deadlock; logged, deferred).**
+- **Q8 — CH Decimal/Decimal division scale.** mkt_share = `sum(case…)/sum(volume)` is
+  Decimal/Decimal; CH gives the quotient the dividend's scale (4) → `0.0388` vs native
+  `0.03882014251433219622` (~5e-4 rel). This is a deparse fidelity gap (CH Decimal-division
+  semantics), NOT the deadlock. (Q14's ratio is Float64 because of its `100.00 *` literal,
+  so Q14 is exact.) Fix would deparse Decimal `/` via `toFloat64` (matching the accepted
+  avg→Float64 policy); deferred to avoid touching the deparse hot path in this minimal
+  deadlock fix.
+- **Q11 — HAVING scalar-subquery param unbound.** The non-correlated HAVING subquery
+  becomes a PG `PARAM_EXEC` (InitPlan); the deparser emits `{p1:Decimal}` but the SHM
+  one-shot HTTP dispatch never binds it → `Code 456 Substitution 'p1' is not set`. This is
+  the Phase-4 subquery-param-binding gap (the SHM dispatch must evaluate the InitPlan in PG
+  and bind/inline the value), NOT the deadlock. Deferred.
+
+**Known limitation of the fix (tracked).** The fix bounds SHM retention at the hash-join
+BUILD chokepoint only; the probe/left side stays zero-copy adopted (intentional — it is
+the large fact table and is consumed-and-released block by block). A future plan that
+*fully buffers a streamed probe side* before a blocking operator (sort-merge join,
+window/ORDER BY over a streamed source feeding a blocking node, certain self-joins) could
+re-exhaust the K=4 ring the same way. It is correct for all current hash-join shapes; a
+general "bounded SHM retention" guarantee would require materialising at every operator
+that can retain > ring-depth blocks. Logged as a known limitation, not a regression.
+
+**Evidence note (variance control).** The first back-to-back `eligibility-scan.sh` runs
+(`evidence/phase-deadlock/elig/`, `elig9/`) were taken under background-worker
+registration contention (multi-source queries needing many producers raced
+`max_worker_processes=32`; the worker pool was also shared with a concurrent adversarial
+reviewer), so their `SUMMARY.md` shows transient `scan_only?`/`ON_ERR` and raw unsorted
+`DIFF(...)` that DO NOT reflect steady-state behaviour. The authoritative results above
+were taken in ISOLATION (one query at a time, idle host) and re-confirmed by an
+independent reviewer: Q9/Q14 fully offload + correct; Q10's raw `DIFF(200846)` collapses
+to 0 after sort + CHAR-pad/trailing-zero normalisation. Clean isolated re-runs are in
+`evidence/phase-deadlock/` (the `dl_q*_chk` / `dl_q14_fixed` artifacts and the clean
+W-sweep `wsweep-clean/`).
+
 ## Queries provisionally NOT-YET-offloadable (root-caused, pending phase work)
 
 - **CH join READONLY/empty (Phase 2):** Q2, Q3, Q5, Q7, Q8, Q11, Q12, Q17, Q19, Q20.
-- **CH join deadlock (Phase 2):** Q9, Q14, Q21.
+- **CH hash-join-BUILD deadlock (Phase 4 — FIXED in D0008):** ~~Q9, Q14~~ now fully
+  offload; Q8 fully offloads (residual ratio-precision, D0008); Q11 deadlock gone
+  (residual HAVING-subquery param, D0008). Q21 join-build no longer deadlocks either,
+  but Q21 remains blocked by its anti-join + correlated EXISTS subqueries (Phase 4).
+- **CH Decimal/Decimal division scale (deparse fidelity, Phase 4):** Q8 mkt_share (D0008).
+- **HAVING/scalar-subquery PARAM_EXEC not bound by SHM dispatch (Phase 4):** Q11 (D0008),
+  and the related correlated-subquery family below.
 - **rescan unsupported (Phase 4):** Q16.
 - **correlated-subquery param unbound (Phase 4):** Q22.
 - **anti-join rejected `fdw.c:1865` (Phase 4):** Q16 (NOT IN), Q21, Q22 (NOT EXISTS).

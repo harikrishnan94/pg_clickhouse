@@ -1,0 +1,32 @@
+postmaster=2024103 clickhouse=3250756 db=tpch_sf10 N=5 W_LIST='8 16' QUERIES='1 5 10 19'
+
+## Q1  (offload eligibility: 925	59986052)
+
+| W | nat_med_ms | nat_min/max | nat_sd | nat_cores | off_med_ms | off_min/max | off_sd | off_prod | off_cons | speedup |
+|--:|-----------:|-------------|-------:|----------:|-----------:|-------------|-------:|---------:|---------:|--------:|
+| 8 | 4742 | 4739/4753 | 6 | 8.02 | 1651 | 1632/1676 | 15 | 4.06 | 1.28 | 2.87x |
+| 16 | 2504 | 2500/2514 | 5 | 15.89 | 956 | 952/960 | 2 | 7.91 | 2.33 | 2.62x |
+
+## Q5  (offload eligibility: 1199	76586082)
+
+| W | nat_med_ms | nat_min/max | nat_sd | nat_cores | off_med_ms | off_min/max | off_sd | off_prod | off_cons | speedup |
+|--:|-----------:|-------------|-------:|----------:|-----------:|-------------|-------:|---------:|---------:|--------:|
+| 8 | 1342 | 1334/1349 | 5 | 8.01 | 1534 | 1508/1544 | 13 | 4.89 | 1.24 | 0.87x |
+| 16 | 852 | 847/881 | 12 | 15.44 | 958 | 956/962 | 2 | 8.11 | 2.14 | 0.89x |
+
+## Q10  (offload eligibility: 1194	76486077)
+
+| W | nat_med_ms | nat_min/max | nat_sd | nat_cores | off_med_ms | off_min/max | off_sd | off_prod | off_cons | speedup |
+|--:|-----------:|-------------|-------:|----------:|-----------:|-------------|-------:|---------:|---------:|--------:|
+| 8 | 6049 | 6024/6073 | 18 | 2.86 | 6253 | 6214/6290 | 28 | 1.98 | 0.59 | 0.97x |
+| 16 | 5302 | 5291/5320 | 10 | 3.70 | 5613 | 5600/5679 | 29 | 2.42 | 0.73 | 0.94x |
+
+## Q19  (offload eligibility: 961	61986052)
+
+| W | nat_med_ms | nat_min/max | nat_sd | nat_cores | off_med_ms | off_min/max | off_sd | off_prod | off_cons | speedup |
+|--:|-----------:|-------------|-------:|----------:|-----------:|-------------|-------:|---------:|---------:|--------:|
+| 8 | 231 | 227/236 | 3 | 7.27 | 2256 | 2243/2265 | 9 | 4.12 | 0.56 | 0.10x |
+| 16 | 169 | 169/171 | 1 | 13.14 | 1292 | 1288/1298 | 3 | 7.96 | 1.06 | 0.13x |
+
+results written to /home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase-deadlock/wsweep-clean/RESULTS.md
+WSWEEPCLEAN_DONE_EXIT=0

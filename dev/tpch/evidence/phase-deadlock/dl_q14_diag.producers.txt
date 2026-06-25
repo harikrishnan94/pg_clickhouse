@@ -1,0 +1,176 @@
+===== worker 3239766 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0e028, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0d020) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0d020, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65489, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=2, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf21791e598, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=259, startup_data=0xbbf21791e598, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239767 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0e028, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0d020) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0d020, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65532, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=2, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf217916558, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=240, startup_data=0xbbf217916558, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239768 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0e028, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0d020) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0d020, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65514, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=2, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf21791c578, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=256, startup_data=0xbbf21791c578, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239769 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0e028, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0d020) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0d020, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65496, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=2, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf217922de0, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=251, startup_data=0xbbf217922de0, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239770 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65506, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf21791bd70, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=246, startup_data=0xbbf21791bd70, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239771 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65505, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf2179225d8, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=261, startup_data=0xbbf2179225d8, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239772 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65517, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf217919578, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=247, startup_data=0xbbf217919578, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239773 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65518, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf217920dc0, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=266, startup_data=0xbbf217920dc0, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239774 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65514, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf217915d50, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=243, startup_data=0xbbf217915d50, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239775 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65532, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf21791f5a8, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=250, startup_data=0xbbf21791f5a8, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379
+===== worker 3239776 =====
+#2  0x0000fd7dda7d573c [PAC] in clock_nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#3  0x0000fd7dda7e04c0 [PAC] in nanosleep () from /usr/lib/aarch64-linux-gnu/libc.so.6
+#4  0x0000bbf1d95d4090 [PAC] in pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:50
+#5  pg_usleep (microsec=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/port/pgsleep.c:41
+#6  0x0000fd79bc56f5f8 [PAC] in publish_block (p=0xbbf2179b4d60, payloads=0xbbf217a0cf48, n_payloads=<optimized out>, row_count=65536, is_eos=is_eos@entry=false) at src/shm_producer.c:622
+#7  0x0000fd79bc56fba8 [PAC] in shm_producer_publish (p=<optimized out>, payloads=<optimized out>, n_payloads=<optimized out>, row_count=<optimized out>) at src/shm_producer.c:781
+#8  columnizer_publish_block (cz=cz@entry=0xbbf217a0e028) at src/shm_offload.c:569
+#9  0x0000fd79bc570a80 [PAC] in pgch_columnizer_advance (cz=0xbbf217a0e028, nrows=<optimized out>) at src/shm_offload.c:775
+#10 pgch_stream_relation_vectorized (rel=<optimized out>, snapshot=<optimized out>, cols=<optimized out>, ncols=65508, producer=<optimized out>, rows_per_block=<optimized out>, bcursor=<optimized out>, out_stats=<optimized out>) at src/shm_page_reader.c:859
+#11 pgch_stream_relation_to_shm (rel=rel@entry=0xfd79bb8e2e18, snapshot=<optimized out>, cols=<optimized out>, ncols=ncols@entry=4, producer=producer@entry=0xbbf2179b4d60, rows_per_block=rows_per_block@entry=65536, bcursor=bcursor@entry=0xfd7ddbb9e178, out_stats=out_stats@entry=0x0) at src/shm_offload.c:1002
+#12 0x0000fd79bc576a20 [PAC] in pgch_shm_worker_main (main_arg=<optimized out>) at src/shm_worker.c:559
+#13 0x0000bbf1d92ebcfc [PAC] in BackgroundWorkerMain (startup_data=startup_data@entry=0xbbf21791eda0, startup_data_len=startup_data_len@entry=1472) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/bgworker.c:843
+#14 0x0000bbf1d92ed8d8 [PAC] in postmaster_child_launch (child_type=<optimized out>, child_slot=252, startup_data=0xbbf21791eda0, startup_data_len=1472, client_sock=0x0) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/launch_backend.c:290
+#15 0x0000bbf1d92f5128 [PAC] in StartBackgroundWorker (rw=<optimized out>) at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:4139
+#17 0x0000bbf1d92f7530 [PAC] in LaunchMissingBackgroundProcesses () at /usr/src/postgresql-18-18.4-0ubuntu0.26.04.1/build/../src/backend/postmaster/postmaster.c:3379

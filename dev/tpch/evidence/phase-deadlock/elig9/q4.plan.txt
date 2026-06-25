@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: orders.o_orderpriority, (count(*))

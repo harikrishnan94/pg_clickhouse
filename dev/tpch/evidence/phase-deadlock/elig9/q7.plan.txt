@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: n1.n_name, n2.n_name, (EXTRACT(year FROM lineitem.l_shipdate)), (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount))))

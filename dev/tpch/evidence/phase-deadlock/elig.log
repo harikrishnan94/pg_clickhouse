@@ -1,0 +1,14 @@
+=== Phase-0 eligibility scan: db=tpch_sf10  CH=http://127.0.0.1:21002  out=/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase-deadlock/elig ===
+Q8  fully      shmscan=1 strmd=1 blocks=1238 rows=2/2 fid=DIFF(4 lines)
+Q9  scan_only? shmscan=1 strmd=0 blocks=0 rows=175/175 fid=DIFF(26 lines)
+Q11 scan_only? shmscan=2 strmd=0 blocks=0 rows=8685/0 fid=ON_ERR
+Q14 fully      shmscan=1 strmd=1 blocks=961 rows=1/1 fid=DIFF(2 lines)
+
+=== SUMMARY (/home/ubuntu/pg_clickhouse/dev/tpch/evidence/phase-deadlock/elig/SUMMARY.md) ===
+| Q | verdict | shmscan | strmd_q | ShmBlocks | read_rows | pg_join | pg_agg | ch_join | ch_grpby | rows off/on | fidelity |
+|---|---------|--------:|--------:|----------:|----------:|--------:|-------:|:-------:|:--------:|------------|----------|
+| 8 | fully | 1 | 1 | 1238 | 78586107 | 0 | 0 | yes | yes | 2/2 | DIFF(4 lines) |
+| 9 | scan_only? | 1 | 0 | 0 | 0 | 0 | 0 | no | no | 175/175 | DIFF(26 lines) |
+| 11 | scan_only? | 2 | 0 | 0 | 0 | 0 | 0 | no | no | 8685/0 | ON_ERR |
+| 14 | fully | 1 | 1 | 961 | 61986052 | 0 | 0 | yes | no | 1/1 | DIFF(2 lines) |
+ELIG_DONE_EXIT=0

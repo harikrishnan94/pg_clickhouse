@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: lineitem.l_orderkey, (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))), orders.o_orderdate, orders.o_shippriority

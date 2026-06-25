@@ -1,0 +1,14 @@
+pgch_3239765_1_1_0: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_1: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_2: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_3: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_4: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_5: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_1_1_6: s0:PUBLISHED/seq1/ref0/eos0/rows65536  s1:PUBLISHED/seq1/ref0/eos0/rows65536  s2:PUBLISHED/seq1/ref0/eos0/rows65536  s3:PUBLISHED/seq1/ref0/eos0/rows65536
+pgch_3239765_2_2_0: s0:PUBLISHED/seq1/ref1/eos0/rows65536  s1:PUBLISHED/seq1/ref1/eos0/rows65536  s2:PUBLISHED/seq1/ref1/eos0/rows65536  s3:PUBLISHED/seq1/ref1/eos0/rows65536
+pgch_3239765_2_2_1: s0:PUBLISHED/seq1/ref1/eos0/rows65536  s1:PUBLISHED/seq1/ref1/eos0/rows65536  s2:PUBLISHED/seq1/ref1/eos0/rows65536  s3:PUBLISHED/seq1/ref1/eos0/rows65536
+pgch_3239765_2_2_2: s0:PUBLISHED/seq1/ref1/eos0/rows65536  s1:PUBLISHED/seq1/ref1/eos0/rows65536  s2:PUBLISHED/seq1/ref1/eos0/rows65536  s3:PUBLISHED/seq1/ref1/eos0/rows65536
+pgch_3239765_2_2_3: s0:PUBLISHED/seq1/ref1/eos0/rows65536  s1:PUBLISHED/seq1/ref1/eos0/rows65536  s2:PUBLISHED/seq1/ref1/eos0/rows65536  s3:PUBLISHED/seq1/ref1/eos0/rows65536
+
+=== aggregate slot-state counts across all rings ===
+  PUBLISHED: 44
