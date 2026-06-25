@@ -73,6 +73,16 @@ typedef struct PgchVisStats
     uint64 n_invisible_fast;    /* definite-INVISIBLE verdicts from the kernel */
     uint64 n_undecided;         /* UNDECIDED verdicts handed to the MVCC oracle */
     uint64 n_slow_visible;      /* of those, how many the oracle judged visible */
+
+    /*
+     * Producer-phase split (benchmark instrumentation; filled only when the
+     * shm_log_stream_stats GUC is set, else left zeroed). Index order matches
+     * enum PgchPhase in shm_phase.h: [0]=READ [1]=DEFORM [2]=PUBLISH [3]=STALL.
+     * By construction these partition the vectorized reader's timed region, so
+     * sum(phase_cpu_ns) == the worker's getrusage CPU within clock noise (gate G1).
+     */
+    uint64 phase_cpu_ns[4];     /* CLOCK_THREAD_CPUTIME_ID ns per phase */
+    uint64 phase_wall_ns[4];    /* CLOCK_MONOTONIC ns per phase */
 } PgchVisStats;
 
 /*

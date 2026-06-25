@@ -43,6 +43,7 @@
 #include "utils/wait_event.h"
 
 #include "shm_offload.h"
+#include "shm_phase.h"
 #include "shm_producer.h"
 #include "shm_worker.h"
 
@@ -554,6 +555,29 @@ pgch_shm_worker_main(Datum main_arg)
                      vis.pages_total, vis.pages_all_visible, vis.pages_classified,
                      vis.tuples_gathered, vis.n_visible_fast, vis.n_invisible_fast,
                      vis.n_undecided, vis.n_slow_visible);
+
+            /* Producer-phase split (CPU + wall ms per phase). sum_cpu is the
+             * internal self-consistency check against cpu= above (gate G1). The
+             * stall is the ring-full backpressure wait (idle, consumer-bound),
+             * reported separately and kept out of publish. Vectorized reader only. */
+            if (vis.used_vectorized)
+            {
+                double rd_c = vis.phase_cpu_ns[PGCH_PH_READ] / 1.0e6;
+                double df_c = vis.phase_cpu_ns[PGCH_PH_DEFORM] / 1.0e6;
+                double pb_c = vis.phase_cpu_ns[PGCH_PH_PUBLISH] / 1.0e6;
+                double st_c = vis.phase_cpu_ns[PGCH_PH_STALL] / 1.0e6;
+                double rd_w = vis.phase_wall_ns[PGCH_PH_READ] / 1.0e6;
+                double df_w = vis.phase_wall_ns[PGCH_PH_DEFORM] / 1.0e6;
+                double pb_w = vis.phase_wall_ns[PGCH_PH_PUBLISH] / 1.0e6;
+                double st_w = vis.phase_wall_ns[PGCH_PH_STALL] / 1.0e6;
+
+                elog(LOG,
+                     "pg_clickhouse shm phase: read_cpu=%.1f deform_cpu=%.1f "
+                     "publish_cpu=%.1f stall_cpu=%.1f sum_cpu=%.1f | "
+                     "read_wall=%.1f deform_wall=%.1f publish_wall=%.1f stall_wall=%.1f (ms)",
+                     rd_c, df_c, pb_c, st_c, rd_c + df_c + pb_c + st_c,
+                     rd_w, df_w, pb_w, st_w);
+            }
         }
         else
             (void) pgch_stream_relation_to_shm(rel, GetActiveSnapshot(), cols, ncols,

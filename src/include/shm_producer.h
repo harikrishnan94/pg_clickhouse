@@ -147,4 +147,14 @@ extern const char *shm_producer_shm_name(const ShmProducer *p);
  */
 extern void shm_producer_set_origin_pid(ShmProducer *p, int pid);
 
+/*
+ * Attach a per-worker phase stopwatch (benchmark instrumentation). When set,
+ * publish_block charges the ring-full wait to PUBLISH_STALL and the slot memcpy
+ * to PUBLISH, save/restoring the caller's current phase. NULL disables it (the
+ * default). The pointer must outlive every publish; the reader clears it (NULL)
+ * before its stack frame goes away so the post-scan EOS publish is unaffected.
+ */
+struct PgchPhaseTimers;
+extern void shm_producer_set_phase_timers(ShmProducer *p, struct PgchPhaseTimers *t);
+
 #endif /* PG_CLICKHOUSE_SHM_PRODUCER_H */

@@ -1,0 +1,13 @@
+# Top-N tie-reshuffle adjudication (tiebreak_check.sh) — 2026-06-25 18:00:52
+# Each DIFF top-N query re-run native-vs-offload with a DETERMINISTIC total-order tiebreak.
+# Collapse to 'exact' => the sweep DIFF was benign tie-reshuffle (equal-ranked LIMIT-boundary rows),
+# an ALLOWED bounded deviation. A real value bug would stay DIFF. Oracle (ShmBlk>=1) + CH ORDER BY+LIMIT confirmed.
+
+Q     verdict  fidelity   ShmBlk   ch_ord/lim detail
+q18   OK       exact      161      yes/yes   rows=10/10 
+q22   OK       exact      163      yes/yes   rows=10/10 
+q32   OK       exact      162      yes/yes   rows=10/10 
+q33   OK       exact      163      yes/yes   rows=10/10 
+q39   OK       exact      161      yes/yes   rows=10/10 
+q40   OK       exact      163      yes/yes   rows=10/10 
+q41   OK       exact      164      yes/yes   rows=10/10 

@@ -1,0 +1,24 @@
+# G1 + G2 convergence evidence — Q6 offload (lineitem ~60M, 4 producers, uncapped warm)
+## pg_clickhouse SHA: 35776e62c53d6ce557c07f2e0ce21cc69d9d10f0
+## ClickHouse SHA: 93381ccf9fba48170df206554afc48c9b48e54ea  v26.6.1.1
+
+## G1 (in-code per-phase CLOCK_THREAD_CPUTIME sum vs getrusage cpu_ms), per worker:
+(from the G1 proof run; sum_cpu vs the stream-line cpu=)
+  worker A: getrusage cpu=1252.6  sum_cpu=1252.4  (read 880.5 / deform 356.6 / publish 15.2 / stall 0.1)
+  worker B: getrusage cpu=1252.4  sum_cpu=1252.2  (read 881.8 / deform 355.1 / publish 15.3 / stall 0.1)
+  worker C: getrusage cpu=1252.7  sum_cpu=1252.5  (read 882.6 / deform 355.0 / publish 14.8 / stall 0.1)
+  worker D: getrusage cpu=1252.8  sum_cpu=1252.6  (read 878.6 / deform 358.4 / publish 15.5 / stall 0.1)
+  => |sum_cpu - getrusage| <= 0.2 ms (<0.02%), ALL 4 workers. sum_wall reconciles to wall= too.
+  in-code split (of read+deform+publish): READ 70.3% / DEFORM 28.5% / PUBLISH 1.2% / STALL ~0
+
+## G2 (perf PMU cycles, 160707 samples; comm=postgres, --inline; full-stack phase classification):
+total producer samples=51690
+READ            17389   33.64%
+PUBLISH           706    1.37%
+READ_FAULT      17885   34.60%
+DEFORM          12176   23.56%
+OTHER            3534    6.84%
+--- among READ+DEFORM+PUBLISH: READ=73.2% DEFORM=25.3% PUBLISH=1.5% (READ_FAULT incl in READ)
+
+## G2 vs G1: READ 73.2 vs 70.3 (4.1% rel); DEFORM 25.3 vs 28.5 (~1 stdev); PUBLISH 1.5 vs 1.2.
+## Both instruments: READ dominates (~70-73%), DEFORM ~25-28%, PUBLISH ~1.5%, STALL ~0. CONVERGE.

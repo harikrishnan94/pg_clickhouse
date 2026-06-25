@@ -51,6 +51,7 @@
 #include "shm_deform.h"
 #include "shm_offload.h"
 #include "shm_page_reader.h"
+#include "shm_phase.h"
 #include "shm_producer.h"
 #include "shm_visibility.h"
 #include "pgch_jit.h"        /* PgchJitDeform / PgchJitGetFn (optional module) */
@@ -651,6 +652,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     void               **dst_bases = NULL;  /* [col_index] -> columnizer fixed base (JIT arg) */
     PgchVisDesc          visdesc;       /* per-scan snapshot bounds for the classify kernel */
     PgchVisStats         vis;           /* per-scan visibility-path counters */
+    PgchPhaseTimers      timers;        /* per-scan producer-phase stopwatch (benchmark only) */
     uint32               cum;
     Datum               *values;
     bool                *isnull;
@@ -747,6 +749,16 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     memset(&vis, 0, sizeof(vis));
     vis.used_vectorized = true;
 
+    /* Producer-phase stopwatch (benchmark instrumentation; no-op unless the
+     * shm_log_stream_stats GUC is set). Start in DEFORM so per-scan setup folds
+     * into deform; the block loop switches to READ/DEFORM per page and
+     * publish_block charges PUBLISH/PUBLISH_STALL. The producer must hold the
+     * pointer before the first publish; the reader clears it before returning. */
+    memset(&timers, 0, sizeof(timers));
+    timers.enabled = pgch_log_stream_stats;
+    pgch_phase_begin(&timers, PGCH_PH_DEFORM);
+    shm_producer_set_phase_timers(producer, &timers);
+
     /* Match a stock seqscan: BAS_BULKREAD keeps a large scan from evicting the
      * shared-buffer working set. */
     strategy = GetAccessStrategy(BAS_BULKREAD);
@@ -824,6 +836,7 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
 
         CHECK_FOR_INTERRUPTS();
 
+        pgch_phase_switch(&timers, PGCH_PH_READ);
         buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buf);
@@ -839,6 +852,8 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
         /* Visibility decisions (and any hint-bit writes by the fallback) are
          * done; drop the lock and deform the visible tuples under the pin. */
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+        pgch_phase_switch(&timers, PGCH_PH_DEFORM);
 
         /* Group A: NULL-free tuples, column-major C++ driver. (Emitting A then
          * B then C reorders within the page, which is fine: the offload feeds
@@ -919,8 +934,28 @@ pgch_stream_relation_vectorized(Relation rel, Snapshot snapshot,
     pfree(plan.fixed);
     pfree(meta);
 
-    if (out_stats)
-        *out_stats = vis;
+    /* Flush the final partial block (publishes under save/restore) while the
+     * stopwatch is still live, then stop it: charge the trailing segment to the
+     * current phase. Detach the timers from the producer BEFORE returning -- the
+     * worker's post-scan EOS publish runs after this stack frame is gone. */
+    {
+        uint64 nrows = pgch_columnizer_finish(cz);
 
-    return pgch_columnizer_finish(cz);
+        pgch_phase_switch(&timers, timers.cur);     /* flush trailing segment */
+        shm_producer_set_phase_timers(producer, NULL);
+        if (timers.enabled)
+        {
+            int ph;
+
+            for (ph = 0; ph < PGCH_PH_N; ph++)
+            {
+                vis.phase_cpu_ns[ph] = timers.cpu_ns[ph];
+                vis.phase_wall_ns[ph] = timers.wall_ns[ph];
+            }
+        }
+        if (out_stats)
+            *out_stats = vis;
+
+        return nrows;
+    }
 }

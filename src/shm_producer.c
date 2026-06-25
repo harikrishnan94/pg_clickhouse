@@ -21,6 +21,7 @@
 #include "utils/memutils.h"     /* MemoryContextCallback */
 
 #include "shm_producer.h"
+#include "shm_phase.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -153,6 +154,9 @@ struct ShmProducer {
 
     MemoryContext owner_cxt;
     MemoryContextCallback cleanup_cb;
+
+    /* Optional per-worker phase stopwatch (benchmark instrumentation; NULL = off). */
+    PgchPhaseTimers *timers;
 };
 
 /* --------------------------------------------------------------------- */
@@ -578,6 +582,12 @@ shm_producer_set_origin_pid(ShmProducer *p, int pid)
     p->origin_pid = pid;
 }
 
+void
+shm_producer_set_phase_timers(ShmProducer *p, struct PgchPhaseTimers *t)
+{
+    p->timers = (PgchPhaseTimers *) t;
+}
+
 /* --------------------------------------------------------------------- */
 /* Publish */
 /* --------------------------------------------------------------------- */
@@ -594,6 +604,7 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
     size_t cursor;
     size_t slot_end;
     int i;
+    int saved_phase = -1;   /* phase to restore on return (benchmark instrumentation) */
 
     if (p->eos_published)
         ereport(ERROR, (errmsg("pg_clickhouse: shm stream already ended")));
@@ -606,6 +617,12 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
 
     slot_pos = p->next_slot % p->ring_depth_k;
     slot = slot_at(p, slot_pos);
+
+    /* Charge the ring-full wait to PUBLISH_STALL (idle time waiting on the
+     * consumer, NOT producer work), save/restoring the caller's phase. */
+    if (p->timers != NULL && p->timers->enabled)
+        saved_phase = p->timers->cur;
+    pgch_phase_switch(p->timers, PGCH_PH_STALL);
 
     /* Wait for the slot to be reusable. The consumer drives PUBLISHED->EMPTY on
      * the last retain drop, so we poll state==EMPTY (never retain_refcount). Pump
@@ -621,6 +638,9 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
                             "abandoning SHM stream", p->origin_pid)));
         pg_usleep(1000L);       /* 1 ms */
     }
+
+    /* Wait over: the memcpy of built columns into the slot is PUBLISH work. */
+    pgch_phase_switch(p->timers, PGCH_PH_PUBLISH);
 
     /* EMPTY -> WRITING (counter bump before the state store, both release). */
     __atomic_fetch_add(&slot->transition_counter, 1, __ATOMIC_RELEASE);
@@ -716,6 +736,10 @@ publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
         ssize_t w = write(p->event_fd, &one, sizeof(one));
         (void) w;   /* EAGAIN on a full counter is harmless: consumer still polls */
     }
+
+    /* Resume the caller's phase (PUBLISH work charged; back to DEFORM, etc.). */
+    if (saved_phase >= 0)
+        pgch_phase_switch(p->timers, saved_phase);
 
     p->next_slot++;
     return;
