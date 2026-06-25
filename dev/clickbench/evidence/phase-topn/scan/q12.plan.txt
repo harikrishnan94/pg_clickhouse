@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: mobilephone, mobilephonemodel, (count(DISTINCT userid))

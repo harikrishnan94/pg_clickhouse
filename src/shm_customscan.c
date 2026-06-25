@@ -131,6 +131,12 @@ typedef struct ShmScanState {
 static void shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
                                    RelOptInfo *input_rel, RelOptInfo *output_rel,
                                    void *extra);
+static void shm_add_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                                   RelOptInfo *output_rel, void *extra);
+static void shm_add_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                                  RelOptInfo *output_rel);
+static void shm_add_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                                RelOptInfo *output_rel, void *extra);
 static Plan *shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
                                   CustomPath *best_path, List *tlist,
                                   List *clauses, List *custom_plans);
@@ -441,14 +447,64 @@ shm_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 /* --------------------------------------------------------------------- */
 
 /*
+ * create_upper_paths_hook entry point. Dispatches to the per-stage helpers,
+ * mirroring the FDW's clickhouseGetForeignUpperPaths:
+ *   - UPPERREL_GROUP_AGG: push the scan+filter+aggregate fragment.
+ *   - UPPERREL_ORDERED:   push the final ORDER BY into the dispatched SQL.
+ *   - UPPERREL_FINAL:     push the LIMIT/OFFSET (and ORDER BY) into the SQL.
+ *
+ * The ORDERED/FINAL paths do NOT build a fresh CHFdwRelationInfo for the
+ * deparse: they reuse the underlying (grouping or base) rel as the CustomPath's
+ * parent so shm_plan_custom_path runs against that rel's already-correct fpinfo.
+ * This is the key correctness fix over the reverted D0015 attempt, which
+ * shallow-memcpy'd the grouped fpinfo (sharing List* pointers -> corruption) and
+ * mis-wired the ordered/final scan tuple (-> 0 rows). The ordered/final
+ * output_rel->fdw_private here is only a tiny navigation marker (stage +
+ * outerrel) used to step back from FINAL through ORDERED; it is never the
+ * deparse fpinfo.
+ */
+static void
+shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+                       RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
+{
+    if (prev_create_upper_paths_hook)
+        prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+    if (!pgch_enable_shm_offload)
+        return;
+    if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_ORDERED &&
+        stage != UPPERREL_FINAL)
+        return;
+    if (output_rel->fdw_private != NULL)
+        return;                         /* already considered */
+    if (input_rel->fdw_private == NULL)
+        return;                         /* input is not an SHM-offload source */
+
+    switch (stage)
+    {
+        case UPPERREL_GROUP_AGG:
+            shm_add_grouping_paths(root, input_rel, output_rel, extra);
+            break;
+        case UPPERREL_ORDERED:
+            shm_add_ordered_paths(root, input_rel, output_rel);
+            break;
+        case UPPERREL_FINAL:
+            shm_add_final_paths(root, input_rel, output_rel, extra);
+            break;
+        default:
+            break;
+    }
+}
+
+/*
  * For a GROUP/aggregate upper rel whose input is an offload-eligible heap rel,
  * add a CustomScan path that pushes the whole scan+filter+aggregate fragment to
  * ClickHouse (deparsed against streamed_table()). Reuses the FDW's
  * foreign_grouping_ok to validate shippability and build the grouped tlist.
  */
 static void
-shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
-                       RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
+shm_add_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                       RelOptInfo *output_rel, void *extra)
 {
     CHFdwRelationInfo *ifpinfo;
     CHFdwRelationInfo *fpinfo;
@@ -457,15 +513,6 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
     CustomPath *cpath;
     bool ok = false;
 
-    if (prev_create_upper_paths_hook)
-        prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
-
-    if (!pgch_enable_shm_offload)
-        return;
-    if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private != NULL)
-        return;
-    if (input_rel->fdw_private == NULL)
-        return;
     ifpinfo = (CHFdwRelationInfo *) input_rel->fdw_private;
     /* The input must be a pushdown-safe SHM source: a heap-offload base relation
      * or a pushed-down SHM join. A grouped fragment over a join streams every
@@ -485,7 +532,7 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
      * so is_heap_offload stays false here; shm_collect_sources walks outerrel to
      * find every leaf relation to stream. */
     fpinfo = (CHFdwRelationInfo *) palloc0(sizeof(CHFdwRelationInfo));
-    fpinfo->stage = stage;
+    fpinfo->stage = UPPERREL_GROUP_AGG;
     fpinfo->pushdown_safe = false;
     fpinfo->outerrel = input_rel;
     fpinfo->server = ifpinfo->server;
@@ -549,6 +596,203 @@ shm_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
     cpath->flags = 0;
     cpath->custom_paths = NIL;
     cpath->custom_private = NIL;
+    cpath->methods = &shm_path_methods;
+    add_path(output_rel, (Path *) cpath);
+}
+
+/*
+ * custom_private indexes for an ORDERED/FINAL CustomPath. These carry the two
+ * flags shm_plan_custom_path passes through to the deparser (the path's
+ * .pathkeys carries the sort keys). A grouping/base CustomPath leaves
+ * custom_private NIL, which shm_plan_custom_path reads as [false, false].
+ */
+enum ShmTopNPathPrivate {
+    ShmTopNHasFinalSort = 0,    /* Integer bool: ORDER BY resolves vs the upper target */
+    ShmTopNHasLimit             /* Integer bool: append LIMIT/OFFSET from root->parse */
+};
+
+/*
+ * UPPERREL_ORDERED: push the query's final ORDER BY into the dispatched SQL.
+ *
+ * The input is either our pushed-down GROUP BY/aggregate rel (aggregate top-N:
+ * ORDER BY over grouped output expressions, has_final_sort=true) or a base /
+ * join SHM source (projection top-N like Q24-27: ORDER BY over plain columns,
+ * has_final_sort=false). In both cases the new path's parent is the input rel,
+ * so shm_plan_custom_path deparses against the input's real fpinfo and merely
+ * appends the ORDER BY built from root->sort_pathkeys.
+ */
+static void
+shm_add_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                      RelOptInfo *output_rel)
+{
+    Query *parse = root->parse;
+    CHFdwRelationInfo *ifpinfo = (CHFdwRelationInfo *) input_rel->fdw_private;
+    CHFdwRelationInfo *fpinfo;
+    CustomPath *cpath;
+    bool input_is_grouping;
+    ListCell *lc;
+
+    if (!parse->sortClause)
+        return;                         /* nothing to order */
+    if (parse->hasTargetSRFs)
+        return;
+
+    input_is_grouping = IS_UPPER_REL(input_rel) &&
+                        ifpinfo->stage == UPPERREL_GROUP_AGG;
+
+    /* The input must be one of our SHM-offload sources. A grouping rel that
+     * offloaded has fdw_private set with stage GROUP_AGG; a base/join source has
+     * is_heap_offload / IS_JOIN_REL and pushdown_safe. */
+    if (!input_is_grouping)
+    {
+        if (!(ifpinfo->is_heap_offload || IS_JOIN_REL(input_rel)))
+            return;
+        if (!ifpinfo->pushdown_safe)
+            return;
+    }
+
+    /* Assess that every sort key is safe to push down to ClickHouse. */
+    foreach (lc, root->sort_pathkeys)
+    {
+        PathKey *pathkey = (PathKey *) lfirst(lc);
+        EquivalenceClass *ec = pathkey->pk_eclass;
+        Expr *sort_expr;
+
+        if (ec->ec_has_volatile)
+            return;
+
+        if (input_is_grouping)
+        {
+            /* Grouped output may have an empty reltarget; use the planner's
+             * upper target for the grouping stage (carries sortgrouprefs). */
+            PathTarget *target = input_rel->reltarget->exprs != NIL
+                ? input_rel->reltarget
+                : root->upper_targets[ifpinfo->stage];
+
+            sort_expr = chfdw_find_em_expr_for_input_target(root, ec, target);
+        }
+        else
+            sort_expr = chfdw_find_em_expr_for_rel(ec, input_rel);
+
+        if (sort_expr == NULL || !chfdw_is_foreign_expr(root, input_rel, sort_expr))
+            return;
+    }
+
+    /* Navigation marker only: lets shm_add_final_paths step back to input_rel.
+     * Never used as the deparse fpinfo (the path's parent carries that). */
+    fpinfo = (CHFdwRelationInfo *) palloc0(sizeof(CHFdwRelationInfo));
+    fpinfo->stage = UPPERREL_ORDERED;
+    fpinfo->pushdown_safe = true;
+    fpinfo->outerrel = input_rel;
+    fpinfo->server = ifpinfo->server;
+    output_rel->fdw_private = fpinfo;
+
+    cpath = makeNode(CustomPath);
+    cpath->path.pathtype = T_CustomScan;
+    cpath->path.parent = input_rel;     /* reuse the input rel's real fpinfo */
+    cpath->path.pathtarget = root->upper_targets[UPPERREL_ORDERED];
+    cpath->path.param_info = NULL;
+    cpath->path.rows = input_rel->rows > 0 ? input_rel->rows : 1;
+    cpath->path.startup_cost = 0.0;
+    cpath->path.total_cost = 1.5;        /* beat a PG Sort over the input path */
+    cpath->path.pathkeys = root->sort_pathkeys;
+    cpath->flags = 0;
+    cpath->custom_paths = NIL;
+    cpath->custom_private = list_make2(makeInteger(input_is_grouping ? 1 : 0),
+                                       makeInteger(0));
+    cpath->methods = &shm_path_methods;
+    add_path(output_rel, (Path *) cpath);
+}
+
+/*
+ * UPPERREL_FINAL: push the LIMIT/OFFSET (and the final ORDER BY, if any) into
+ * the dispatched SQL so ClickHouse returns only the requested top-k window
+ * rather than streaming the whole grouped/filtered relation back for PG to
+ * Sort+Limit.
+ *
+ * Mirrors the FDW's add_foreign_final_paths: if the input is our ORDERED rel we
+ * step back to its input (the grouping/base/join source) and re-apply the sort
+ * remotely; otherwise (LIMIT without ORDER BY, e.g. Q18) the input is the source
+ * directly. The path is costed very cheap (negative total, like the FDW) so the
+ * planner always prefers it over a PG Limit node -- which is what avoids the
+ * OFFSET double-apply hazard (no PG Limit means OFFSET is applied once, in CH).
+ */
+static void
+shm_add_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
+                    RelOptInfo *output_rel, void *extra)
+{
+    Query *parse = root->parse;
+    FinalPathExtraData *fextra = (FinalPathExtraData *) extra;
+    CHFdwRelationInfo *ifpinfo = (CHFdwRelationInfo *) input_rel->fdw_private;
+    CHFdwRelationInfo *fpinfo;
+    CustomPath *cpath;
+    List *pathkeys = NIL;
+    bool had_order = false;
+    bool parent_is_grouping;
+    bool has_final_sort;
+
+    if (parse->commandType != CMD_SELECT)
+        return;
+    if (!fextra->limit_needed)
+        return;                         /* no LIMIT/OFFSET to push */
+    if (parse->hasTargetSRFs)
+        return;
+
+    /* If the input is our ORDERED rel, the final sort is applied remotely too;
+     * step back to the underlying grouping/base/join source for the deparse. */
+    if (IS_UPPER_REL(input_rel) && ifpinfo->stage == UPPERREL_ORDERED)
+    {
+        input_rel = ifpinfo->outerrel;
+        ifpinfo = (CHFdwRelationInfo *) input_rel->fdw_private;
+        had_order = true;
+        pathkeys = root->sort_pathkeys;
+    }
+
+    parent_is_grouping = IS_UPPER_REL(input_rel) &&
+                         ifpinfo->stage == UPPERREL_GROUP_AGG;
+
+    if (!parent_is_grouping)
+    {
+        if (!(ifpinfo->is_heap_offload || IS_JOIN_REL(input_rel)))
+            return;
+        if (!ifpinfo->pushdown_safe)
+            return;
+    }
+
+    /* The LIMIT/OFFSET cannot be pushed down if the underlying scan has any
+     * local conditions, or if the count/offset expressions are not shippable. */
+    if (ifpinfo->local_conds)
+        return;
+    if (!chfdw_is_foreign_expr(root, input_rel, (Expr *) parse->limitOffset) ||
+        !chfdw_is_foreign_expr(root, input_rel, (Expr *) parse->limitCount))
+        return;
+
+    /* has_final_sort drives how appendOrderByClause resolves the sort exprs:
+     * via the upper target for a grouping parent, via plain Vars for base/join.
+     * It is true only when we are re-applying a sort over a grouping rel. */
+    has_final_sort = had_order && parent_is_grouping;
+
+    /* Navigation marker for the final rel (not used as the deparse fpinfo). */
+    fpinfo = (CHFdwRelationInfo *) palloc0(sizeof(CHFdwRelationInfo));
+    fpinfo->stage = UPPERREL_FINAL;
+    fpinfo->pushdown_safe = true;
+    fpinfo->outerrel = input_rel;
+    fpinfo->server = ifpinfo->server;
+    output_rel->fdw_private = fpinfo;
+
+    cpath = makeNode(CustomPath);
+    cpath->path.pathtype = T_CustomScan;
+    cpath->path.parent = input_rel;     /* reuse the input rel's real fpinfo */
+    cpath->path.pathtarget = root->upper_targets[UPPERREL_FINAL];
+    cpath->path.param_info = NULL;
+    cpath->path.rows = 1;
+    cpath->path.startup_cost = 0.0;
+    cpath->path.total_cost = -10.0;     /* always beat a PG Limit (no double-apply) */
+    cpath->path.pathkeys = pathkeys;
+    cpath->flags = 0;
+    cpath->custom_paths = NIL;
+    cpath->custom_private = list_make2(makeInteger(has_final_sort ? 1 : 0),
+                                       makeInteger(1));
     cpath->methods = &shm_path_methods;
     add_path(output_rel, (Path *) cpath);
 }
@@ -649,6 +893,20 @@ shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
     List *sources = NIL;
     StringInfoData sql;
     Index scan_relid;
+    bool has_final_sort = false;
+    bool has_limit = false;
+
+    /*
+     * ORDERED/FINAL top-N pushdown carries [has_final_sort, has_limit] in the
+     * CustomPath's custom_private and the sort keys in the path's pathkeys (see
+     * shm_add_ordered_paths / shm_add_final_paths). A plain grouping/base/join
+     * path leaves custom_private NIL -> both flags stay false.
+     */
+    if (best_path->custom_private != NIL)
+    {
+        has_final_sort = intVal(list_nth(best_path->custom_private, ShmTopNHasFinalSort));
+        has_limit = intVal(list_nth(best_path->custom_private, ShmTopNHasLimit));
+    }
 
     if (IS_UPPER_REL(rel))
     {
@@ -696,8 +954,9 @@ shm_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
     }
 
     initStringInfo(&sql);
-    chfdw_deparse_select_stmt_for_rel(&sql, root, rel, fdw_scan_tlist, remote_exprs, NIL,
-                                      false, false, false,
+    chfdw_deparse_select_stmt_for_rel(&sql, root, rel, fdw_scan_tlist, remote_exprs,
+                                      best_path->path.pathkeys,
+                                      has_final_sort, has_limit, false,
                                       &retrieved_attrs, &params_list);
 
     /*

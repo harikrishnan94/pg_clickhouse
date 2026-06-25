@@ -390,3 +390,127 @@ fresh) fpinfo for the ordered/final rel rather than a shared shallow copy, and
 (b) correct CustomScan `custom_scan_tlist` / output-tlist wiring for the
 ordered/final upper rel so the executor reads the bounded CH result. Worth
 revisiting as a dedicated perf effort with executor-level gating.
+
+**RESOLVED (top-N phase) — root cause + the fix that lands it.**
+The reverted attempt built a *separate* `CHFdwRelationInfo` for the ordered/final
+rel (a shallow `memcpy` of the grouped fpinfo) and made that rel the
+CustomPath's `parent`, so `shm_plan_custom_path` deparsed against the COPY. Two
+bugs followed: (1) the copy shared `List*` fields (`grouped_tlist`,
+`remote_conds`, `outerrel`, …) with the grouped fpinfo, which planner/executor
+passes (e.g. `set_customscan_references`) mutate in place → corruption +
+intermittency (10 rows once, 0 thrice); (2) the ordered/final rel's
+`custom_scan_tlist`/output-tlist were derived from that copy and did not
+describe the scan tuple the executor read back → 0 rows.
+
+The landed fix removes the copy entirely, mirroring the FDW's
+`add_foreign_ordered_paths`/`add_foreign_final_paths`: the ORDERED/FINAL
+CustomPath's **`parent` is the underlying grouping (or base/join) rel**, so
+`shm_plan_custom_path` runs against that rel's already-correct, already-built
+fpinfo and produces the IDENTICAL `custom_scan_tlist` it produces for the plain
+grouped/base scan — only the dispatched SQL gains `ORDER BY … LIMIT … [OFFSET]`.
+The ordered/final `output_rel->fdw_private` is now only a tiny navigation marker
+(`{stage, outerrel}`) used by FINAL to step back through ORDERED; it is never the
+deparse fpinfo and shares no mutable List. `[has_final_sort, has_limit]` ride in
+the **CustomPath's** `custom_private` and the sort keys in the path's
+`pathkeys`; `shm_plan_custom_path` forwards them to
+`chfdw_deparse_select_stmt_for_rel`. See D0016 for the design + evidence.
+
+Verified: the exact trivial query that returned 0 rows
+(`GROUP BY AdvEngineID ORDER BY c DESC LIMIT 5`) now returns the correct 5 rows
+on **3/3** consecutive runs (no intermittency), plan = single `Custom Scan`
+(no Sort, no Limit), oracle `ShmAdoptedBlocks≈162`, dispatched SQL ends
+`… GROUP BY advengineid ORDER BY count(*) DESC … LIMIT 5`.
+
+---
+
+## D0016 — 2026-06-25 — Top-N (ORDER BY/LIMIT/OFFSET) pushdown LANDED
+
+**What.** Push the final `ORDER BY […] LIMIT k [OFFSET m]` of an offloaded
+single-table aggregate/projection query into the dispatched ClickHouse
+`streamed_table()` SQL, so CH returns only the top-k window instead of streaming
+the whole grouped/filtered relation back for PG to Sort+Limit. Implemented in
+`src/shm_customscan.c` by extending the `create_upper_paths_hook` to also handle
+`UPPERREL_ORDERED` and `UPPERREL_FINAL` (it previously handled only
+`UPPERREL_GROUP_AGG`). Deparse side was already correct (`appendOrderByClause` /
+`appendLimitClause`); the deparse call in `shm_plan_custom_path` now forwards
+`best_path->path.pathkeys` + `[has_final_sort, has_limit]`.
+
+**Design decisions taken without a human (with rationale):**
+
+1. **Reuse the input rel's fpinfo as the path parent; no copy** (the D0015 fix).
+   The ORDERED/FINAL CustomPath's `parent` is the grouping rel (aggregate top-N)
+   or the base/join rel (projection top-N, e.g. Q24–27). Alternative — a fresh
+   deep-copied fpinfo for the ordered/final rel — was rejected: it duplicates
+   state that the planner can mutate, and the deep-copy boundary is exactly where
+   D0015 went wrong. Reuse is what the FDW does and is provably correct here.
+
+2. **FINAL path costed `total_cost = -10` (mirrors the FDW).** Guarantees the
+   planner prefers the remote-LIMIT CustomScan over a PG `Limit` node. This is
+   what avoids the **OFFSET double-apply** hazard: with no PG `Limit`, the OFFSET
+   is applied exactly once (in CH). The ORDERED path is costed `1.5` (beats a PG
+   `Sort` over the input). Fixed costs (not estimates) → deterministic plans
+   (the prior attempt saw ORDERED/FINAL instability). Verified: every top-N plan
+   collapses to a single `Custom Scan` with `pg_sort=0, pg_lim=0`.
+
+3. **`has_final_sort` = (stepped back through ORDERED) AND (parent is a grouping
+   rel).** It selects how `appendOrderByClause` resolves the sort exprs: via the
+   upper target (grouped output expressions / aggregates) for an aggregate
+   top-N, via plain Vars for a base/join projection top-N. Wrong choice → the
+   deparser can't find the EC member. Verified exact on both shapes.
+
+4. **Q18 (`LIMIT` with no `ORDER BY`).** Now pushes `LIMIT 10` (no ORDER BY) to
+   CH and finishes as a normal `QueryFinish` (no more Code-210 broken pipe from
+   PG cancelling the stream early). Result set is undefined-by-design (D0006), so
+   still judged on mechanism, not byte-equality — but with a deterministic
+   tiebreak it is exact vs native.
+
+**Evidence (≥2 independent converging classes per claim).**
+- *Coverage/oracle* (`eligibility-scan.sh`, all 43): every top-N query flips from
+  `ch_ord=no, ch_lim=no, pg_sort=1, pg_lim=1` (D0007) to
+  `ch_ord=yes, ch_lim=yes, pg_sort=0, pg_lim=0`, `ShmAdoptedBlocks≥1`. Coverage
+  unchanged at 42/43 (Q1 declined, expected). Raw:
+  `dev/clickbench/evidence/phase-topn/scan/`.
+- *Fidelity, tie-robust* (`tiebreak_check.sh` + projection check): the
+  plain-ORDER-BY DIFF/approx cases (Q18,22,24,25,26,27,32,33,39,40,41) all
+  collapse to **exact** under a deterministic tiebreak → pure tie reshuffle
+  (D0006), not value bugs. **OFFSET windows (Q39/40/41) match native exactly →
+  no double-apply, not empty.** Raw: `dev/clickbench/evidence/phase-topn/tiebreak/`.
+- *No regression*: `sanity.sh` 17/0, `verify_offload.sh` **137/0**, zero
+  `/dev/shm/pgch_*`/socket/worker leaks. Consumer unchanged (pure PG-side
+  planner change — no ClickHouse rebuild).
+- *Perf* (`wsweep.sh`, shared cgroup cap, N=5 warm, W=8/16): see
+  `FULL-OFFLOAD-RESULTS.md`. W=16 highlights (speedup = native_med/offload_med,
+  before → after): Q33 2.01→**25.8×**, Q35 1.28→**8.0×**, Q34 1.50→**8.0×**,
+  Q32 1.54→**4.8×**, Q16 2.05→**4.5×**, Q31 1.88→**3.7×**, and the projection
+  losers Q25 0.40→**1.7×**, Q27 0.40→**1.7×**, Q26 0.84→**1.7×**, Q40
+  0.87→**1.7×**. Mechanism: offload_median collapses (e.g. Q33 4619→358 ms)
+  while native is unchanged. See D0017 for the one query that does not improve.
+
+---
+
+## D0017 — 2026-06-25 — Q24 (`SELECT *`) is producer-bound; top-N does not help it (honest loss)
+
+**Finding.** Q24 `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY
+EventTime LIMIT 10` was **pre-registered** to improve to ≥0.9× once the top-N is
+pushed (CH returns 10 rows, not the filtered relation). It did **not**: W=16
+stayed `0.70× → 0.72×` (offload_med 609 → 598 ms; ≈ run-to-run noise). The
+prediction was wrong, and this is recorded as a finding, not hand-waved.
+
+**Root cause (measured, not asserted).** Q24's cost is the **producer side**:
+streaming all 10M rows × **105 columns** into shared memory. The W-sweep cores
+split shows offload `off_prod≈13.6` cores (the PG heap scan + columnize + ring
+publish) vs `off_cons≈1.6` cores (the CH consumer). Top-N pushdown shrinks only
+the **read-back** (already tiny — the filtered set is small and the LIMIT is 10),
+so it cannot move the producer-bound wall time. Native's parallel seq-scan +
+bounded top-N sort (430 ms) simply beats streaming 105 wide columns through SHM.
+Independent corroboration: every OTHER top-N query (1–10 narrow columns) improved
+sharply; only the 105-column one did not — isolating the column-width / producer
+cost as the cause, exactly as the cores split predicts.
+
+**Decision: accept as a documented, root-caused loss.** Q24 still offloads
+correctly and is **fidelity-exact** (tie-robust); the top-N IS pushed per the
+oracle (`ch_ord=yes, ch_lim=yes`, no PG Sort/Limit). It is simply a workload
+(very wide `SELECT *`) where the SHM producer round-trip is the bottleneck and
+native PG wins — the same class as the cheap-projection caveat already noted.
+Out of scope to fix here (would require producer-side column-stream speedups, not
+top-N). Flagged so it is not mistaken for a top-N defect.

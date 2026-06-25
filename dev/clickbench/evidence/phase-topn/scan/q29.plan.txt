@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: (regexp_replace(referer, '^https?://(?:www\.)?([^/]+)/.*$'::text, '\1'::text)), (avg(length(referer))), (count(*)), (min(referer))

@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: (date_trunc('minute'::text, eventtime)), (count(*))

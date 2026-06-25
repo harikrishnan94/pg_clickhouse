@@ -1,0 +1,1 @@
+DIFF|10|10|0|0|0|10|col0 off='http://3dnews/741' on='http://afisha.yandex.php?produkty%2Fproduct_name'

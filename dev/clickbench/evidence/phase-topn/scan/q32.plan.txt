@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: watchid, clientip, (count(*)), (sum(isrefresh)), (avg(resolutionwidth))

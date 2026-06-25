@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: clientip, ((clientip - 1)), ((clientip - 2)), ((clientip - 3)), (count(*))

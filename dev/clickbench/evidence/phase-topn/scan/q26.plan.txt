@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan) on pg.hits
+  Output: searchphrase

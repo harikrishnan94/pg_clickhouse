@@ -1,0 +1,2 @@
+Custom Scan (ClickHouseShmScan)
+  Output: searchphrase, (min(url)), (min(title)), (count(*)), (count(DISTINCT userid))
