@@ -478,13 +478,18 @@ the whole grouped/filtered relation back for PG to Sort+Limit. Implemented in
 - *No regression*: `sanity.sh` 17/0, `verify_offload.sh` **137/0**, zero
   `/dev/shm/pgch_*`/socket/worker leaks. Consumer unchanged (pure PG-side
   planner change — no ClickHouse rebuild).
-- *Perf* (`wsweep.sh`, shared cgroup cap, N=5 warm, W=8/16): see
-  `FULL-OFFLOAD-RESULTS.md`. W=16 highlights (speedup = native_med/offload_med,
-  before → after): Q33 2.01→**25.8×**, Q35 1.28→**8.0×**, Q34 1.50→**8.0×**,
-  Q32 1.54→**4.8×**, Q16 2.05→**4.5×**, Q31 1.88→**3.7×**, and the projection
-  losers Q25 0.40→**1.7×**, Q27 0.40→**1.7×**, Q26 0.84→**1.7×**, Q40
-  0.87→**1.7×**. Mechanism: offload_median collapses (e.g. Q33 4619→358 ms)
-  while native is unchanged. See D0017 for the one query that does not improve.
+- *Perf* (`wsweep.sh`, shared cgroup cap, N=5 warm, W=8/16): canonical full-42
+  matrix at `evidence/phase-topn/wsweep-full/RESULTS.md`; see
+  `FULL-OFFLOAD-RESULTS.md`. **Full-set W=16 aggregate (all 42, incl. the one
+  loss): arithmetic mean 2.18→4.07×, geomean 1.79→2.87×, median 1.80→2.01×,
+  41/42 faster (was 37), 18 of them ≥3×.** W=16 per-query highlights (speedup =
+  native_med/offload_med, before → after, from the canonical full-sweep): Q33
+  2.01→**25.8×**, Q17 3.77→**14.7×**, Q19 →**12.7×**, Q34 1.50→**7.9×**, Q35
+  1.28→**7.3×**, Q32 1.54→**4.8×**, Q16 2.05→**4.5×**, Q36 →**4.5×**, Q31
+  1.88→**3.6×**, and the projection losers Q25 0.40→**1.7×**, Q27 0.40→**1.7×**,
+  Q26 0.84→**1.7×**, Q40 0.87→**1.8×**. Mechanism: offload_median collapses (e.g.
+  Q33 4619→358 ms) while native is unchanged, and CH `result_rows` returned to PG
+  drops to k=10 (was 1.4M–10M). See D0017 for the one query that does not improve.
 
 ---
 
@@ -514,3 +519,29 @@ oracle (`ch_ord=yes, ch_lim=yes`, no PG Sort/Limit). It is simply a workload
 native PG wins — the same class as the cheap-projection caveat already noted.
 Out of scope to fix here (would require producer-side column-stream speedups, not
 top-N). Flagged so it is not mistaken for a top-N defect.
+
+---
+
+## D0018 — 2026-06-25 — Top-N phase: independent adversarial review = SOUND
+
+**Review.** A fresh reviewer (separate context, did not write the code) re-derived
+every claim with its own runs and could not break it. Findings: D0015 0-rows bug
+does NOT reproduce (12/12 sequential runs correct, no exceptions); OFFSET applied
+exactly once (Q39 offload window byte-identical to CH-native `LIMIT 10 OFFSET
+1000` and DIFFERENT from `OFFSET 2000` — a double-apply would have matched 2000);
+`result_rows` to PG = 10 over 1.5M–10M groups; HAVING/grouped-expr/DATE_TRUNC
+exact; tie cases pure reshuffle (tied rows share the ORDER BY key); avg→Float64
+and count(DISTINCT) unregressed; the full-42 perf aggregate recomputed from the
+raw table matches exactly (mean 2.18→4.07×, geomean 1.79→2.87×, 41/42 faster,
+only Q24 0.71×); Q24 honestly producer-bound. **Verdict: SOUND, no blocking
+findings.**
+
+**Non-blocking observation (pre-existing, NOT introduced by top-N).** Under a
+6-way concurrency storm, offload queries can fail with `could not register SHM
+streaming background worker` — `max_worker_processes=32` is exhausted (≈7 workers
+× 6 concurrent = 42 > 32). It originates in `src/shm_worker.c` (untouched by this
+change) and reproduces identically with a NON-top-N aggregate, so it is orthogonal
+to top-N. It is **fail-closed**: a clean ERROR (never wrong/empty data), PG stays
+alive, zero leaked workers / `/dev/shm/pgch_*` objects, and the next single query
+is correct. Logged as a known SHM-offload capacity limit (no auto-fallback to
+native on pool exhaustion); out of scope for this phase.

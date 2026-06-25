@@ -19,23 +19,32 @@ numeric-aware, tie-robust fidelity comparison vs native (D0003).
 
 | | count | queries |
 |--|------:|---------|
-| **fully offloaded** | **41** | Q2–17, 19–43 (all except Q18, Q1) |
-| **fully(cxl)** (heavy GROUP BY ran in CH; stream client-cancelled by `LIMIT`-no-`ORDER BY`) | **1** | Q18 |
+| **fully offloaded** | **42** | Q2–43 (all except Q1) |
 | **declined (intentional, no column referenced)** | **1** | Q1 |
 | **TOTAL offloading the heavy fragment** | **42 / 43** | |
 
-**42 of 43 ClickBench queries push their heavy fragment to ClickHouse over SHM.**
-The single non-offload, Q1 (`SELECT COUNT(*) FROM hits`), references no column, so
-there is nothing to stream and a parallel seq-scan `count(*)` wins — expected, not a
-failure (D0010). Starting baseline was 37/43; this effort added **+5** (timestamp
-support Q19/24/25/27/43, of which Q24 also needed the column-cap raise) and fixed
-two correctness/fidelity bugs (Q4 avg overflow, Q29 regex).
+**42 of 43 ClickBench queries push their heavy fragment to ClickHouse over SHM,**
+**and the final top-N (ORDER BY/LIMIT/OFFSET) is now pushed into ClickHouse too**
+(D0016): for every top-N query the dispatched SQL carries `ORDER BY` +
+`LIMIT`/`OFFSET` and the PG plan has no residual `Sort`/`Limit` — so ClickHouse
+returns only the top-k window instead of streaming the whole grouped/filtered
+relation back. The single non-offload, Q1 (`SELECT COUNT(*) FROM hits`),
+references no column, so there is nothing to stream and a parallel seq-scan
+`count(*)` wins — expected, not a failure (D0010). Q18 (`LIMIT` with no
+`ORDER BY`) now pushes the `LIMIT` and finishes as a clean `QueryFinish` (no more
+Code-210 broken pipe from PG cancelling the stream). Starting baseline was 37/43;
+this effort added **+5** coverage (timestamp support Q19/24/25/27/43), fixed two
+correctness/fidelity bugs (Q4 avg overflow, Q29 regex), and **landed top-N
+pushdown** (the dominant remaining structural perf gap).
 
 ## Coverage + fidelity table (final, measured)
 
-`fragment`: heavy op pushed to CH. `pg_resid`: residual PG op above the CustomScan
-(top-N is not pushed — D0007/D0015 — so a `Sort`/`Limit` remains; it does **not**
-demote `fully`). `fidelity`: offload vs native (tie-robust).
+`fragment`: heavy op pushed to CH. `pg_resid`: residual PG op above the CustomScan.
+With top-N pushdown **landed** (D0016), the final `ORDER BY`/`LIMIT`/`OFFSET` is
+now pushed into the dispatched ClickHouse SQL, so there is **no** residual
+`Sort`/`Limit` above any `Custom Scan` (`pg_sort=0, pg_lim=0` for all 42 — proven
+by `eligibility-scan.sh`, raw under `evidence/phase-topn/scan/`). `fidelity`:
+offload vs native (tie-robust).
 
 | Q | offloaded | fragment in CH | pg_resid | fidelity | notes |
 |--:|:---------:|----------------|----------|----------|-------|
@@ -46,42 +55,42 @@ demote `fully`). `fidelity`: offload vs native (tie-robust).
 | 5 | yes | `COUNT(DISTINCT UserID)` | — | **exact** | uniqExact (D0004) |
 | 6 | yes | `COUNT(DISTINCT SearchPhrase)` | — | **exact** | uniqExact |
 | 7 | yes | min/max date | — | exact | |
-| 8 | yes | GROUP BY + agg | Sort | exact | |
-| 9 | yes | top-N + count(DISTINCT) | Sort+Limit | exact | |
-| 10 | yes | top-N sum+avg+count(DISTINCT) | Sort+Limit | exact | |
-| 11 | yes | top-N + count(DISTINCT) | Sort+Limit | exact | |
-| 12 | yes | top-N + count(DISTINCT) | Sort+Limit | exact | |
-| 13 | yes | top-N GROUP BY str | Sort+Limit | exact | |
-| 14 | yes | top-N + count(DISTINCT) | Sort+Limit | exact | |
-| 15 | yes | top-N 2-key GROUP BY | Sort+Limit | exact | |
-| 16 | yes | `GROUP BY UserID` | Sort+Limit | exact | large grouped result |
-| 17 | yes | `GROUP BY UserID,SearchPhrase` | Sort+Limit | exact | |
-| 18 | yes(cxl) | `GROUP BY UserID,SearchPhrase` | Limit | nondeterministic | `LIMIT 10` no `ORDER BY` (D0006) |
-| 19 | yes | `extract(minute FROM EventTime)` group | Sort+Limit | exact | timestamp (D0011) |
+| 8 | yes | GROUP BY + agg | — | exact | ORDER BY pushed (no LIMIT) |
+| 9 | yes | top-N + count(DISTINCT) | — | exact | |
+| 10 | yes | top-N sum+avg+count(DISTINCT) | — | exact | |
+| 11 | yes | top-N + count(DISTINCT) | — | exact | |
+| 12 | yes | top-N + count(DISTINCT) | — | exact | |
+| 13 | yes | top-N GROUP BY str | — | exact | |
+| 14 | yes | top-N + count(DISTINCT) | — | exact | |
+| 15 | yes | top-N 2-key GROUP BY | — | exact | |
+| 16 | yes | `GROUP BY UserID` | — | exact | large grouped result |
+| 17 | yes | `GROUP BY UserID,SearchPhrase` | — | exact | |
+| 18 | yes | `GROUP BY UserID,SearchPhrase` | — | nondeterministic | `LIMIT 10` no `ORDER BY` (D0006); LIMIT now pushed, QueryFinish (no cxl) |
+| 19 | yes | `extract(minute FROM EventTime)` group | — | exact | timestamp (D0011) |
 | 20 | yes | point filter | — | exact | empty in subset |
 | 21 | yes | `URL LIKE '%google%'` count | — | exact | |
-| 22 | yes | top-N + LIKE | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 23 | yes | top-N + LIKE/NOT LIKE + count(DISTINCT) | Sort+Limit | exact | |
-| 24 | yes | `SELECT *` (105 cols) filter | Sort+Limit | exact | col-cap raise (D0012) |
-| 25 | yes | `ORDER BY EventTime` filtered proj | Sort+Limit | exact | timestamp |
-| 26 | yes | `ORDER BY SearchPhrase` filtered proj | Sort+Limit | exact | |
-| 27 | yes | `ORDER BY EventTime,SearchPhrase` proj | Sort+Limit | exact | timestamp |
-| 28 | yes | `AVG(length(URL))` HAVING top-N | Sort+Limit | exact | |
-| 29 | yes | `REGEXP_REPLACE` group HAVING top-N | Sort+Limit | **exact** | regex dotall (D0009 fix) |
+| 22 | yes | top-N + LIKE | — | tie (exact tiebroken) | D0006 |
+| 23 | yes | top-N + LIKE/NOT LIKE + count(DISTINCT) | — | exact | |
+| 24 | yes | `SELECT *` (105 cols) filter | — | exact | col-cap raise (D0012) |
+| 25 | yes | `ORDER BY EventTime` filtered proj | — | exact | timestamp |
+| 26 | yes | `ORDER BY SearchPhrase` filtered proj | — | exact | |
+| 27 | yes | `ORDER BY EventTime,SearchPhrase` proj | — | exact | timestamp |
+| 28 | yes | `AVG(length(URL))` HAVING top-N | — | exact | |
+| 29 | yes | `REGEXP_REPLACE` group HAVING top-N | — | **exact** | regex dotall (D0009 fix) |
 | 30 | yes | 90× `SUM(ResolutionWidth+n)` | — | exact | |
-| 31 | yes | top-N sum+avg | Sort+Limit | exact | |
-| 32 | yes | top-N (WatchID,ClientIP) | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 33 | yes | top-N (WatchID,ClientIP) | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 34 | yes | `GROUP BY URL` | Sort+Limit | exact | large grouped result |
-| 35 | yes | `GROUP BY 1, URL` | Sort+Limit | exact | grouped expr |
-| 36 | yes | `GROUP BY ClientIP, ClientIP-1..3` | Sort+Limit | exact | grouped exprs |
-| 37 | yes | top-N PageViews (date filter) | Sort+Limit | exact | |
-| 38 | yes | top-N Title | Sort+Limit | exact | |
-| 39 | yes | top-N `OFFSET 1000` | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 40 | yes | `CASE WHEN` group + `OFFSET 1000` | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 41 | yes | top-N `OFFSET 100` | Sort+Limit | tie (exact tiebroken) | D0006 |
-| 42 | yes | top-N `OFFSET 10000` | Sort+Limit | exact | empty in subset |
-| 43 | yes | `DATE_TRUNC('minute',EventTime)` group | Sort+Limit | exact | timestamp |
+| 31 | yes | top-N sum+avg | — | exact | |
+| 32 | yes | top-N (WatchID,ClientIP) | — | tie (exact tiebroken) | D0006 |
+| 33 | yes | top-N (WatchID,ClientIP) | — | tie (exact tiebroken) | D0006 |
+| 34 | yes | `GROUP BY URL` | — | exact | large grouped result |
+| 35 | yes | `GROUP BY 1, URL` | — | exact | grouped expr |
+| 36 | yes | `GROUP BY ClientIP, ClientIP-1..3` | — | exact | grouped exprs |
+| 37 | yes | top-N PageViews (date filter) | — | exact | |
+| 38 | yes | top-N Title | — | exact | |
+| 39 | yes | top-N `OFFSET 1000` | — | tie (exact tiebroken) | D0006 |
+| 40 | yes | `CASE WHEN` group + `OFFSET 1000` | — | tie (exact tiebroken) | D0006 |
+| 41 | yes | top-N `OFFSET 100` | — | tie (exact tiebroken) | D0006 |
+| 42 | yes | top-N `OFFSET 10000` | — | exact | empty in subset |
+| 43 | yes | `DATE_TRUNC('minute',EventTime)` group | — | exact | timestamp |
 
 ## Fidelity ledger (every deviation detected, quantified, classified)
 
@@ -106,7 +115,7 @@ bit-exact). avg(length) columns (Q28/29) match within the 1e-6 tolerance.
 | 1 | `timestamp` → CH `DateTime64(6, 'UTC')` wire support (the `'UTC'` pin is required — CH server tz is Asia/Kolkata) | `src/shm_offload.c`, `src/shm_deform.cpp`, `src/include/shm_deform.h` | +Q19/25/27/43 (timestamp columns stream) |
 | 1b | SHM column cap 64→128 (PG `SHM_IMPL_MAX_COLS` + consumer `IMPL_MAX_COLUMNS`) | `src/shm_producer.c`, `ClickHouse .../Wire/Layout.h` | +Q24 (`SELECT *`, 105 cols) |
 | 2 | `avg(bigint)` → `avg(toFloat64())` | `src/deparse.c` | Q4 wrong→bounded avg→Float64 |
-| 3 | top-N (ORDER BY/LIMIT/OFFSET) pushdown — **attempted, reverted** (correctness bug, D0015) | — | top-N stays in PG (correct) |
+| 3 | top-N (ORDER BY/LIMIT/OFFSET) pushdown — **LANDED** (D0016; resolves the D0015 0-rows bug) | `src/shm_customscan.c` | top-N pushed into CH; PG Sort/Limit removed |
 | 4 | `regexp_replace` pattern → `concat('(?s)', …)` (RE2 dotall = PG default) | `src/deparse.c` | Q29 1e-4 count dev → exact |
 
 The only consumer/ABI-side change in the whole effort is the column-cap raise
@@ -124,80 +133,95 @@ of N=5 warm runs (min/max + stdev), cores = CPU-seconds/wall from whole-host
 producer). Native is tuned for best performance (parallel workers = W, `work_mem`
 2 GB so HashAggregate/Sort do not spill, JIT on). speedup = nat_med / off_med.
 
-Full W={8,16} matrix for all 42 offload-eligible queries:
-`dev/clickbench/evidence/final/wsweep/RESULTS.md` (N=5 warm/cell). Summary:
+Full W={8,16} matrix for all 42 offload-eligible queries, **with top-N pushdown
+landed**: `dev/clickbench/evidence/phase-topn/wsweep-full/RESULTS.md` (N=5
+warm/cell). The pre-top-N baseline (top-N in PG) is preserved at
+`dev/clickbench/evidence/final/wsweep/RESULTS.md`. Summary:
 
-**Distribution (speedup = native_median / offload_median):**
+**Distribution (speedup = native_median / offload_median), over ALL 42 (incl. the
+one remaining loss), before vs after top-N pushdown:**
 
-| W | queries | offload faster (≥1×) | offload slower (<1×) | ≥3× | mean | max | min |
-|--:|--------:|---------------------:|---------------------:|----:|-----:|----:|----:|
-| 8 | 42 | **38** | 4 | 7 | 1.97× | 5.23× (Q30) | 0.55× (Q25) |
-| 16 | 42 | **37** | 5 | 7 | 2.18× | 6.98× (Q10) | 0.40× (Q25) |
+| W | set | faster (≥1×) | slower (<1×) | ≥3× | arith mean | geomean | median | max | min |
+|--:|-----|-------------:|-------------:|----:|-----------:|--------:|-------:|----:|----:|
+| 16 | **before** (top-N in PG) | 37 | 5 | 7 | 2.18× | 1.79× | 1.80× | 6.98× (Q10) | 0.40× (Q25) |
+| 16 | **after** (top-N in CH) | **41** | **1** | **18** | **4.07×** | **2.87×** | **2.01×** | **25.8× (Q33)** | 0.71× (Q24) |
+| 8 | **after** | 41 | 1 | 16 | 3.01× | 2.41× | 1.89× | 15.5× (Q33) | 0.74× (Q24) |
 
-(W=16 central tendency over all 42: arithmetic mean 2.18×, geometric mean 1.79×,
-median 1.80× — reported transparently; all three computed over the full set
-including the 5 losses, not just the wins.)
+All central-tendency numbers are over the full 42 (including the single remaining
+loss, Q24), not just the wins. Top-N pushdown lifts the W=16 geomean **1.79× →
+2.87×** and flips 4 of the 5 prior losers (Q25/26/27/40) to faster; only Q24
+remains <1× (root-caused in D0017).
 
-**Where offload wins big — CPU-heavy aggregation that native PG can't parallelize.**
-The largest wins are `COUNT(DISTINCT)`, many-aggregate, multi-key `GROUP BY`, and
-regex queries, where native PG's aggregate is effectively serial (its measured
-cores stay ~1–5 even with W=16 available) while the offload's producer scan
-parallelizes to W cores and ClickHouse's vectorized aggregate (e.g. `uniqExact`)
-finishes fast:
+**Biggest movers — large grouped/filtered result no longer streamed back.** These
+are precisely the queries that previously streamed a huge grouped/filtered
+relation to PG for it to Sort+Limit; now CH returns k=10 rows. Mechanism is
+proven by CH `result_rows` (rows returned to PG) collapsing to 10 — see
+`evidence/phase-topn/MECHANISM.md`:
 
-| Q | shape | W=8 speedup | W=16 speedup | nat cores@16 | mechanism |
-|--:|-------|------------:|-------------:|-------------:|-----------|
-| Q10 | top-N sum+avg+count(DISTINCT) | 5.18× | **6.98×** | 5.13 | native count-distinct serial; CH uniqExact scales |
-| Q9 | top-N + count(DISTINCT) | 4.75× | **6.42×** | 5.23 | same |
-| Q6 | `COUNT(DISTINCT SearchPhrase)` | 4.36× | **6.21×** | 5.19 | same |
-| Q30 | 90× `SUM(ResolutionWidth+n)` | 5.23× | 5.58× | 15.70 | both scale; CH SIMD aggregate faster |
-| Q5 | `COUNT(DISTINCT UserID)` | 3.40× | 4.68× | 5.48 | native count-distinct serial |
-| Q29 | `REGEXP_REPLACE` group + avg | 3.95× | 4.05× | 13.69 | CH regex+agg vectorized |
-| Q17 | `GROUP BY UserID,SearchPhrase` | 3.30× | 3.77× | 1.12 | native hash-agg serial (1 core!) |
+| Q | shape | W=16 before | W=16 after | off_med ms before→after | rows CH returned (before→after) |
+|--:|-------|------------:|-----------:|-------------------------|---------------------------------|
+| Q33 | `GROUP BY WatchID,ClientIP` (near-unique) | 2.01× | **25.8×** | 4619→358 | 10,000,000 → 10 |
+| Q17 | `GROUP BY UserID,SearchPhrase` | 3.77× | **14.7×** | (native pinned ~1 core) | high-card → 10 |
+| Q19 | `GROUP BY UserID,minute,SearchPhrase` | — | **12.7×** | — | high-card → 10 |
+| Q35 | `GROUP BY 1,URL` | 1.28× | **7.26×** | 1982→318 | 2,620,109 → 10 |
+| Q34 | `GROUP BY URL` | 1.50× | **7.86×** | 1703→319 | 2,620,109 → 10 |
+| Q16 | `GROUP BY UserID` | 2.05× | **4.54×** | 543→240 | 1,530,334 → 10 |
+| Q32 | `GROUP BY WatchID,ClientIP` (filtered) | 1.54× | **4.81×** | 820→262 | — → 10 |
+| Q31 | `GROUP BY SearchEngineID,ClientIP` | 1.88× | **3.59×** | 503→261 | — → 10 |
+| Q36 | `GROUP BY ClientIP, ClientIP-1..3` | — | **4.54×** | — | — → 10 |
 
-(Q17/Q33 native pin at ~1.1 cores even at W=16 — the high-cardinality 2-key
-hash-aggregate does not parallelize in PG — so offload wins despite a large grouped
-result streamed back.)
+**Prior losers — flipped to wins** (CH now sorts+limits instead of streaming the
+filtered relation back; `result_rows` 1.37M → 10 for Q25):
 
-**Where offload loses (5 of 42, all at W=16) — cheap projections, nothing to
-amortize.** These have no heavy aggregate; native PG's parallel scan + top-N is
-already sub-500 ms, and the offload pays a stream round-trip (and, for Q24, a
-105-column read-back), with the `ORDER BY`/`LIMIT` still done in PG (top-N pushdown
-reverted, D0015):
+| Q | shape | W=16 before | W=16 after |
+|--:|-------|------------:|-----------:|
+| Q25 | `SELECT SearchPhrase … ORDER BY EventTime LIMIT 10` | 0.40× | **1.70×** |
+| Q27 | `… ORDER BY EventTime,SearchPhrase LIMIT 10` | 0.40× | **1.71×** |
+| Q26 | `… ORDER BY SearchPhrase LIMIT 10` | 0.84× | **1.67×** |
+| Q40 | `CASE WHEN` group + `OFFSET 1000` | 0.87× | **1.77×** |
 
-| Q | shape | W=16 | why |
-|--:|-------|-----:|-----|
-| Q25 | `SELECT SearchPhrase … ORDER BY EventTime LIMIT 10` | 0.40× | cheap filter; top-N in PG; stream round-trip dominates |
-| Q27 | `… ORDER BY EventTime,SearchPhrase LIMIT 10` | 0.40× | same |
-| Q24 | `SELECT *` (105 cols) `… LIMIT 10` | 0.70× | wide-row read-back of all 105 columns |
-| Q26 | `… ORDER BY SearchPhrase LIMIT 10` | 0.84× | cheap projection |
-| Q40 | `CASE WHEN` group + `OFFSET 1000` | 0.87× | modest grouped result; sort+offset in PG |
+**The one remaining loss — Q24 `SELECT *` (105 cols), 0.70× → 0.72× (unchanged).**
+This was pre-registered to improve and did NOT — recorded honestly (D0017). Root
+cause (measured, not asserted): Q24 is **producer-bound** — streaming all 10M rows
+× 105 columns into shared memory dominates (W-sweep cores: off_prod≈13.6 vs
+off_cons≈1.6). Top-N pushdown shrinks only the already-tiny read-back, so it cannot
+move Q24's wall time; native's parallel seq-scan + bounded top-N (430 ms) wins.
+Every other top-N query (1–10 narrow columns) improved sharply — isolating column
+width / producer cost as the cause, exactly as the cores split predicts.
 
-These five are exactly the queries top-N/ORDER BY pushdown (D0007/D0015) would help
-most — pushing the `ORDER BY … LIMIT` into ClickHouse would return k rows instead
-of streaming the filtered/grouped relation back. That pushdown was attempted and
-reverted for correctness (D0015); it remains the clear next perf lever.
-
-**Net:** on ClickBench's analytic core — scan+filter+aggregate+GROUP BY — the SHM
-offload is **2.18× faster on average at an equal 16-core cap (37/42 queries
-faster, up to 7×)**, confirming the TPC-H finding (CPU-heavy single-table
-aggregation favors the offload) holds across the whole suite. It loses only on the
-handful of cheap non-aggregate projections, by a documented and addressable margin.
+**Net:** with top-N pushed into ClickHouse, on ClickBench's analytic core the SHM
+offload is **4.07× faster on average (geomean 2.87×) at an equal 16-core cap,
+41/42 queries faster (18 of them ≥3×, up to 25.8×)**, up from 2.18× mean / 37-of-42
+before. The dominant remaining structural gap (D0007) is closed: only one query
+(Q24, the very wide `SELECT *`) is slower, and for a measured, producer-side reason
+unrelated to top-N.
 
 ## Evidence (≥2 independent converging sources per claim)
 
 - **Coverage** (per query): (1) CH `system.query_log` oracle — `streamed_table`
-  `QueryFinish`/cxl with `ShmAdoptedBlocks ≥ 1` correlated by a unique
-  `log_comment` (poll-retried for the async-flush race, D0002); (2) PG `EXPLAIN`
-  plan — `ClickHouseShmScan` present, no residual Aggregate; (3) the dispatched CH
-  SQL inspected for the heavy op. Raw artifacts: `dev/clickbench/evidence/final/`.
-- **Fidelity**: `cmp_results.py` (numeric-aware, tie-robust) + independent manual
-  re-derivations (count(DISTINCT) values, Q4 native-vs-CH-direct, regex divergent
-  rows). Confirmed by two independent adversarial reviews (Phase 0; Phases 1/1b/2).
+  `QueryFinish` with `ShmAdoptedBlocks ≥ 1` correlated by a unique `log_comment`
+  (poll-retried for the async-flush race, D0002); (2) PG `EXPLAIN` plan —
+  `ClickHouseShmScan` present, no residual Aggregate **and (for top-N) no residual
+  `Sort`/`Limit`**; (3) the dispatched CH SQL inspected for the heavy op **plus
+  `ORDER BY` + `LIMIT`/`OFFSET`**. Raw: `dev/clickbench/evidence/phase-topn/scan/`
+  (top-N), `dev/clickbench/evidence/final/` (prior phases).
+- **Fidelity**: `cmp_results.py` (numeric-aware, tie-robust) + a deterministic
+  tiebreak for the top-N tie cases (`dev/clickbench/tiebreak_check.sh`,
+  `evidence/phase-topn/tiebreak/`): Q18/22/24/25/26/27/32/33/39/40/41 all exact
+  under a total order → pure tie reshuffle; OFFSET windows match native (no
+  double-apply). Plus independent re-derivations (count(DISTINCT), Q4, regex).
+- **Mechanism** (top-N): CH `result_rows` returned to PG collapses to k=10 while
+  the full grouped/filtered relation was 1.4M–10M rows
+  (`evidence/phase-topn/MECHANISM.md`); converges with the wall-time drop and the
+  plan change.
 - **Performance**: end-to-end median-of-5 wall time + measured cores split
-  (producer vs consumer) under the shared cap; W-sweep shows scaling.
-- **Regression**: `dev/clickbench/sanity.sh` green (PASS=17, FAIL=0) after every
-  phase; zero `/dev/shm/pgch_*` leaks; consumer unit tests green.
+  (producer vs consumer) under the shared cap; W-sweep before/after at
+  `evidence/phase-topn/wsweep-full/` (pre-registration in
+  `evidence/phase-topn/PRE-REGISTRATION.md`).
+- **Regression**: `dev/clickbench/sanity.sh` green (PASS=17, FAIL=0) and
+  `test/shm/verify_offload.sh` green (PASS=137, FAIL=0) after the top-N change;
+  zero `/dev/shm/pgch_*`/socket/worker leaks; consumer unchanged (pure PG-side
+  planner change — no ClickHouse rebuild).
 
 ## Reproduction
 
@@ -205,6 +229,7 @@ handful of cheap non-aggregate projections, by a documented and addressable marg
 RUN_ID=tpchcb dev/bench/ch-bench-server.sh start     # then re-point FDW if port changed (D0013)
 RUN_ID=tpchcb make -C dev/clickbench ch && RUN_ID=tpchcb make -C dev/clickbench pg
 RUN_ID=tpchcb PGDB=clickbench dev/clickbench/eligibility-scan.sh   # coverage + fidelity (all 43)
+RUN_ID=tpchcb PGDB=clickbench dev/clickbench/tiebreak_check.sh     # tie-robust fidelity (top-N)
 RUN_ID=tpchcb PGDB=clickbench QUERIES="$(seq 2 43)" W_LIST="8 16" N=5 \
-  OUT=dev/clickbench/evidence/final/wsweep dev/clickbench/wsweep.sh   # perf
+  OUT=dev/clickbench/evidence/phase-topn/wsweep-full dev/clickbench/wsweep.sh   # perf (top-N landed)
 ```
