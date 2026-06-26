@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <sys/epoll.h>       /* Phase 3 P1: producer-side EPOLLOUT readiness wait for non-blocking send */
 #include <sys/eventfd.h>
+#include <sys/uio.h>         /* Phase 3 P2: struct iovec / sendmsg for the coalesced pipelined send */
 #include <sys/mman.h>
 #include <signal.h>             /* kill() for backend-liveness checks */
 #include <sys/socket.h>
@@ -211,6 +212,22 @@ struct ShmProducer {
     bool       tcp_handshake_sent;
     char      *tcp_scratch;
     size_t     tcp_scratch_cap;
+
+    /*
+     * Hot-Cold Phase 3 Branch P2: pipelined send reactor. `send_k` frame buffers (>=1) so the producer
+     * may serialize up to K blocks ahead of the SINGLE in-flight socket send (one frame SENDING at a time
+     * preserves byte-stream order). Frames are a FIFO ring: `send_drain` is the oldest occupied (the
+     * send head), `send_count` is the number occupied (READY/SENDING/ZC_PENDING). Non-blocking publish
+     * serializes into the fill slot and pumps the head; backpressure (all K busy) waits on EPOLLOUT (or
+     * reaps zerocopy). K=1 ⇒ single-in-flight (P1) behavior. Lazily sized at the first publish.
+     */
+    int        send_k;
+    int        send_k_configured;   /* the GUC value before any RLIMIT_MEMLOCK cap (for logging) */
+    struct SendFrame *send_frames;  /* [send_k]; NULL until tcp_reactor_init */
+    int        send_count;          /* occupied frames (READY/SENDING/ZC_PENDING), 0..send_k */
+    int        send_drain;          /* index of the oldest occupied frame (the send head) */
+    uint64_t   send_pump_calls;     /* observability: reactor pump invocations */
+    uint64_t   send_overlap_frames; /* frames whose send was advanced while a later block was being prepared */
 
     /*
      * Hot-Cold Phase 2 Branch A (PGCH_PRODUCER_TRANSPORT_ARROW, D-HC-0207): the Arrow IPC
@@ -997,14 +1014,14 @@ arrow_publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payl
 }
 #endif /* PGCH_USE_NANOARROW */
 
-/* Lay one block into p->tcp_scratch frame-relative (descriptors at offset 0, then per-column
+/* Lay one block into `buf` (cap bytes) frame-relative (descriptors at offset 0, then per-column
  * buffers with the SHM align / SIMD-padding / offsets[-1]-zero-sentinel layout). Returns the
- * used payload length. MUST match the consumer's adopt() expectations and block_footprint(). */
+ * used payload length. MUST match the consumer's adopt() expectations and block_footprint().
+ * P2: `buf` is the acquired frame's payload buffer (one of K), not the single tcp_scratch. */
 static size_t
-tcp_serialize_block(ShmProducer *p, const ShmColumnPayload *payloads, size_t row_count)
+tcp_serialize_block(ShmProducer *p, const ShmColumnPayload *payloads, size_t row_count,
+                    char *buf, size_t cap)
 {
-    char *buf = p->tcp_scratch;
-    size_t cap = p->tcp_scratch_cap;
     ShmColumnDescriptor *descs = (ShmColumnDescriptor *) buf;
     size_t cursor = align_up((size_t) p->n_columns * sizeof(ShmColumnDescriptor), 8);
     int i;
@@ -1061,13 +1078,267 @@ overflow:
     return 0;   /* unreachable */
 }
 
-/* TCP analog of publish_block: lazy accept+handshake on the first call, serialize + send. */
+/* ---------------------------------------------------------------------------------------------------
+ * Hot-Cold Phase 3 Branch P2: pipelined send reactor (K-deep frame pool, exactly ONE send in flight).
+ *
+ * A frame carries a coalesced 2-entry iovec {header/meta, payload/body} (one sendmsg per block, H9). The
+ * pool is a FIFO ring: send_drain = oldest occupied (the send head), send_count = #occupied. Only the head
+ * is ever mid-send (byte-stream order). Publish serializes block N into a FREE fill-slot frame (the
+ * snapshot, synchronous), then pumps the head non-blocking and returns -- so the scan/deform loop refills
+ * cz->bufs for N+1 while the kernel drains frame N. Backpressure (all K occupied) waits on EPOLLOUT (or
+ * reaps a zerocopy completion). K=1 ⇒ pool of one ⇒ acquire waits for the single frame to drain = the P1
+ * single-in-flight behavior exactly (no special case).
+ * --------------------------------------------------------------------------------------------------- */
+
+typedef struct SendFrame
+{
+    struct iovec   iov[2];      /* iov[0]=header/meta, iov[1]=payload/body (when n_iov==2)            */
+    int            n_iov;       /* 1 (header-only, e.g. EOS / empty payload) or 2                     */
+    size_t         total_len;   /* sum of iov lengths                                                 */
+    size_t         sent;        /* bytes handed to the kernel so far (partial-send resume offset)     */
+    bool           is_eos;
+    TcpBlockHeader bh;          /* bespoke header storage (iov[0] points here)                        */
+    char          *scratch;     /* bespoke frame-owned payload buffer (iov[1]); arrow frames: unused  */
+    size_t         scratch_cap;
+    bool           zc_pending;  /* fully sent via MSG_ZEROCOPY; buffer pinned until the seq is reaped  */
+    uint32_t       zc_seq;      /* last zerocopy seq this frame's send(s) consumed                    */
+} SendFrame;
+
+/* Lazily size + allocate the K-deep frame pool at the first publish (after the scratch cap is known). */
+static void
+tcp_reactor_init(ShmProducer *p)
+{
+    int k, i;
+
+    if (p->send_frames != NULL)
+        return;
+    k = p->send_k_configured >= 1 ? p->send_k_configured : 1;
+    /* H4: bound K x max_frame <= RLIMIT_MEMLOCK (8 MiB here) on the zerocopy path so the pinned-pages
+     * accounting limit is not exceeded; the per-send ENOBUFS+drain is the runtime backstop. */
+    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY && p->tcp_scratch_cap > 0)
+    {
+        size_t budget = (size_t) 8 * 1024 * 1024;
+        int kmax = (int) (budget / p->tcp_scratch_cap);
+        if (kmax < 1) kmax = 1;
+        if (k > kmax)
+        {
+            ereport(LOG, (errmsg("pg_clickhouse: P2 capping run-ahead K=%d -> %d for msg_zerocopy "
+                                 "(K x frame %zu must stay under RLIMIT_MEMLOCK 8 MiB)",
+                                 k, kmax, p->tcp_scratch_cap)));
+            k = kmax;
+        }
+    }
+    p->send_k = k;
+    /* Allocate in the producer's owner context (stable for the stream lifetime): tcp_reactor_init runs
+     * lazily at the first publish, which may be inside a transient per-block context. */
+    p->send_frames = (SendFrame *) MemoryContextAllocZero(p->owner_cxt, sizeof(SendFrame) * (size_t) k);
+    for (i = 0; i < k; i++)
+    {
+        p->send_frames[i].scratch = (char *) MemoryContextAlloc(p->owner_cxt, p->tcp_scratch_cap);
+        p->send_frames[i].scratch_cap = p->tcp_scratch_cap;
+    }
+    p->send_count = 0;
+    p->send_drain = 0;
+    ereport(DEBUG1, (errmsg("pg_clickhouse: P2 send reactor K=%d (configured %d), frame=%zu bytes, "
+                            "pool=%zu bytes", k, p->send_k_configured, p->tcp_scratch_cap,
+                            (size_t) k * p->tcp_scratch_cap)));
+}
+
+/* One non-blocking sendmsg of the head frame's REMAINING iovec (from frame->sent). Returns 1 = head fully
+ * handed to the kernel, 0 = partial progress (keep pumping), -1 = WOULDBLOCK / no progress (stop). Throws
+ * on a hard error / backend death. For msg_zerocopy each successful sendmsg consumes a zc seq (tagged on
+ * the frame) and reaps completions; the frame stays pinned (reclaimed only when the seq is acked). */
+static int
+reactor_send_head_once(ShmProducer *p)
+{
+    SendFrame *f = &p->send_frames[p->send_drain];
+    struct msghdr msg;
+    struct iovec  iov[2];
+    int     ni = 0, i;
+    size_t  skip = f->sent;
+    int     flags = MSG_NOSIGNAL;
+    ssize_t w;
+
+    for (i = 0; i < f->n_iov; i++)
+    {
+        size_t len = f->iov[i].iov_len;
+        if (skip >= len) { skip -= len; continue; }
+        iov[ni].iov_base = (char *) f->iov[i].iov_base + skip;
+        iov[ni].iov_len  = len - skip;
+        skip = 0;
+        ni++;
+    }
+    if (ni == 0)
+        return 1;   /* already fully sent */
+
+    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY && p->tcp_zc_sockopt_set)
+        flags |= MSG_ZEROCOPY;
+
+    CHECK_FOR_INTERRUPTS();
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = iov;
+    msg.msg_iovlen = ni;
+    w = sendmsg(p->tcp_conn_fd, &msg, flags);
+    if (w > 0)
+    {
+        f->sent += (size_t) w;
+        if (flags & MSG_ZEROCOPY)
+        {
+            f->zc_seq = p->tcp_zc_seq_next++;   /* mirrors the kernel's per-socket zerocopy counter */
+            f->zc_pending = true;
+            p->tcp_zc_sends++;
+            tcp_zc_reap(p);
+        }
+        if (f->sent >= f->total_len)
+        {
+            if (!(flags & MSG_ZEROCOPY))
+            {
+                if (f->is_eos) { /* EOS frame fully sent */ }
+                p->tcp_epoll_sends++;   /* a logical frame send completed via the non-blocking path */
+            }
+            return 1;
+        }
+        return 0;   /* partial progress */
+    }
+    if (w < 0 && errno == EINTR)
+        return 0;
+    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return -1;   /* socket send buffer full (TCP backpressure) */
+    if (w < 0 && errno == ENOBUFS)
+    {
+        /* zerocopy pinned-pages hit RLIMIT_MEMLOCK; reap to release some, then let the caller wait. */
+        tcp_zc_reap(p);
+        return -1;
+    }
+    if (origin_backend_dead(p))
+        ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; abandoning TCP stream",
+                               p->origin_pid)));
+    ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: pipelined TCP send to consumer failed: %m")));
+    return -1;   /* unreachable */
+}
+
+/* Reclaim fully-sent (and, for zerocopy, reaped) head frames to FREE. Returns #reclaimed. */
+static int
+reactor_reclaim(ShmProducer *p)
+{
+    int n = 0;
+
+    while (p->send_count > 0)
+    {
+        SendFrame *f = &p->send_frames[p->send_drain];
+
+        if (f->sent < f->total_len)
+            break;                              /* head not fully sent yet */
+        if (f->zc_pending)
+        {
+            tcp_zc_reap(p);
+            if (!(p->tcp_zc_seq_acked_valid && (int32_t) (p->tcp_zc_seq_acked - f->zc_seq) >= 0))
+                break;                          /* still pinned by the kernel */
+            f->zc_pending = false;
+        }
+        p->send_drain = (p->send_drain + 1) % p->send_k;
+        p->send_count--;
+        n++;
+    }
+    return n;
+}
+
+/* Non-blocking pump: advance the single in-flight (head) send as far as it goes, reclaiming completed
+ * frames, until it WOULDBLOCK or the pool is empty. The kernel then drains the accepted bytes to the wire
+ * while the caller returns to scan/deform the next block. */
+static void
+reactor_pump(ShmProducer *p)
+{
+    p->send_pump_calls++;
+    while (p->send_count > 0)
+    {
+        SendFrame *f = &p->send_frames[p->send_drain];
+        int r;
+
+        if (f->sent >= f->total_len)
+        {
+            if (reactor_reclaim(p) == 0)
+                break;                          /* head fully sent but zc-pinned; can't advance further now */
+            continue;
+        }
+        r = reactor_send_head_once(p);
+        if (r < 0)
+            break;                              /* WOULDBLOCK */
+        /* r==0 (partial) or 1 (complete): loop (reclaim/continue at top) */
+    }
+}
+
+/* Acquire a FREE fill-slot frame, pumping the in-flight send and (if all K are occupied) waiting on
+ * writability / a zerocopy completion until one frees. This wait is the producer's backpressure point. */
+static SendFrame *
+reactor_acquire(ShmProducer *p)
+{
+    SendFrame *f;
+
+    while (p->send_count >= p->send_k)
+    {
+        reactor_pump(p);
+        if (p->send_count < p->send_k)
+            break;
+        {
+            SendFrame *head = &p->send_frames[p->send_drain];
+
+            if (head->sent >= head->total_len && head->zc_pending)
+                tcp_zc_drain_until(p, head->zc_seq);   /* H4: block on THIS frame's seq only (its buffer is needed) */
+            else
+            {
+                if (origin_backend_dead(p))
+                    ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                           "abandoning TCP stream", p->origin_pid)));
+                tcp_wait_writable(p, 100);
+            }
+        }
+    }
+    f = &p->send_frames[(p->send_drain + p->send_count) % p->send_k];
+    f->sent = 0;
+    f->zc_pending = false;
+    f->n_iov = 0;
+    f->total_len = 0;
+    f->is_eos = false;
+    return f;
+}
+
+/* Block (pumping + waiting) until every queued frame is fully sent to the kernel and, for zerocopy, every
+ * pinned buffer reaped. Used for EOS (H5: the consumer must see all data + EOS) and as the teardown flush. */
+static void
+reactor_drain_all(ShmProducer *p)
+{
+    while (p->send_count > 0)
+    {
+        reactor_pump(p);
+        if (p->send_count == 0)
+            break;
+        {
+            SendFrame *head = &p->send_frames[p->send_drain];
+
+            if (head->sent >= head->total_len && head->zc_pending)
+                tcp_zc_drain_until(p, head->zc_seq);
+            else
+            {
+                if (origin_backend_dead(p))
+                    ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                           "abandoning TCP stream", p->origin_pid)));
+                tcp_wait_writable(p, 100);
+            }
+        }
+    }
+}
+
+/* TCP analog of publish_block (P2): lazy accept+handshake on the first call, then NON-BLOCKING publish:
+ * serialize block N into a free pooled frame (the snapshot copy out of cz->bufs), enqueue it, pump the one
+ * in-flight send, and return so scan/deform of N+1 overlaps the drain of frame N. The EOS frame is enqueued
+ * after the last data frame and then drained synchronously (H5). */
 static void
 tcp_publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
                   size_t row_count, bool is_eos)
 {
     int saved_phase = -1;
-    TcpBlockHeader bh;
+    SendFrame *f;
     size_t payload_len = 0;
 
     if (p->eos_published)
@@ -1079,24 +1350,46 @@ tcp_publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloa
 
     if (!p->tcp_handshake_sent)
         tcp_accept_and_handshake(p);
+    tcp_reactor_init(p);
 
-    /* Serialize + socket send is the TCP PUBLISH phase (CPU clock excludes the send-blocked wait,
-     * which lands in PUBLISH wall — TCP has no separate ring-full STALL). */
+    /* PUBLISH phase = serialize the snapshot + submit + (when all K busy) the backpressure wait. The
+     * kernel drain of an in-flight frame overlaps the SUBSEQUENT block's DEFORM/READ (it returns here). */
     if (p->timers != NULL && p->timers->enabled)
         saved_phase = p->timers->cur;
     pgch_phase_switch(p->timers, PGCH_PH_PUBLISH);
 
+    f = reactor_acquire(p);
     if (!is_eos)
-        payload_len = tcp_serialize_block(p, payloads, row_count);
+        payload_len = tcp_serialize_block(p, payloads, row_count, f->scratch, f->scratch_cap);
 
-    memset(&bh, 0, sizeof(bh));
-    bh.payload_len = payload_len;
-    bh.row_count = is_eos ? 0 : row_count;
-    bh.descriptors_offset = 0;
-    bh.eos_marker = is_eos ? 1 : 0;
-    tcp_send_all(p, &bh, sizeof(bh));
+    memset(&f->bh, 0, sizeof(f->bh));
+    f->bh.payload_len = payload_len;
+    f->bh.row_count = is_eos ? 0 : row_count;
+    f->bh.descriptors_offset = 0;
+    f->bh.eos_marker = is_eos ? 1 : 0;
+    f->is_eos = is_eos;
+    f->iov[0].iov_base = &f->bh;
+    f->iov[0].iov_len  = sizeof(f->bh);
     if (payload_len > 0)
-        tcp_send_all(p, p->tcp_scratch, payload_len);
+    {
+        f->iov[1].iov_base = f->scratch;
+        f->iov[1].iov_len  = payload_len;
+        f->n_iov = 2;
+    }
+    else
+        f->n_iov = 1;
+    f->total_len = sizeof(f->bh) + payload_len;
+    f->sent = 0;
+
+    /* Enqueue + pump (non-blocking). A frame queued behind an already-in-flight one is the overlap. */
+    p->send_count++;
+    p->tcp_send_bytes += f->total_len;
+    if (p->send_count > 1)
+        p->send_overlap_frames++;
+    reactor_pump(p);
+
+    if (is_eos)
+        reactor_drain_all(p);   /* H5: flush all data frames + EOS to the kernel before returning */
 
     if (saved_phase >= 0)
         pgch_phase_switch(p->timers, saved_phase);
@@ -1160,6 +1453,8 @@ shm_producer_create(const char *name,
     p->tcp_handshake_sent = false;
     p->tcp_scratch = NULL;
     p->tcp_scratch_cap = 0;
+    p->send_k_configured = 1;   /* set by shm_producer_set_send_inflight; default single-in-flight (P1) */
+    p->send_frames = NULL;      /* lazily allocated at the first publish (tcp_reactor_init) */
     p->tcp_port = 0;
     p->tcp_send_method = PGCH_TCP_SEND_BLOCKING;   /* set by shm_producer_set_tcp_send_method */
 
@@ -1325,6 +1620,14 @@ void
 shm_producer_set_tcp_send_method(ShmProducer *p, int method)
 {
     p->tcp_send_method = method;
+}
+
+void
+shm_producer_set_send_inflight(ShmProducer *p, int k)
+{
+    /* P2 producer run-ahead depth (the GUC already clamps to [1,64]); the pool is sized at the first
+     * publish (tcp_reactor_init), which may further cap K for msg_zerocopy (RLIMIT_MEMLOCK). */
+    p->send_k_configured = (k >= 1) ? k : 1;
 }
 
 void

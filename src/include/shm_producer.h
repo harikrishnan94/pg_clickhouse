@@ -156,6 +156,15 @@ extern void shm_producer_set_phase_timers(ShmProducer *p, struct PgchPhaseTimers
 extern void shm_producer_set_tcp_send_method(ShmProducer *p, int method);
 
 /*
+ * Phase 3 Branch P2: set the producer run-ahead depth K (>=1) for the TCP/Arrow pipelined sender. K frame
+ * buffers let the producer serialize up to K blocks ahead of the single in-flight socket send. K=1 is the
+ * single-in-flight (P1) behavior. The producer may CAP K (on msg_zerocopy, so K x max_frame stays under
+ * RLIMIT_MEMLOCK). No-op for an SHM producer. Must be called before the first publish (frames are sized at
+ * the first publish from the scratch capacity).
+ */
+extern void shm_producer_set_send_inflight(ShmProducer *p, int k);
+
+/*
  * Branch-P1 observability: how many logical TCP sends the producer issued via the epoll non-blocking
  * path vs the blocking send() path, and the total bytes sent. Lets a test/benchmark prove the epoll
  * path is actually on the wire (epoll sends > 0, blocking sends == 0) rather than silently falling

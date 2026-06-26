@@ -55,6 +55,7 @@ bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
 int   pgch_tcp_send_method = PGCH_TCP_SEND_EPOLL;
+int   pgch_tcp_send_inflight_blocks = 2;
 
 /* adopt/copy = SHM transport (consumer-side data path); tcp = bespoke TCP stream (Phase 1);
  * arrow = Apache Arrow IPC over the same per-stream TCP socket (Phase 2 Branch A). */
@@ -1188,6 +1189,16 @@ pgch_shm_offload_init(void)
                              "SO_ZEROCOPY is unavailable.",
                              NULL, &pgch_tcp_send_method, PGCH_TCP_SEND_EPOLL,
                              pgch_tcp_send_method_options, PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.tcp_send_inflight_blocks",
+                            "For the 'tcp'/'arrow' transports (Phase 3 Branch P2), the producer run-ahead "
+                            "depth: K frame buffers so deform/serialize of later blocks overlaps the single "
+                            "in-flight socket send of an earlier block. 1 = single-in-flight (P1) behavior. "
+                            "Memory cost is K x max frame size per stream; on msg_zerocopy the producer caps "
+                            "K so K x max_frame stays under RLIMIT_MEMLOCK. Snapshotted into the "
+                            "streaming-worker header.",
+                            NULL, &pgch_tcp_send_inflight_blocks, 2, 1, 64,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
      * last_query_used_clickhouse observability GUC. */

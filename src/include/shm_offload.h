@@ -94,6 +94,15 @@ typedef enum PgchTcpSendMethod
 extern int   pgch_tcp_send_method;
 
 /*
+ * Hot-Cold Phase 3, Branch P2: producer run-ahead depth for the TCP/Arrow pipelined sender. K frame
+ * buffers (bespoke tcp_scratch buffers / Arrow encoder bodies) so the producer may serialize up to K
+ * blocks ahead of the single in-flight socket send, overlapping deform(N+1..) with the drain of frame N.
+ * Default 2, >=1. K=1 degrades to the single-in-flight (P1) behavior exactly. Memory = K x max frame size
+ * per stream; on the msg_zerocopy path K x max_frame is bounded by RLIMIT_MEMLOCK (the producer caps K).
+ */
+extern int   pgch_tcp_send_inflight_blocks;
+
+/*
  * Hard cap on cooperating SHM streaming workers: the final clamp on the count
  * derived from PostgreSQL's parallel-query budget. Stays comfortably below the
  * producer's MAX_PARKED_CONNS so every worker's control-socket connection can

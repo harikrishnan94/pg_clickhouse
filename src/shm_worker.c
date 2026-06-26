@@ -105,6 +105,7 @@ typedef struct ShmWorkerHeader
     int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
     int         transport;           /* ShmProducerTransport: SHM ring or per-stream TCP listener */
     int         tcp_send_method;     /* PgchTcpSendMethod: epoll non-blocking send / blocking / msg_zerocopy */
+    int         tcp_send_inflight_blocks;  /* P2: producer run-ahead depth K (>=1) for the pipelined sender */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     int         backend_pid;         /* originating backend PID, for liveness checks */
@@ -193,6 +194,7 @@ pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
                    : (pgch_shm_transport_mode == PGCH_TRANSPORT_ARROW) ? PGCH_PRODUCER_TRANSPORT_ARROW
                    : PGCH_PRODUCER_TRANSPORT_SHM;
     hdr->tcp_send_method = pgch_tcp_send_method;
+    hdr->tcp_send_inflight_blocks = pgch_tcp_send_inflight_blocks;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
     hdr->backend_pid = MyProcPid;
@@ -518,6 +520,8 @@ pgch_shm_worker_main(Datum main_arg)
 
         /* Honor the backend session's TCP send method (epoll / blocking / msg_zerocopy); no-op for SHM. */
         shm_producer_set_tcp_send_method(producer, hdr->tcp_send_method);
+        /* P2: honor the backend session's producer run-ahead depth K; no-op for SHM. */
+        shm_producer_set_send_inflight(producer, hdr->tcp_send_inflight_blocks);
 
         /* Publish the TCP listener port (0 for SHM) BEFORE marking ready, so the backend reads a
          * valid port the instant it observes WS_READY and can emit tcp:127.0.0.1:<port> (D-HC-0102). */
