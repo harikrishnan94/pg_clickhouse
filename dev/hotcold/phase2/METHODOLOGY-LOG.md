@@ -88,3 +88,69 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   prediction; its value is purely the SEND_ZC substrate + the async story on the consumer side.
 - **Verdict:** DONE for the producer-send sub-step (correctness + on-path proven, green, committed).
   CONTINUE → async consumer (task #3), then the Branch-0 W=8 perf measurement (task #4).
+
+---
+
+### L0003 — Branch 0: async TcpStreamSource (+ executor-contract bug found & fixed)  [branch 0]  [iteration 2]  2026-06-26
+- **Goal / hypothesis:** Convert `TcpStreamSource` from a blocking `ISource` to an **async** source
+  (overlap recv with downstream processing), mirroring `PollableShmSource`'s contract. Pre-registered
+  (00-PRE-REGISTRATION Branch 0): correctness preserved; the durable win is the single-stream regime
+  (async no longer pins a thread inside recv); multi-stream W=8 ≈ 0. Bespoke wire UNCHANGED.
+- **What I did (files):**
+  - `TcpStreamSource.{h,cpp}`: rewrote as a dual-mode source. async=true (default): `prepare()` returns
+    `Status::Async` while waiting; `schedule()` returns an owned readiness eventfd; a one-shot wake-bridge
+    thread polls the socket fd (+ a stop eventfd) up to the remaining stall budget and writes the eventfd;
+    a **resumable non-blocking recv state machine** (`tryRecvBlock`/`tryRecvInto`, O_NONBLOCK after the
+    one-shot blocking handshake) reassembles a frame straddling schedule cycles. async=false: the Phase-1
+    blocking leaf source, preserved for A/B. Shared `buildChunkFromPayload` (charge→retain→adopt→project→
+    validate). Recv into the to-be-adopted buffer (so the Arrow adopter drops in for Branch A).
+  - `Settings.cpp`/`SettingsChangesHistory.cpp`: new `shm_tcp_source_async` (default true).
+  - `StorageShm.cpp`: pass the setting to the source ctor.
+  - `shm_customscan.c`: re-derived the deadlock-safety comment for the async model (D-HC-0204): the
+    blocking invariant `max_threads ≥ #blocking sources` RELAXES (async sources don't pin a recv thread);
+    keeping `max_threads = Σ producers` stays safe for both modes and gives async overlap headroom.
+  - gtest: 3 cases — `DrainsHandshakeAndBlocks` (async, fast), `DrainsHandshakeAndBlocksBlocking`
+    (blocking), `AsyncResumesAcrossPartialFrames` (async, SLOW 17-byte-fragmented producer with 2ms
+    delays → forces the resumable-recv + wake-bridge path).
+- **How verified (3 instrument classes):**
+  1. **gtests through a REAL PullingPipelineExecutor:** all 3 PASS. The slow async test completes in
+     **1187 ms** ≈ the producer's fragment-rate send time (25 blocks × ~27 frags × 2 ms), i.e. the executor
+     **blocks efficiently** between fragments — NO busy-spin (the timing is the proof of overlap-not-stall).
+  2. **gdb thread-stack + env-gated stderr trace** (PGCH_TCP_TRACE, since removed): used to root-cause the
+     hang (below). The fixed build shows the async path drives prepare→Async→schedule→wait→work cleanly.
+  3. **verify_offload.sh TRANSPORT=tcp (async default):** [result recorded in L0004].
+- **THE BUG (and the fix) — a real null/failure entry:** the first async build **HUNG** the slow test
+  (>150 s). Root cause (gdb + trace): `IProcessor::onAsyncJobReady()` is invoked **only** by the
+  multi-threaded `processAsyncTasks` monitor (`ExecutorTasks.cpp:325`); the **single-threaded**
+  `PullingPipelineExecutor` (num_threads==1) runs `work()` directly on a ready async node and **never**
+  calls `onAsyncJobReady`. My source had put the readiness-eventfd drain + `is_async_state=false` reset
+  ONLY in `onAsyncJobReady`, so in single-thread mode the level-triggered fd stayed readable → the
+  executor hot-spun (`prepare→Async` ~1.07M times, `onAsyncJobReady` 0). A second hang was a post-EOS
+  infinite `prepare→Async` (stale `is_async_state` masking the base `Finished`). **Fixes:** (a) do the
+  drain/stop/reset at the TOP of the async `tryGenerate` (runs in `work()`, so it covers both executor
+  modes), placed BEFORE the `eos_observed` early-return; (b) guard `prepare()`'s Async return with
+  `!finished && !eos_observed`. Both gated by the 3 gtests.
+- **Interpretation:** the async source is correct in both executor modes; the slow-test timing proves it
+  overlaps the recv wait without pinning a thread (the Branch-0 mechanism). The bug was a genuine,
+  non-obvious executor-contract gotcha worth recording: **a single-threaded async ISource must not rely
+  on `onAsyncJobReady`.**
+- **Learnings:** (1) `onAsyncJobReady` ≠ guaranteed; single-thread executors skip it. (2) Diagnosing async
+  hangs needs gdb thread stacks + a per-state trace; `timeout`-kill drops buffered stderr (run bg + tail).
+  (3) A ninja "exit 0" can precede the `unit_tests_dbms` link — verify the binary before trusting results.
+- **Verdict:** DONE for the async-source sub-step pending the in-query gate (L0004). CONTINUE → verify_offload + commit.
+
+---
+
+### L0004 — Branch 0 async consumer: in-query correctness gate (GREEN)  [branch 0]  [iteration 2]  2026-06-26
+- **What I did:** removed the debug trace; rebuilt `clickhouse` + `unit_tests_dbms` clean; re-ran the
+  gtests; ran the regression oracle in TCP/async-default mode.
+- **How verified:**
+  - gtests (fresh binary, trace removed): `TcpStreamSource.*` = **4/4 PASS** (async fast 0ms; blocking
+    0ms; async-slow-resumable 1188ms; loopback microbench 7.57 GB/s 0.132 ns/byte).
+  - `CH_BIN=…/reldeb/programs/clickhouse PG_DB=shmdemo TRANSPORT=tcp bash test/shm/verify_offload.sh`
+    (async source is the default) → **PASS=137 FAIL=0** (`/tmp/b0_verify_async.log`), clean teardown,
+    no new DIFF (bespoke wire unchanged). Live `:21002` server restarted onto the new binary (pid 2677975).
+- **Interpretation:** the async TcpStreamSource is correct in real multi-source offload queries (scans,
+  SEMI/ANTI joins one TCP conn per relation, decimal, NULLs, fail-closed, leak teardown) — same 137/137
+  as the blocking baseline, so the async rewrite preserves correctness and clean teardown.
+- **Verdict:** DONE (async consumer correct + green). Committing. CONTINUE → W=8 A/B measurement (task #4).

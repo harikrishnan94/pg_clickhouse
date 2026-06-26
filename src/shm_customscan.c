@@ -1374,12 +1374,20 @@ shm_build_offload_settings(int nworkers)
     }
     /*
      * Force the CH consumer's max_threads to the total producer count across all sources.
-     * DEADLOCK-SAFETY INVARIANT for the TCP transport (Hot-Cold D-HC-0104): TcpStreamSource is a
-     * BLOCKING leaf source (its generate() blocks in recv()), so it holds one executor thread for
-     * the lifetime of its stream. max_threads = Σ producers guarantees threads >= the number of
-     * blocking TCP sources, so a multi-source query can never starve a source of its thread. Do NOT
-     * lower max_threads below the producer count while the consumer source blocks (the durable fix
-     * is an async TcpStreamSource; see dev/hotcold/phase1/REPORT.md §9).
+     * DEADLOCK-SAFETY INVARIANT (Hot-Cold D-HC-0104, re-derived for async in D-HC-0204):
+     *   - Phase-1 BLOCKING TcpStreamSource: its generate() blocks in recv(), holding one executor
+     *     thread for the lifetime of its stream. The invariant was max_threads = Σ producers >=
+     *     #blocking TCP sources, so a multi-source query can never starve a source of its thread.
+     *   - Phase-2 ASYNC TcpStreamSource (shm_tcp_source_async=1, the default): the source returns
+     *     Status::Async and the executor epolls its readiness fd instead of pinning a thread inside
+     *     recv, so one thread can service many ready sources. The hard invariant RELAXES to "every
+     *     async source's readiness fd is registered and re-scheduled on readiness/cancel/stall"
+     *     (guaranteed by the source's prepare()/schedule()/onAsyncJobReady()/wake-bridge contract).
+     * Forcing max_threads = Σ producers stays SAFE for both modes (it only ever over-provisions
+     * threads for the async source) and additionally gives the async source >=2 threads whenever
+     * there are >=2 producers, which is what lets recv overlap downstream processing. We keep the
+     * forcing for both: it is required for the blocking baseline and harmless+beneficial for async.
+     * (Single-stream overlap needs max_threads>=2 with 1 producer; measured separately via a probe.)
      */
     items = lappend(items, makeDefElem(pstrdup("max_threads"),
                                        (Node *) makeString(psprintf("%d", nworkers)), -1));

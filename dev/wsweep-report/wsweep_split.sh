@@ -95,6 +95,8 @@ SQL
 offload_set(){
   local ss="join_use_nulls 1, group_by_use_nulls 1, final 1, allow_experimental_streamed_table_function 1"
   [ -n "$USE_MAXTHREADS" ] && ss="$ss, max_threads $USE_MAXTHREADS"
+  # Phase-2 hook: extra CH session settings (e.g. 'shm_tcp_source_async 0' for the Branch-0 A/B).
+  [ -n "$EXTRA_SS" ] && ss="$ss, $EXTRA_SS"
   ss="$ss, log_comment $1"
   echo "LOAD 'pg_clickhouse';"
   echo "SET search_path=pg;"
@@ -103,6 +105,8 @@ offload_set(){
   echo "SET pg_clickhouse.session_settings='$ss';"
   echo "SET pg_clickhouse.enable_shm_offload=on;"
   echo "SET pg_clickhouse.shm_transport_mode='$TRANSPORT';"
+  # Phase-2 hook: extra PG GUC SET lines (e.g. tcp_send_method='blocking' for the Branch-0 A/B).
+  [ -n "$EXTRA_SET" ] && echo "$EXTRA_SET"
   [ "$2" = 1 ] && echo "SET pg_clickhouse.shm_log_stream_stats=on;"
   echo "SET max_parallel_workers=64; SET max_parallel_workers_per_gather=$OFF_MPWPG;"
   echo "SET statement_timeout='300s';"
