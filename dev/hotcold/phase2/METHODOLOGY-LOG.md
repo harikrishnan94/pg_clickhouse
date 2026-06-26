@@ -478,3 +478,46 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE (kickoff + constraint mapped). CONTINUE → implement B-it2 (the adopt-mode decoder +
   RetainToken retention + Decimal128 copy-fallback + String sentinel validation), gate, then measure the
   Q24 recovery.
+
+---
+
+### L0012 — Branch B iteration 2: zero-copy adoption — correct + measured; PARTIAL recovery (honest)  [branch B]  [iteration 2]  2026-06-26
+- **Goal / hypothesis (pre-registered B-it2):** zero-copy adopt of the Arrow buffers ELIMINATES the
+  consumer copy-decode → predicted to **recover the Branch-A String-heavy Q24 regression to bespoke-TCP
+  parity**; fixed-width stays at parity; alloc/no-cloneResized prove the elimination.
+- **What I did:** committed B-it2 (CH f30ed9d6efc): `shm_arrow_zero_copy` setting (default adopt; 0=copy
+  for A/B), `adoptArrowColumnToCH` aliasing the Arrow buffers via `createAdopted` + one RetainToken/block
+  (frees the recv body) + shared ChargeHandle; Decimal128/sliced/bad-sentinel → copy fallback. Ran the
+  W=8 sweep `run_bB_sweep.sh` (arrow-adopt / arrow-copy / tcp / shm-adopt, all FRESH same-binary same-
+  session, idle host load 0.12).
+- **How verified (≥3 INDEPENDENT classes):**
+  1. **Correctness:** verify_offload TRANSPORT=arrow (adopt default) = **137/137** (joins/aggregates over
+     adopted columns, Decimal copy-fallback, EOS, leak teardown). gtests 10/10 (adopt + copy + stock oracle
+     + zero-copy-across-fragmented-recv). No new DIFF (cmp.py verdicts identical to native/tcp/copy).
+  2. **End-to-end W=8 timing (RAW, ms median(sd)):** TPC-H Q1 adopt 1581(14)/copy 1571/tcp 1547/shm 1424;
+     Q6 1244/1238/1226/1158; Q19 2254/2260/2216/2042. CB Q2 407/408/404/402. **CB Q24 (headline) adopt
+     1242(15) / copy 1292 / tcp 1156 / shm-adopt 916.** Fixed-width: adopt vs tcp +1.5…+2.2% → PARITY.
+     Q24: adopt vs copy **−3.9%**; adopt vs tcp **+7.4%** (ABOVE the max(5%,1σ) band → NOT full parity).
+  3. **Consumer CPU split (mechanism):** CB Q24 `cons_user` adopt **663** vs copy **962** = **−299 ms** —
+     the copy-decode IS eliminated (matches the predicted +283 ms). adopt vs tcp `cons_user` +47, `cons_sys`
+     +118.
+- **Interpretation (prediction vs observation — a MISMATCH to investigate, NOT rationalize):** the
+  zero-copy adoption is real and proven (−299 ms consumer user CPU; createAdopted aliases the buffer by
+  construction; 137/137 correct). BUT the pre-registered "recover Q24 to bespoke parity" **did not fully
+  hold**: adopt is **+7.4% vs bespoke-tcp**, above the noise band. Two converging reasons: (a) on this
+  bandwidth-bound ~8 GB cell the eliminated consumer CPU was **overlapped** with the recv, so removing
+  299 ms of CPU only moved the wall −50 ms (−3.9% vs copy); (b) the residual +7.4% vs bespoke is the
+  **Arrow IPC framing/parse overhead** — `Message::Open` + `ReadRecordBatch` construct 105 `arrow::Array`
+  objects/block (allocations + flatbuffer walk) that the bespoke descriptor wire does not pay. The wall
+  decomposes: shm-adopt 916 + kernel-recv-copy(→tcp 1156, +240) + Arrow-parse(→arrow-adopt 1242, +86) [+
+  copy-decode in arrow-copy 1292, +50]. So Branch B removes the copy-decode layer (intention 2 progress)
+  but exposes the Arrow-parse layer as the new residual — the honest cost of a STANDARD format (intention 1).
+- **Learnings / whole-system:** eliminating a consumer copy only helps the wall when the copy is ON the
+  critical path; on a recv-bandwidth-bound cell it is overlapped, so the win is CPU/energy (real) more than
+  wall. The next lever is the Arrow framing per-block parse (`ReadRecordBatch` array construction), not the
+  data copy. Fixed-width cells were already parity (copy negligible) and stay parity.
+- **Verdict:** CONTINUE. B-it2 is correct + the copy-decode is measurably eliminated, but the Q24 floor
+  (parity vs bespoke) is NOT met (+7.4% residual = Arrow-parse). → B-it3: a LEAN Arrow buffer-extraction
+  that skips `ReadRecordBatch`'s per-block `arrow::Array` construction (walk the RecordBatch flatbuffer's
+  `Buffer{offset,length}` directly → adopt), pre-registered to attack the +7.4%. (Also B-it1 producer-1-copy
+  confirm; send-zc measured-null.) D-HC-0206 ColumnNullable recurse + gtest pending a build.
