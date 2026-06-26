@@ -116,3 +116,43 @@ verified the msg_zerocopy buffer-reuse has no corruption window, and re-derived 
 #1 (a defensive ENOBUFS hot-spin) was fixed in-branch, #2 (the un-fused deform+serialize) documented.
 
 **Branch B GREEN.**
+
+## 8. Definition-of-Done checklist (PROMPT.md §"Definition of done") — Branch B
+- [x] **Copy-budget table measured + each ELIMINATED copy profile-proven** — §2 + `evidence/bB-copy-budget.md`;
+  perf shows the absence of per-column `memcpy`/`cloneResized` on the adopt path and the −299 ms consumer-CPU
+  drop on the String-heavy cell.
+- [x] **(a) No per-column userspace data copy on the pass-through path** — fixed-width + String adopted in
+  place (`adoptFixedRaw`/`adoptStringRaw`); String `offsets = &arrow_offsets[1]` with `array.offset()==0 &&
+  arrow_offsets[0]==0` validated (and `validateAdoptedOffsets()` on the emitted columns). Proven: parity on
+  fixed-width + −299 ms on String + perf (no per-column data memcpy; `ReadRecordBatch`/`cloneResized` absent).
+- [x] **(b) No per-column data allocation / zero realloc** — `createAdopted` is alias-only (structural); the
+  only allocation per block is the one recv body buffer (`allocFrameBuffer`) + the small column shells; no
+  `cloneResized`/realloc on the pass-through path (perf-confirmed absent). Nullable null_map: n/a (non-Nullable
+  producer); the capability + recurse are gtested.
+- [x] **(c) `convertToFullColumnIfAdopted` materialize-on-mutate + `ColumnNullable` recurse (D-HC-0206)** —
+  NOT a blanket no-op; gtested `AdoptedConvert.FixedWidthMaterializesAndIsMutable` +
+  `.NullableRecursesIntoAdoptedNested` (2/2), end-to-end-neutral (137/137).
+- [x] **(d) Prompt drop / bounded memory** — one `RetainToken`/block, freed on the chunk's last-drop when
+  consumed downstream; in-flight bounded to ~K recv buffers/stream (structural, shared with Branch 0/A's
+  validated lifetime machinery); the leak oracle (`verify_offload` teardown) = 137/137 (no leaked
+  workers/sockets/fds) on every binary state. (A dedicated adopt-path RSS-peak curve is inherited from
+  Branch 0/A — the buffer-lifetime machinery is unchanged; Branch B only changes WHO holds the buffer.)
+- [x] **Send-side zero-copy honestly proven (loopback measured null via `SO_EE_CODE_ZEROCOPY_COPIED`)** —
+  B-it4/L0015: zc_copied==zc_notifs 100% (deferred copy); +7.3% wall (negative); NOT claimed as an elimination.
+- [x] **Recv-side single-copy recv + residual kernel copy reported + capable-NIC design recorded** — one
+  kernel copy into the to-be-adopted buffer, no userspace recopy; the residual kernel recv copy is the
+  measured dominant ~35% consumer cost (no NIC header/data split — review §3); `TCP_ZEROCOPY_RECEIVE`/io_uring
+  `RECV_ZC` recorded as the real-NIC north star, not claimed.
+- [x] **End-to-end ≥ today's TCP at W=8 (mechanism explains any shortfall)** — fixed-width parity (≥); the
+  widest-String-cell +7.5% shortfall is mechanism-explained (distributed standard-Arrow-framing cost: NOT the
+  decode [B-it3 ~0.4%], NOT wire size [+0.7%], NOT the serialize concat [~0.5%]).
+- [x] **≥3 evidence-based optimization iterations logged** — L0012 (it2), L0014 (it3), L0015 (it4) + L0016
+  (it1 confirm) + D-HC-0206; 4 iterations, each pre-registered → gated → measured ≥3 classes → verdict.
+- [x] **Every claim ≥3 converging instruments; every deviation logged; reproduction recorded** — §7;
+  10-REPRODUCTION.md; the methodology log is the append-only audit trail.
+- [x] **Small reviewable patches, each green before commit** — 8 Branch-B commits across the two repos,
+  history is the audit trail.
+- [x] **Independent adversarial review passed** — `evidence/ADVERSARIAL-REVIEW.md` Branch B = PASS, zero
+  blocking; finding #1 fixed in-branch, #2 documented.
+
+**Branch B: Definition of Done — MET. GREEN.**
