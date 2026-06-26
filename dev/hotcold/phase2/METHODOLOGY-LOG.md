@@ -384,3 +384,48 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE. Branch A correctness GREEN, committed (CH f2128e5a7fb; pg A2/A3). CONTINUE → A5:
   W=8 sweep (arrow-tcp vs bespoke-tcp vs shm-adopt/copy) for the fixed-width-parity / String-bounded-
   regression gate, then the independent adversarial review + REPORT-branchA.md.
+
+---
+
+### L0010 — Branch A: W=8 perf gate + adversarial review + review-fix (GREEN)  [branch A]  [iteration 1]  2026-06-26
+- **Goal / hypothesis:** the pre-registered Branch-A perf gate — fixed-width/numeric cells at PARITY with
+  bespoke-TCP at W=8 (a fixed-width regression BLOCKS the branch), String-heavy a BOUNDED +10–30%
+  regression (copying decode), recovered in Branch B. Plus the mandated independent adversarial review.
+- **What I did:** wrote `run_bA_sweep.sh` (arrow/tcp/adopt, all fresh on the same binaries in one session,
+  via `wsweep_split.sh` with `TRANSPORT=` + empty `EXTRA_SET/SS`). Ran W=8 N=5 on an idle host (load 0.12):
+  TPC-H {1,6,19} + ClickBench {2,24}. Built `evidence/bA-overhead-table.md` + `REPORT-branchA.md`. Ran a
+  fresh independent adversarial-review subagent. Actioned its finding #1.
+- **How I did it (commands):** `N=5 K=3 bash dev/hotcold/phase2/run_bA_sweep.sh`; parsed
+  `results/bA-*/{tpch,clickbench}/cells.tsv`; `unit_tests_dbms --gtest_filter='ArrowStreamSource.*:TcpStreamSource.*'`.
+  (First sweep aborted to "no-customscan" because `wsweep_split.sh` uses `$EXTRA_SS` under `set -u`; passing
+  `EXTRA_SET="" EXTRA_SS=""` fixed it — logged here as the null that explained an early no-offload run.)
+- **How verified (≥3 INDEPENDENT converging classes):**
+  1. **End-to-end W=8 wall (median+sd, fresh same-binary):** TPC-H Q1 **+1.3%**, Q6 **+0.6%**, Q19 **+2.4%**,
+     CB Q2 **−0.5%** → all 4 fixed-width/numeric cells **PARITY** within `max(5%,1σ)` (no fixed-width
+     regression → blocking condition satisfied). CB Q24 (`SELECT *` ~8 GB, String-heavy) **+15.9%** — inside
+     the pre-registered **+10–30%** bound. `evidence/bA-overhead-table.md`, `results/bA-*/`.
+  2. **Consumer CPU split (mechanism):** Q24 `cons_user` arrow−tcp = **+283.7 ms**, `cons_sys` **+199.3 ms**
+     — the String copy-decode (arrow rebuilds `ColumnString` chars+offsets; bespoke adopts zero-copy);
+     negligible on fixed-width (Q1 +11 ms, Q6 +60 ms user). The producer side is ≈ equal (`off_prod` ~4–7 ms).
+  3. **Gap-to-adopt decomposition:** Q24 = adopt 914 + kernel-recv-copy(→tcp 1148, +26%) +
+     consumer-copy-decode(→arrow 1331, +16%). The regression IS the copy-decode layer → Branch B removes it
+     (→ bespoke parity); the kernel recv copy is the irreducible loopback residual (real-NIC north star).
+- **Result (RAW):** see `evidence/bA-overhead-table.md`. Fidelity: every swept cell's `cmp.py` verdict is
+  byte-identical across arrow/tcp/adopt (Q1 `approx(<=1.4e-16)` = same Decimal→Float64 bound in all modes;
+  rest `exact`). No new DIFF.
+- **Adversarial review (fresh subagent — `evidence/ADVERSARIAL-REVIEW.md` Branch-A section): VERDICT PASS.**
+  Re-ran 8/8 gtests, re-derived all 5 deltas (≤0.1% match), confirmed the +283.7 ms mechanism, identical
+  fidelity verdicts, memory safety (body freed after `batch.reset()`), no bespoke regression. 3 non-blocking
+  findings: **#1 FIXED in-branch** — `readArrowSchema()` validated only field COUNT, not per-field layout
+  (D-HC-0207 requires count + layout; the fixed-width memcpy trusted the SQL width → a latent width-mismatch
+  heap over-read). Added per-field cross-validation: String ↔ variable-binary Arrow field; every fixed-width
+  SQL type ↔ a fixed-width Arrow field of the SAME byte width (`FixedWidthType::bit_width()/8 ==
+  getSizeOfValueInMemory()`). Rebuilt; **gtests 8/8 + verify_offload arrow 137/137 re-confirmed**. #2 (the
+  stock-reader oracle is transitive via shared literals) DOCUMENTED. #3 (the `offsets[0]==0` sentinel
+  "MUST validate") carried into Branch B as a binding requirement (the zero-copy adopter needs it).
+- **Interpretation:** prediction matches observation exactly — fixed-width parity, String +15.9% inside the
+  pre-registered band, mechanism = consumer copy-decode. Three perf classes + four correctness classes
+  converge. The one regression is reported, bounded, and slated for Branch-B recovery — not hidden.
+- **Verdict:** DONE. **Branch A GREEN** (correct, fixed-width parity, String bounded-regression, review
+  PASS, finding #1 fixed). CONTINUE → Branch B (zero-copy Arrow adoption + ≥3 evidence-based optimization
+  iterations + the copy-budget table + send-side measured-null + single-copy-recv).

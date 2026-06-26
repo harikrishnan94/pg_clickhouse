@@ -53,3 +53,54 @@ executor (`ExecutorTasks`/`PollingQueue`). No blocking defect that breaches a st
 
 **Outcome:** PASS. Findings #1 + #3 actioned in-branch; #2 documented as the clean follow-up that explains
 the Q24 edge. Branch 0 is GREEN.
+
+---
+
+## Branch A (Apache Arrow IPC wire) — 2026-06-26 — VERDICT: PASS (non-blocking findings)
+
+Independent reviewer (fresh context, did NOT write the code) re-ran BOTH gtest suites (8/8:
+`ArrowStreamSource.*` 4/4 + `TcpStreamSource.*` 4/4), re-derived all 5 W=8 deltas from the raw
+`results/bA-{arrow,tcp,adopt}/{tpch,clickbench}/cells.tsv` (matched the REPORT to ≤0.1%), read the
+consumer decode + producer encoder line-by-line, re-read both verify logs, the pre-registration,
+REPORT-branchA, the overhead table, and D-HC-0207.
+
+**Confirmed sound (per angle):**
+- **Correctness:** `copyArrowColumnToCH` String copy correct (base/total/`coffs[i]=offs[i+1]-base`,
+  non-NUL-terminated; empty + all-empty cases reasoned out, no off-by-one); all 17 fixed-width TypeIndex
+  cases map to the right column + memcpy width (Date→u16/2B … Decimal128→FixedSizeBinary16); body buffer
+  freed AFTER `batch.reset()` (no use-after-free), in-flight bounded to one body buffer; 3-phase recv EOS
+  (metadata_size==0) + producer-death (PeerClosed in any phase) correct; producer offsets-prepend correct.
+  gtests 8/8 reproduce; `/tmp/bA_verify_arrow.log` = 137/137 with `arrow:` URLs + `ShmCopiedBlocks` oracle.
+- **Fidelity:** every swept cell's `correct` verdict is byte-IDENTICAL across arrow/tcp/adopt (Q1
+  `approx(<=1.4e-16)` is the same Decimal→Float64 bound in all modes, NOT an arrow-only deviation; rest
+  `exact`). No new DIFF.
+- **Performance/mechanism:** re-derived deltas (Q1 +1.35%, Q6 +0.65%, Q19 +2.39%, CB-Q2 −0.49%, CB-Q24
+  +15.94%) match; fixed-width all within `max(5%,1σ)` (no fixed-width regression — blocking condition met);
+  Q24 within the PRE-REGISTERED +10–30%. Mechanism confirmed: Q24 `cons_user` arrow−tcp = **+283.7 ms**
+  (the String copy-decode), negligible (+4.2 ms) on fixed-width. All 3 modes ran on the SAME PG backend +
+  CH server (fresh-baseline). Nothing cherry-picked.
+- **Holism:** copy-decode doesn't hurt the broader W=8 dataflow (4/4 fixed-width parity); `copied=true`
+  charge bumps the oracle correctly; extending TcpStreamSource didn't regress bespoke (tcp 137/137 + 4/4).
+
+**Non-blocking findings + disposition:**
+1. **(Safety/doc divergence) `readArrowSchema()` validated only field COUNT, not per-field layout** —
+   D-HC-0207 requires field count **+ per-field layout**; the fixed-width memcpy trusted the SQL width
+   with no check vs the Arrow buffer, so a width mismatch (e.g. Arrow Int32 vs SQL Int64) would be a heap
+   over-read (not reachable in the shipped same-codebase flow, but a real defense-in-depth gap).
+   **DISPOSITION: FIXED in-branch** — `readArrowSchema` now cross-validates each field: String ↔ a
+   variable-binary Arrow field, and every fixed-width SQL type ↔ a fixed-width Arrow field of the SAME
+   byte width (`FixedWidthType::bit_width()/8 == getSizeOfValueInMemory()`), throwing `SHM_SCHEMA_MISMATCH`
+   otherwise. Rebuilt; gtests 8/8 + verify_offload arrow 137/137 re-confirmed.
+2. **(Test strength) the stock-reader oracle is transitive** (both the custom decode and
+   `ArrowColumnToCHColumn` are compared to shared literals, not to each other directly). Functionally
+   sound. **DISPOSITION: DOCUMENTED** — the literals are the strongest oracle (known truth) and the
+   end-to-end verify_offload independently cross-checks arrow vs native/other-transports; a direct
+   chunk==chunk comparison is a minor future strengthening.
+3. **(Branch-B mandate) the LargeBinary `offsets[0]==0` sentinel "MUST validate" (pre-reg) is not
+   asserted** — the Branch-A COPY path is robust without it (it subtracts `base=offs[0]`), but the
+   Branch-B ZERO-COPY adopter MUST validate `array.offset()==0 && arrow_offsets[0]==0` (it aliases
+   `&arrow_offsets[1]` as the CH `offsets[-1]` sentinel). **DISPOSITION: carried into Branch B** as a
+   binding requirement (it is already in D-HC-0201/0207 + 00-PRE-REGISTRATION).
+
+**Outcome:** PASS. Finding #1 FIXED in-branch (per-field layout validation); #2 documented; #3 carried
+into Branch B as a binding requirement. Branch A is GREEN.
