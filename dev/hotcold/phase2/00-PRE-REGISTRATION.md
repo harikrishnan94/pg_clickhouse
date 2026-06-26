@@ -216,3 +216,15 @@ instrument classes → adversarial check → log DONE/CONTINUE. Candidate iterat
   String regression to parity; alloc counter == recv buf (+null_map); no cloneResized in profile.
 - **B-it3:** send-side `IORING_OP_SEND_ZC` measured-null (SO_EE_CODE_ZEROCOPY_COPIED) + confirm no
   end-to-end win on loopback (honest null). Possibly a 4th iteration tuning recv buffer sizing / batching.
+
+---
+
+## Amendment 2026-06-26 (Branch-A readiness) — nanoarrow IPC writer confirmed
+De-risked D-HC-0202 before starting Branch A: **nanoarrow 0.8.0 ships an IPC encoder** — verified the
+public API in `nanoarrow_ipc.h`: `ArrowIpcEncoderInit`, `ArrowIpcEncoderEncodeSchema`,
+`ArrowIpcEncoderEncodeSimpleRecordBatch`, `ArrowIpcEncoderFinalizeBuffer` (+ a higher-level
+`ArrowIpcWriter`). So the C producer can emit standards-valid encapsulated Arrow IPC (Schema message +
+RecordBatch messages) via nanoarrow + its vendored flatcc runtime, and the stock `ArrowColumnToCHColumn`
+can be the decode oracle — the producer path is viable as decided. Branch-A implementation sequencing:
+fixed-width numeric round-trip first (highest confidence) → `LargeBinary` String → Nullable/Date. (This
+amends, does not change, the Branch-A plan above.)

@@ -154,3 +154,33 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   SEMI/ANTI joins one TCP conn per relation, decimal, NULLs, fail-closed, leak teardown) — same 137/137
   as the blocking baseline, so the async rewrite preserves correctness and clean teardown.
 - **Verdict:** DONE (async consumer correct + green). Committing. CONTINUE → W=8 A/B measurement (task #4).
+
+---
+
+### L0005 — Branch 0: W=8 A/B measurement + adversarial review + hardening  [branch 0]  [iteration 2]  2026-06-26
+- **Goal / hypothesis:** confirm the pre-registered multi-stream W=8 delta ≈ 0 (io_uring-async vs
+  bespoke-blocking TCP); run the independent adversarial review; action its findings.
+- **What I did:** added `EXTRA_SS`/`EXTRA_SET` hooks to `wsweep_split.sh` + `run_b0_sweep.sh` (A/B on the
+  proven harness, identical cap/oracles). Ran a representative W=8 sweep (TPC-H {1,6,19} + ClickBench
+  {2,24}), then a clean idle re-measure (N=7) of the win cell (Q1) + the regression cell (Q24).
+- **How verified (≥3 instrument classes, converge):**
+  1. **End-to-end W=8 timing (both modes fresh, same binary):** 4/5 cells parity within the noise band
+     (Q1 +0.3%/clean +1.2%, Q6 −0.2%, Q19 −0.1%, CB Q2 −0.5%). Q24 (SELECT* ~8 GB): sweep-1 +7.3% (load
+     ~2.9) → clean idle +4.9% (55 ms) = within `max(5%,1σ)=56 ms`. `evidence/b0-overhead-table.md`,
+     `results/{b0-*,clean-*}/`.
+  2. **gtests + loopback microbench:** 4/4 PASS; transport rate 7.5–7.9 GB/s (invariant across builds);
+     async-resumable 1188 ms ≈ producer fragment-rate (overlap-not-spin).
+  3. **Deterministic per-producer io_uring counter** (L0002) — io_uring on the path.
+- **Result (RAW):** see `evidence/b0-overhead-table.md` (sweep 1 + clean re-measure tables).
+- **Interpretation:** pre-registered null confirmed on 4/5 cells; Q24 is an honest small (~5%, statistically
+  real: 2.6σ, t≈6.3) within-floor regression — the io_uring/async per-op overhead on the highest-throughput
+  cell (the reviews' "io_uring targets a non-bottleneck on loopback" prediction). No floor breach. The
+  single-stream overlap win is mechanism-proven (gtest) but query-level clamp-gated (CONTINUE).
+- **Adversarial review (fresh subagent, `evidence/ADVERSARIAL-REVIEW.md`):** **PASS.** Re-ran gtests,
+  re-derived every A/B delta from raw cells, confirmed io_uring linked + on path + GUC propagation,
+  audited async concurrency vs the real executor. Non-blocking findings: #1 latent `sock_fd` non-atomic
+  race (onCancel/dtor) → **FIXED** (atomic + exchange-on-close; rebuilt, 4/4 gtests still PASS); #2
+  per-cycle wake-bridge thread spawn (source of the async sys-CPU + Q24 edge) → documented follow-up; #3
+  Q24 headline honesty → REPORT tightened (real within-floor regression, not "noise").
+- **Verdict:** DONE. Branch 0 GREEN — implementation + measurement + review complete, committed as small
+  patches. CONTINUE → Branch A (Arrow wire) is designed/decided/pre-registered; implementation pending.
