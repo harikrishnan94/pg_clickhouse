@@ -1,0 +1,19 @@
+-- transport frames in tcp CH profile --
+     6.63%  QueryPipelin  [kernel.kallsyms]              [k] __arch_copy_to_user
+            ---__arch_copy_to_user
+               simple_copy_to_iter
+               __skb_datagram_iter
+               skb_copy_datagram_iter
+               tcp_recvmsg_locked
+               tcp_recvmsg
+               inet_recvmsg
+               sock_recvmsg
+               recvAll (inlined)
+               recvBlock (inlined)
+               recvBlock (inlined)
+               tcp_recvmsg_locked
+               tcp_recvmsg
+               inet_recvmsg
+               sock_recvmsg
+               recvAll (inlined)
+               recvBlock (inlined)

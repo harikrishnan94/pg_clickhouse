@@ -22,6 +22,10 @@ N="${N:-5}"
 K="${K:-3}"
 W_LIST="${W_LIST:-1 2 4 8}"
 RUN_ID="${RUN_ID:-tpchcb}"
+# Hot-Cold transport dimension: adopt (default, zero-copy) | copy. Threaded into the
+# offload SET block; the offload oracle counts ShmAdopted+ShmCopied blocks so both modes
+# are eligible. Set OUT per mode (e.g. results/copy/$BENCH) to keep cells.tsv separate.
+TRANSPORT="${TRANSPORT:-adopt}"
 REPORT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGF=/var/log/postgresql/postgresql-18-main.log
 
@@ -52,7 +56,7 @@ CHPID=$(sudo ss -ltnp 2>/dev/null | grep ":$CH_HTTP_PORT " | grep -oP 'pid=\K[0-
 PMPID=$(sudo head -1 /var/lib/postgresql/18/main/postmaster.pid)
 PERIOD=100000
 [ -n "$CHPID" ] && [ -n "$PMPID" ] || { echo "could not resolve CH/PM pids" >&2; exit 1; }
-echo "BENCH=$BENCH db=$PGDB pm=$PMPID ch=$CHPID N=$N K=$K W='$W_LIST' nq=$(echo $QUERIES|wc -w)"
+echo "BENCH=$BENCH db=$PGDB pm=$PMPID ch=$CHPID N=$N K=$K W='$W_LIST' transport=$TRANSPORT nq=$(echo $QUERIES|wc -w)"
 
 PM_CG=$(sudo cat /proc/$PMPID/cgroup | cut -d: -f3)
 CH_CG=$(sudo cat /proc/$CHPID/cgroup | cut -d: -f3)
@@ -98,6 +102,7 @@ offload_set(){
   echo "SET pg_clickhouse.shm_min_rows=0;"
   echo "SET pg_clickhouse.session_settings='$ss';"
   echo "SET pg_clickhouse.enable_shm_offload=on;"
+  echo "SET pg_clickhouse.shm_transport_mode='$TRANSPORT';"
   [ "$2" = 1 ] && echo "SET pg_clickhouse.shm_log_stream_stats=on;"
   echo "SET max_parallel_workers=64; SET max_parallel_workers_per_gather=$OFF_MPWPG;"
   echo "SET statement_timeout='300s';"
@@ -125,7 +130,7 @@ check_eligible(){ local sql="$1" tag; tag=$(new_tag elig)
   local m blk=0
   for _t in $(seq 1 12); do
     chq "SYSTEM FLUSH LOGS" >/dev/null
-    m=$(chq "SELECT sum(ProfileEvents['ShmAdoptedBlocks']), sum(read_rows) FROM system.query_log WHERE log_comment='$tag' AND type='QueryFinish' AND positionCaseInsensitive(query,'streamed_table')>0 AND positionCaseInsensitive(query,'query_log')=0")
+    m=$(chq "SELECT sum(ProfileEvents['ShmAdoptedBlocks'] + ProfileEvents['ShmCopiedBlocks']), sum(read_rows) FROM system.query_log WHERE log_comment='$tag' AND type='QueryFinish' AND positionCaseInsensitive(query,'streamed_table')>0 AND positionCaseInsensitive(query,'query_log')=0")
     blk=$(echo "$m" | cut -f1); blk=${blk:-0}
     [ "${blk:-0}" -ge 1 ] 2>/dev/null && break
     sleep 0.5

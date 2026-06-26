@@ -251,6 +251,18 @@ SET_OFF="SET pg_clickhouse.enable_shm_offload=off;"
 # LOAD is belt-and-braces in case session_preload_libraries has not taken effect.
 SET_ON="LOAD 'pg_clickhouse'; SET pg_clickhouse.local_ch_server='local_ch'; SET pg_clickhouse.shm_min_rows=0; SET pg_clickhouse.session_settings='allow_experimental_streamed_table_function 1'; SET pg_clickhouse.enable_shm_offload=on;"
 
+# Transport mode under test (Hot-Cold Phase 0): adopt (default, zero-copy) | copy.
+# Selects the consumer data path via the streamed_table() arg AND which per-block
+# ProfileEvent the offload oracle proves, so the SAME suite runs green in both modes
+# and proves the INTENDED transport actually ran (copy => ShmCopiedBlocks, not Adopted).
+TRANSPORT="${TRANSPORT:-adopt}"
+SET_ON="$SET_ON SET pg_clickhouse.shm_transport_mode='$TRANSPORT';"
+case "$TRANSPORT" in
+    copy|tcp) BLOCK_EVENT="ShmCopiedBlocks" ;;   # copy + tcp both increment the copy counter family
+    *)        BLOCK_EVENT="ShmAdoptedBlocks" ;;
+esac
+say "Transport under test: $TRANSPORT (offload oracle asserts ProfileEvents['$BLOCK_EVENT'])"
+
 # verify_offload <name> <expected_streamed_rows> <sql>
 verify_offload() {
     local name="$1" want_rows="$2" sql="$3"
@@ -263,20 +275,20 @@ verify_offload() {
     chq "SYSTEM FLUSH LOGS" >/dev/null
     after=$(ch_count_streamed)
     read_rows=$(ch_latest "read_rows")
-    shm_blocks=$(ch_latest "ProfileEvents['ShmAdoptedBlocks']")
+    shm_blocks=$(ch_latest "ProfileEvents['$BLOCK_EVENT']")
     chsql=$(ch_latest "replaceRegexpAll(query,'\\\\s+',' ')")
 
     say ""
     say "[$name]"
     say "    pg(off): $(echo "$baseline" | tr '\n' '|')   pg(on): $(echo "$result" | tr '\n' '|')"
     say "    CH executed : $chsql"
-    say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks  (streamed_table queries: $before -> $after)"
+    say "    CH read_rows=$read_rows  $BLOCK_EVENT=$shm_blocks  (streamed_table queries: $before -> $after)"
 
     check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
         && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query in system.query_log"
     [ "${shm_blocks:-0}" -ge 1 ] 2>/dev/null \
-        && ok "$name: ClickHouse adopted >= 1 SHM block (ShmAdoptedBlocks=$shm_blocks)" || bad "$name: ShmAdoptedBlocks=$shm_blocks"
+        && ok "$name: ClickHouse adopted >= 1 SHM block ($BLOCK_EVENT=$shm_blocks)" || bad "$name: $BLOCK_EVENT=$shm_blocks"
     [ "${read_rows:-0}" = "$want_rows" ] 2>/dev/null \
         && ok "$name: CH read_rows == $want_rows (full table streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
 }
@@ -331,21 +343,21 @@ verify_big() {
     chq "SYSTEM FLUSH LOGS" >/dev/null
     after=$(ch_count_streamed)
     read_rows=$(ch_latest "read_rows")
-    shm_blocks=$(ch_latest "ProfileEvents['ShmAdoptedBlocks']")
+    shm_blocks=$(ch_latest "ProfileEvents['$BLOCK_EVENT']")
     chsql=$(ch_latest "replaceRegexpAll(query,'\\\\s+',' ')")
 
     say ""
     say "[$name] (bounded-ring streaming of a large relation)"
     say "    pg(off): $(echo "$baseline" | tr '\n' '|')   pg(on): $(echo "$result" | tr '\n' '|')"
     say "    CH executed : $chsql"
-    say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
+    say "    CH read_rows=$read_rows  $BLOCK_EVENT=$shm_blocks (>= $min_blocks expected)"
 
     check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
         && ok "$name: ClickHouse executed a new streamed_table() query" || bad "$name: no new streamed_table query"
     [ "${shm_blocks:-0}" -ge "$min_blocks" ] 2>/dev/null \
-        && ok "$name: adopted many SHM blocks (ShmAdoptedBlocks=$shm_blocks >= $min_blocks)" \
-        || bad "$name: ShmAdoptedBlocks=$shm_blocks < $min_blocks (not streaming through the ring?)"
+        && ok "$name: adopted many SHM blocks ($BLOCK_EVENT=$shm_blocks >= $min_blocks)" \
+        || bad "$name: $BLOCK_EVENT=$shm_blocks < $min_blocks (not streaming through the ring?)"
     [ "${read_rows:-0}" = "$want_rows" ] 2>/dev/null \
         && ok "$name: CH read_rows == $want_rows (whole relation streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
 }
@@ -366,14 +378,14 @@ verify_join() {
     chq "SYSTEM FLUSH LOGS" >/dev/null
     after=$(ch_count_streamed)
     read_rows=$(ch_latest "read_rows")
-    shm_blocks=$(ch_latest "ProfileEvents['ShmAdoptedBlocks']")
+    shm_blocks=$(ch_latest "ProfileEvents['$BLOCK_EVENT']")
     chsql=$(ch_latest "replaceRegexpAll(query,'\\\\s+',' ')")
 
     say ""
     say "[$name] (JOIN pushdown: one SHM source per base relation)"
     say "    pg(off): $(echo "$baseline" | tr '\n' '|')   pg(on): $(echo "$result" | tr '\n' '|')"
     say "    CH executed : $chsql"
-    say "    CH read_rows=$read_rows  ShmAdoptedBlocks=$shm_blocks (>= $min_blocks expected)"
+    say "    CH read_rows=$read_rows  $BLOCK_EVENT=$shm_blocks (>= $min_blocks expected)"
 
     check_result_equiv "$name" "$baseline" "$result"
     { [ -n "${after:-}" ] && [ -n "${before:-}" ] && [ "$after" -gt "$before" ]; } 2>/dev/null \
@@ -381,8 +393,8 @@ verify_join() {
     { echo "$chsql" | grep -qi 'join'; } \
         && ok "$name: ClickHouse query is a JOIN over streamed_table() sources" || bad "$name: CH query is not a join"
     [ "${shm_blocks:-0}" -ge "$min_blocks" ] 2>/dev/null \
-        && ok "$name: adopted >= $min_blocks SHM blocks (one per source) (ShmAdoptedBlocks=$shm_blocks)" \
-        || bad "$name: ShmAdoptedBlocks=$shm_blocks < $min_blocks (not all sources streamed?)"
+        && ok "$name: adopted >= $min_blocks SHM blocks (one per source) ($BLOCK_EVENT=$shm_blocks)" \
+        || bad "$name: $BLOCK_EVENT=$shm_blocks < $min_blocks (not all sources streamed?)"
     [ "${read_rows:-0}" = "$want_rows" ] 2>/dev/null \
         && ok "$name: CH read_rows == $want_rows (every base relation streamed)" || bad "$name: read_rows=$read_rows != $want_rows"
 }

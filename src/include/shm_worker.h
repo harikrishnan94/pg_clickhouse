@@ -80,6 +80,14 @@ extern void pgch_shm_worker_wait_ready(ShmWorkerHandle *h);
 extern void pgch_shm_worker_check_error(ShmWorkerHandle *h);
 
 /*
+ * For a TCP-transport stream, worker `w`'s bound ephemeral TCP port (host 127.0.0.1). Valid once the
+ * worker is READY (pgch_shm_worker_wait_ready returned). Returns 0 for SHM transport or an
+ * out-of-range index. The dispatch path emits streamed_table(..., 'tcp:127.0.0.1:<port>') per
+ * worker from this (Hot-Cold D-HC-0102).
+ */
+extern uint16 pgch_shm_worker_tcp_port(ShmWorkerHandle *h, int w);
+
+/*
  * Terminate the worker if still running, wait for it to exit, and detach the
  * DSM segment. Idempotent. Used on both normal completion and the error /
  * cancellation teardown path; guarantees no leaked worker, fds, /dev/shm object,

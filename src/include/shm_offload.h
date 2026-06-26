@@ -56,6 +56,21 @@ extern bool  pgch_enable_jit_deform;
 extern int   pgch_jit_row_threshold;
 
 /*
+ * Consumer transport for SHM offload (Hot-Cold D-HC-0002). Selected per query via the
+ * pg_clickhouse.shm_transport_mode session GUC and emitted as the optional 3rd argument of
+ * the per-stream streamed_table() call (D-HC-0001) so the ClickHouse consumer selects its
+ * data path. The producer (this extension) is identical across modes; only the consumer's
+ * read path differs (zero-copy adopt vs copy-out-of-SHM).
+ */
+typedef enum PgchShmTransport
+{
+    PGCH_TRANSPORT_ADOPT = 0,   /* zero-copy adoption straight out of the ring (default)        */
+    PGCH_TRANSPORT_COPY = 1,    /* consumer copies each block out of SHM, releases slot early   */
+    PGCH_TRANSPORT_TCP = 2,     /* reserved (Phase 1: block bytes over a TCP socket)            */
+} PgchShmTransport;
+extern int   pgch_shm_transport_mode;
+
+/*
  * Hard cap on cooperating SHM streaming workers: the final clamp on the count
  * derived from PostgreSQL's parallel-query budget. Stays comfortably below the
  * producer's MAX_PARKED_CONNS so every worker's control-socket connection can

@@ -1,0 +1,13 @@
+===== perf stat (copy) =====
+
+ Performance counter stats for process id '844791':
+
+       63861609846      cycles                                                                  (50.65%)
+      150091253978      instructions                                                            (50.77%)
+       63970893964      cache-references                                                        (50.85%)
+        1550281734      cache-misses                                                            (33.73%)
+       29034393002      branch-instructions                                                     (33.67%)
+         104120909      branch-misses                                                           (33.68%)
+
+      19.814703914 seconds time elapsed
+

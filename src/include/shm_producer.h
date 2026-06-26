@@ -92,17 +92,39 @@ typedef struct ShmColumnPayload {
 typedef struct ShmProducer ShmProducer;
 
 /*
- * Create the SHM object and bring up the handshake + control socket. `name`
- * is the SHM object name passed to shm_open (a leading '/' is added if
- * missing). The producer is registered for cleanup on `owner_cxt` reset/delete
- * so an aborted query never leaks the /dev/shm object or the socket.
+ * Transport for a producer (Hot-Cold D-HC-0102/0103). SHM = the POSIX shared-memory ring +
+ * control-socket eventfd handshake (the default). TCP = a per-stream TCP listener the co-located
+ * ClickHouse consumer connects to; blocks are serialized frame-relative (Wire/TcpFrame.h) and sent,
+ * with no SHM object / control socket / pump thread.
+ */
+typedef enum ShmProducerTransport
+{
+    PGCH_PRODUCER_TRANSPORT_SHM = 0,
+    PGCH_PRODUCER_TRANSPORT_TCP = 1,
+} ShmProducerTransport;
+
+/*
+ * Create the producer for `transport`. For SHM: create the SHM object + handshake + control socket;
+ * `name` is the shm_open name (leading '/' added if missing). For TCP: bind a 127.0.0.1 listener on
+ * an ephemeral port (read it back with shm_producer_tcp_port) and allocate the per-block serialize
+ * scratch (sized from data_region_size); `name` is retained for diagnostics. The producer is
+ * registered for cleanup on `owner_cxt` reset/delete so an aborted query never leaks the object,
+ * socket, listener, or connection.
  *
  * Raises a PostgreSQL ERROR (ereport) on any setup failure.
  */
 extern ShmProducer *shm_producer_create(const char *name,
                                         const ShmColumnSchema *schema, int n_columns,
                                         uint32_t ring_depth_k, size_t data_region_size,
-                                        MemoryContext owner_cxt);
+                                        MemoryContext owner_cxt,
+                                        ShmProducerTransport transport);
+
+/*
+ * For a TCP-transport producer, the ephemeral TCP port its listener bound (host 127.0.0.1). The
+ * worker reports this to the backend so the emitted streamed_table('<name>','<schema>',
+ * 'tcp:127.0.0.1:<port>') call points the consumer at this stream. 0 for an SHM producer.
+ */
+extern uint16_t shm_producer_tcp_port(const ShmProducer *p);
 
 /*
  * Publish one block of `row_count` rows (one ShmColumnPayload per schema

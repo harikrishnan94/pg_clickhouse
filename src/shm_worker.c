@@ -67,6 +67,9 @@ typedef enum ShmWorkerState
 typedef struct ShmWorkerSlot
 {
     pg_atomic_uint32 state;          /* ShmWorkerState */
+    pg_atomic_uint32 tcp_port;       /* TCP transport: worker's bound ephemeral port (0 for SHM),
+                                      * published before WS_READY so the backend can emit
+                                      * streamed_table(..., 'tcp:127.0.0.1:<port>') (D-HC-0102) */
     char             errmsg[1024];
 } ShmWorkerSlot;
 
@@ -100,6 +103,7 @@ typedef struct ShmWorkerHeader
     bool        log_stream_stats;    /* honor the backend session's shm_log_stream_stats GUC */
     bool        enable_jit_deform;   /* honor the backend session's enable_jit_deform GUC */
     int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
+    int         transport;           /* ShmProducerTransport: SHM ring or per-stream TCP listener */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     int         backend_pid;         /* originating backend PID, for liveness checks */
@@ -184,6 +188,8 @@ pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->log_stream_stats = pgch_log_stream_stats;
     hdr->enable_jit_deform = pgch_enable_jit_deform;
     hdr->jit_row_threshold = pgch_jit_row_threshold;
+    hdr->transport = (pgch_shm_transport_mode == PGCH_TRANSPORT_TCP)
+        ? PGCH_PRODUCER_TRANSPORT_TCP : PGCH_PRODUCER_TRANSPORT_SHM;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
     hdr->backend_pid = MyProcPid;
@@ -204,7 +210,10 @@ pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
     coord = coord_of(hdr);
     pg_atomic_init_u32(&coord->block.next_block, 0);
     for (w = 0; w < nworkers; w++)
+    {
         pg_atomic_init_u32(&wslot_of(hdr, w)->state, PGCH_WS_INIT);
+        pg_atomic_init_u32(&wslot_of(hdr, w)->tcp_port, 0);
+    }
 
     h = (ShmWorkerHandle *) palloc0(sizeof(ShmWorkerHandle));
     h->seg = seg;
@@ -366,6 +375,14 @@ pgch_shm_worker_wait_ready(ShmWorkerHandle *h)
     }
 }
 
+uint16
+pgch_shm_worker_tcp_port(ShmWorkerHandle *h, int w)
+{
+    if (h == NULL || w < 0 || w >= h->nworkers)
+        return 0;
+    return (uint16) pg_atomic_read_u32(&wslot_of(h->hdr, w)->tcp_port);
+}
+
 void
 pgch_shm_worker_shutdown(ShmWorkerHandle *h)
 {
@@ -488,12 +505,17 @@ pgch_shm_worker_main(Datum main_arg)
         producer = shm_producer_create(my_shm_name, schema, ncols,
                                        (uint32_t) PGCH_SHM_RING_DEPTH_K,
                                        PGCH_SHM_DATA_REGION_BYTES,
-                                       CurTransactionContext);
+                                       CurTransactionContext,
+                                       (ShmProducerTransport) hdr->transport);
 
         /* Abandon the stream (rather than hang) if the originating backend dies
          * while we are blocked on a full ring -- a dead backend means the
          * ClickHouse consumer was cancelled and this ring will never drain. */
         shm_producer_set_origin_pid(producer, hdr->backend_pid);
+
+        /* Publish the TCP listener port (0 for SHM) BEFORE marking ready, so the backend reads a
+         * valid port the instant it observes WS_READY and can emit tcp:127.0.0.1:<port> (D-HC-0102). */
+        pg_atomic_write_u32(&me->tcp_port, (uint32) shm_producer_tcp_port(producer));
 
         /* Mark this worker ready. Once every worker is ready the backend dispatches
          * the ClickHouse query (each ring's control socket is up for its source). */

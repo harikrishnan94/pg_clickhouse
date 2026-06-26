@@ -36,6 +36,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 /* --------------------------------------------------------------------- */
 /* Wire layout — byte-for-byte mirror of ClickHouse Wire/Layout.h (ABI v1).
@@ -101,9 +104,31 @@ typedef struct ShmColumnDescriptor {
     uint64_t offsets_padding;
 } __attribute__((aligned(8))) ShmColumnDescriptor;
 
+/* --- Hot-Cold Phase 1: TCP stream framing (byte-for-byte mirror of CH Wire/TcpFrame.h). --- */
+#define PGCH_TCP_MAGIC          UINT64_C(0x01005043544D4853)  /* "SHMTCP\0\1" LE; == CH SHM_TCP_MAGIC */
+#define PGCH_TCP_ABI_VERSION_1  1u
+
+#pragma pack(push, 1)
+typedef struct TcpHandshakeHeader {
+    uint64_t magic;
+    uint32_t abi_version;
+    uint32_t schema_count;
+} TcpHandshakeHeader;
+
+typedef struct TcpBlockHeader {
+    uint64_t payload_len;
+    uint64_t row_count;
+    uint64_t descriptors_offset;
+    uint8_t  eos_marker;
+    uint8_t  reserved[7];
+} TcpBlockHeader;
+#pragma pack(pop)
+
 StaticAssertDecl(sizeof(ShmHandshake) == 128, "ShmHandshake must be 128 bytes");
 StaticAssertDecl(sizeof(ShmSlot) == 64, "ShmSlot must be 64 bytes");
 StaticAssertDecl(sizeof(ShmSchemaEntry) == 128, "ShmSchemaEntry must be 128 bytes");
+StaticAssertDecl(sizeof(TcpHandshakeHeader) == 16, "TcpHandshakeHeader must be 16 bytes");
+StaticAssertDecl(sizeof(TcpBlockHeader) == 32, "TcpBlockHeader must be 32 bytes");
 StaticAssertDecl(sizeof(ShmColumnDescriptor) == 56, "ShmColumnDescriptor must be 56 bytes");
 
 #define MAX_PARKED_CONNS 16
@@ -157,6 +182,20 @@ struct ShmProducer {
 
     /* Optional per-worker phase stopwatch (benchmark instrumentation; NULL = off). */
     PgchPhaseTimers *timers;
+
+    /*
+     * Hot-Cold Phase 1 TCP transport (PGCH_PRODUCER_TRANSPORT_TCP). When set, there is no SHM
+     * mapping / control socket / pump thread: `listen_fd` is a 127.0.0.1 TCP listener bound to
+     * `tcp_port`, `tcp_conn_fd` is the accepted consumer connection (-1 until the first publish),
+     * and blocks are serialized into `tcp_scratch` (frame-relative) and sent. Backpressure is the
+     * blocking send() (TCP flow control) in place of the SHM ring-full wait.
+     */
+    ShmProducerTransport transport;
+    uint16_t   tcp_port;
+    int        tcp_conn_fd;
+    bool       tcp_handshake_sent;
+    char      *tcp_scratch;
+    size_t     tcp_scratch_cap;
 };
 
 /* --------------------------------------------------------------------- */
@@ -394,6 +433,7 @@ producer_cleanup(ShmProducer *p)
         close(p->parked_conns[i]);
     p->n_parked = 0;
 
+    if (p->tcp_conn_fd >= 0) { close(p->tcp_conn_fd); p->tcp_conn_fd = -1; }
     if (p->listen_fd >= 0) { close(p->listen_fd); p->listen_fd = -1; }
     if (p->event_fd >= 0)  { close(p->event_fd);  p->event_fd = -1; }
     if (p->pump_stop_fd >= 0) { close(p->pump_stop_fd); p->pump_stop_fd = -1; }
@@ -415,11 +455,247 @@ producer_cleanup_callback(void *arg)
     producer_cleanup((ShmProducer *) arg);
 }
 
+/* --------------------------------------------------------------------- */
+/* Hot-Cold Phase 1: TCP transport (D-HC-0101/0103). One listener per stream; the consumer
+ * connects, receives the handshake, then a sequence of frame-relative BLOCK frames + EOS. */
+/* --------------------------------------------------------------------- */
+
+/* Blocking send-all, cancellation/backend-death responsive (SO_SNDTIMEO slices -> EAGAIN). */
+static void
+tcp_send_all(ShmProducer *p, const void *buf, size_t n)
+{
+    const char *ptr = (const char *) buf;
+    while (n > 0)
+    {
+        ssize_t w;
+
+        CHECK_FOR_INTERRUPTS();
+        w = send(p->tcp_conn_fd, ptr, n, MSG_NOSIGNAL);
+        if (w > 0) { ptr += w; n -= (size_t) w; continue; }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            struct pollfd pfd;
+
+            if (origin_backend_dead(p))
+                ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                       "abandoning TCP stream", p->origin_pid)));
+            pfd.fd = p->tcp_conn_fd; pfd.events = POLLOUT; pfd.revents = 0;
+            (void) poll(&pfd, 1, 100);
+            continue;
+        }
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                   "abandoning TCP stream", p->origin_pid)));
+        ereport(ERROR, (errcode_for_file_access(),
+                        errmsg("pg_clickhouse: TCP send to consumer failed: %m")));
+    }
+}
+
+/* Accept the consumer (poll loop honouring cancel + backend death), set TCP_NODELAY + a send
+ * timeout, and send the one-shot handshake (header + ShmSchemaEntry[n_columns]). */
+static void
+tcp_accept_and_handshake(ShmProducer *p)
+{
+    TcpHandshakeHeader hs;
+    ShmSchemaEntry *se;
+    struct timeval tv;
+    int one = 1;
+    int i;
+
+    for (;;)
+    {
+        struct pollfd pfd;
+        int conn;
+
+        pfd.fd = p->listen_fd; pfd.events = POLLIN; pfd.revents = 0;
+        (void) poll(&pfd, 1, 100);
+        CHECK_FOR_INTERRUPTS();
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited before the "
+                                   "TCP consumer connected", p->origin_pid)));
+        conn = accept4(p->listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (conn < 0)
+        {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: TCP accept failed: %m")));
+        }
+        p->tcp_conn_fd = conn;
+        break;
+    }
+    (void) setsockopt(p->tcp_conn_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    tv.tv_sec = 0; tv.tv_usec = 100000;   /* 100ms send slices -> EAGAIN so send observes cancel */
+    (void) setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Size the send buffer to several blocks so this producer can run ahead while the (often
+     * single-threaded) consumer processes a block -- the TCP analog of the SHM ring's K in-flight
+     * slots; without it producer-send and consumer-process serialize. Capped by net.core.wmem_max
+     * (raised to match the SHM 64 MiB data region; see 10-REPRODUCTION). */
+    {
+        int sndbuf = 32 * 1024 * 1024;
+        (void) setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+
+    hs.magic = PGCH_TCP_MAGIC;
+    hs.abi_version = PGCH_TCP_ABI_VERSION_1;
+    hs.schema_count = (uint32_t) p->n_columns;
+    tcp_send_all(p, &hs, sizeof(hs));
+
+    se = (ShmSchemaEntry *) palloc0(sizeof(ShmSchemaEntry) * p->n_columns);
+    for (i = 0; i < p->n_columns; i++)
+    {
+        memcpy(se[i].name, p->schema[i].name, sizeof(se[i].name));
+        memcpy(se[i].type_string, p->schema[i].type_string, sizeof(se[i].type_string));
+    }
+    tcp_send_all(p, se, sizeof(ShmSchemaEntry) * p->n_columns);
+    pfree(se);
+    p->tcp_handshake_sent = true;
+}
+
+/* Lay one block into p->tcp_scratch frame-relative (descriptors at offset 0, then per-column
+ * buffers with the SHM align / SIMD-padding / offsets[-1]-zero-sentinel layout). Returns the
+ * used payload length. MUST match the consumer's adopt() expectations and block_footprint(). */
+static size_t
+tcp_serialize_block(ShmProducer *p, const ShmColumnPayload *payloads, size_t row_count)
+{
+    char *buf = p->tcp_scratch;
+    size_t cap = p->tcp_scratch_cap;
+    ShmColumnDescriptor *descs = (ShmColumnDescriptor *) buf;
+    size_t cursor = align_up((size_t) p->n_columns * sizeof(ShmColumnDescriptor), 8);
+    int i;
+
+    memset(descs, 0, (size_t) p->n_columns * sizeof(ShmColumnDescriptor));
+    for (i = 0; i < p->n_columns; i++)
+    {
+        const ShmColumnPayload *pay = &payloads[i];
+        ShmColumnDescriptor *d = &descs[i];
+        ShmWireType wire = p->schema[i].wire;
+
+        d->type = (uint32_t) wire;
+        if (wire == SHM_WIRE_STRING)
+        {
+            size_t chars_bytes = pay->value_len;
+            size_t offs_bytes = pay->offsets_count * sizeof(uint64_t);
+            size_t chars_off = align_up(cursor, 8);
+            size_t sentinel_off, offs_off;
+
+            cursor = chars_off + chars_bytes + SHM_PADDING_FOR_SIMD;
+            if (cursor > cap) goto overflow;
+            if (chars_bytes) memcpy(buf + chars_off, pay->value_buf, chars_bytes);
+
+            sentinel_off = align_up(cursor, 8);
+            cursor = sentinel_off + sizeof(uint64_t);
+            if (cursor > cap) goto overflow;
+            memset(buf + sentinel_off, 0, sizeof(uint64_t));   /* offsets[-1] zero sentinel */
+
+            offs_off = align_up(cursor, 8);
+            cursor = offs_off + offs_bytes + SHM_PADDING_FOR_SIMD;
+            if (cursor > cap) goto overflow;
+            if (offs_bytes) memcpy(buf + offs_off, pay->offsets_buf, offs_bytes);
+
+            d->value_offset = chars_off; d->value_count = chars_bytes; d->value_padding = SHM_PADDING_FOR_SIMD;
+            d->offsets_offset = offs_off; d->offsets_count = row_count; d->offsets_padding = SHM_PADDING_FOR_SIMD;
+        }
+        else
+        {
+            size_t elem = shm_wire_fixed_width_size(wire);
+            size_t vbytes = row_count * elem;
+            size_t voff = align_up(cursor, elem > 8 ? elem : 8);
+
+            cursor = voff + vbytes + SHM_PADDING_FOR_SIMD;
+            if (cursor > cap) goto overflow;
+            if (vbytes) memcpy(buf + voff, pay->value_buf, vbytes);
+
+            d->value_offset = voff; d->value_count = row_count; d->value_padding = SHM_PADDING_FOR_SIMD;
+        }
+    }
+    return cursor;
+
+overflow:
+    ereport(ERROR, (errmsg("pg_clickhouse: TCP block serialize overflow (scratch %zu bytes too small)", cap)));
+    return 0;   /* unreachable */
+}
+
+/* TCP analog of publish_block: lazy accept+handshake on the first call, serialize + send. */
+static void
+tcp_publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
+                  size_t row_count, bool is_eos)
+{
+    int saved_phase = -1;
+    TcpBlockHeader bh;
+    size_t payload_len = 0;
+
+    if (p->eos_published)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm stream already ended")));
+    if (!is_eos && n_payloads != p->n_columns)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm payload count %d != schema %d", n_payloads, p->n_columns)));
+    if (row_count > SHM_IMPL_MAX_ROWS)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm row_count %zu exceeds limit %u", row_count, SHM_IMPL_MAX_ROWS)));
+
+    if (!p->tcp_handshake_sent)
+        tcp_accept_and_handshake(p);
+
+    /* Serialize + socket send is the TCP PUBLISH phase (CPU clock excludes the send-blocked wait,
+     * which lands in PUBLISH wall — TCP has no separate ring-full STALL). */
+    if (p->timers != NULL && p->timers->enabled)
+        saved_phase = p->timers->cur;
+    pgch_phase_switch(p->timers, PGCH_PH_PUBLISH);
+
+    if (!is_eos)
+        payload_len = tcp_serialize_block(p, payloads, row_count);
+
+    memset(&bh, 0, sizeof(bh));
+    bh.payload_len = payload_len;
+    bh.row_count = is_eos ? 0 : row_count;
+    bh.descriptors_offset = 0;
+    bh.eos_marker = is_eos ? 1 : 0;
+    tcp_send_all(p, &bh, sizeof(bh));
+    if (payload_len > 0)
+        tcp_send_all(p, p->tcp_scratch, payload_len);
+
+    if (saved_phase >= 0)
+        pgch_phase_switch(p->timers, saved_phase);
+}
+
+/* Bring up the TCP listener (ephemeral 127.0.0.1 port) + the per-block serialize scratch. */
+static void
+tcp_producer_setup(ShmProducer *p, size_t scratch_size)
+{
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    int one = 1;
+
+    p->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (p->listen_fd < 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: TCP socket() failed: %m")));
+    (void) setsockopt(p->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;   /* ephemeral */
+    if (bind(p->listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: TCP bind() failed: %m")));
+    if (listen(p->listen_fd, 1) < 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: TCP listen() failed: %m")));
+    if (getsockname(p->listen_fd, (struct sockaddr *) &addr, &alen) < 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("pg_clickhouse: TCP getsockname() failed: %m")));
+    p->tcp_port = ntohs(addr.sin_port);
+
+    /* Columnizer block sizing (matches block_footprint): descriptors at frame offset 0, payload
+     * after; the whole scratch is one block's budget (no K-slot split for TCP). */
+    p->per_slot_payload_offset = align_up((size_t) p->n_columns * sizeof(ShmColumnDescriptor), 8);
+    p->per_slot_capacity = scratch_size;
+    p->tcp_scratch_cap = scratch_size;
+    p->tcp_scratch = palloc(scratch_size);
+}
+
 ShmProducer *
 shm_producer_create(const char *name,
                     const ShmColumnSchema *schema, int n_columns,
                     uint32_t ring_depth_k, size_t data_region_size,
-                    MemoryContext owner_cxt)
+                    MemoryContext owner_cxt,
+                    ShmProducerTransport transport)
 {
     MemoryContext old = MemoryContextSwitchTo(owner_cxt);
     ShmProducer *p = palloc0(sizeof(ShmProducer));
@@ -434,6 +710,12 @@ shm_producer_create(const char *name,
     p->pump_stop_fd = -1;
     p->mapping = NULL;
     p->owner_cxt = owner_cxt;
+    p->transport = transport;
+    p->tcp_conn_fd = -1;
+    p->tcp_handshake_sent = false;
+    p->tcp_scratch = NULL;
+    p->tcp_scratch_cap = 0;
+    p->tcp_port = 0;
 
     if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
         ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
@@ -462,6 +744,16 @@ shm_producer_create(const char *name,
     p->n_columns = n_columns;
     p->schema = palloc0(sizeof(ShmColumnSchema) * n_columns);
     memcpy(p->schema, schema, sizeof(ShmColumnSchema) * n_columns);
+
+    /* TCP transport: no SHM object / control socket / pump thread — a per-stream TCP listener and
+     * a serialize scratch buffer instead. The cleanup callback (registered above) closes them. */
+    if (transport == PGCH_PRODUCER_TRANSPORT_TCP)
+    {
+        tcp_producer_setup(p, data_region_size);
+        MemoryContextSwitchTo(old);
+        return p;
+    }
+
     off = align_up(sizeof(ShmHandshake), (size_t) page);          /* slot table */
     off += (size_t) ring_depth_k * sizeof(ShmSlot);
     off += (size_t) n_columns * sizeof(ShmSchemaEntry);
@@ -802,14 +1094,26 @@ void
 shm_producer_publish(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
                      size_t row_count)
 {
-    publish_block(p, payloads, n_payloads, row_count, false);
+    if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
+        tcp_publish_block(p, payloads, n_payloads, row_count, false);
+    else
+        publish_block(p, payloads, n_payloads, row_count, false);
 }
 
 void
 shm_producer_signal_eos(ShmProducer *p)
 {
-    publish_block(p, NULL, p->n_columns, 0, true);
+    if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
+        tcp_publish_block(p, NULL, p->n_columns, 0, true);
+    else
+        publish_block(p, NULL, p->n_columns, 0, true);
     p->eos_published = true;
+}
+
+uint16_t
+shm_producer_tcp_port(const ShmProducer *p)
+{
+    return p->tcp_port;
 }
 
 /* --------------------------------------------------------------------- */
@@ -823,6 +1127,14 @@ shm_producer_destroy(ShmProducer *p)
 
     if (p->cleaned)
         return;
+
+    /* TCP transport has no shared ring/slots to drain: the consumer reads the byte stream and the
+     * kernel guarantees buffered bytes are delivered before the FIN, so close immediately. */
+    if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
+    {
+        producer_cleanup(p);
+        return;
+    }
 
     /* Producer must outlive every consumer retain. Wait (cooperatively, bounded)
      * until all slots are released (consumer drove them back to EMPTY). Keep

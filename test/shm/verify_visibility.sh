@@ -53,6 +53,7 @@ on_prelude() {
     "SET pg_clickhouse.shm_min_rows = 0;" \
     "SET pg_clickhouse.session_settings = 'allow_experimental_streamed_table_function 1, max_threads 1';" \
     "SET pg_clickhouse.shm_log_stream_stats = on;" \
+    "SET pg_clickhouse.shm_transport_mode = '${TRANSPORT:-adopt}';" \
     "SET pg_clickhouse.enable_shm_offload = on;"
 }
 

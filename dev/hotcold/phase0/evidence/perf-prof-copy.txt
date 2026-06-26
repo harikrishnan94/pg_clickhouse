@@ -1,0 +1,26 @@
+-- copy/adopt-relevant frames in copy profile --
+    16.25%  QueryPipelin  clickhouse             [.] DB::ColumnString::validateAdoptedOffsets() const
+               |          convertToFullColumnIfAdopted (inlined)
+                --4.72%--cloneResized (inlined)
+                          convertToFullColumnIfAdopted (inlined)
+               |          convertToFullColumnIfAdopted (inlined)
+                --4.43%--cloneResized (inlined)
+                          convertToFullColumnIfAdopted (inlined)
+               |          convertToFullColumnIfAdopted (inlined)
+                --2.42%--cloneResized (inlined)
+                          convertToFullColumnIfAdopted (inlined)
+               |          convertToFullColumnIfAdopted (inlined)
+                --1.04%--cloneResized (inlined)
+                          convertToFullColumnIfAdopted (inlined)
+                                     |          convertToFullColumnIfAdopted (inlined)
+                                      --0.68%--cloneResized (inlined)
+                                                convertToFullColumnIfAdopted (inlined)
+     0.56%  QueryPipelin  clickhouse             [.] void DB::filterArraysImpl<char8_t>(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long)
+     0.22%  QueryPipelin  clickhouse             [.] DB::MatchImpl<DB::NameLike, (DB::MatchTraits::Syntax)0, (DB::MatchTraits::Case)0, (DB::MatchTraits::Result)0>::vectorConstant(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, COW<DB::IColumn>::immutable_ptr<DB::IColumn> const&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::ColumnVector<char8_t>*, unsigned long)
+     0.16%  QueryPipelin  clickhouse             [.] void DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul>::assign<char8_t const*, char8_t const*>(char8_t const*, char8_t const*)
+     0.11%  QueryPipelin  clickhouse             [.] void DB::PODArrayBase<8ul, 4096ul, Allocator<false, false>, 63ul, 64ul>::reserve_exact<>(unsigned long)
+     0.11%  QueryPipelin  clickhouse             [.] DB::ColumnVector<int>::ColumnVector(unsigned long)
+     0.11%  QueryPipelin  clickhouse             [.] DB::ColumnVector<short>::ColumnVector(unsigned long)
+     0.07%  QueryPipelin  clickhouse             [.] DB::ColumnVector<short>::~ColumnVector()
+     0.06%  QueryPipelin  clickhouse             [.] DB::ColumnDecimal<DB::DateTime64>::filter(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long) const
+     0.04%  QueryPipelin  clickhouse             [.] DB::ColumnString::convertToFullColumnIfAdopted() const

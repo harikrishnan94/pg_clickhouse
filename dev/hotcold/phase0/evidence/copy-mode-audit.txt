@@ -1,0 +1,6 @@
+=== COPY-MODE AUDIT: partition all sweep-window streamed_table QueryFinish by (copied>0, adopted>0) ===
+has_copied	has_adopted	queries	copied_blocks	adopted_blocks
+0	1	1596	0	393534
+1	0	646	239337	0
+
+KEY: zero rows with has_copied=1 AND has_adopted=1 (no mixed query); zero with both 0 (every offload query accounted).

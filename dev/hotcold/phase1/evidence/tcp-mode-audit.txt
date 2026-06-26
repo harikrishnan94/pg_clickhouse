@@ -1,0 +1,6 @@
+=== Phase-1 transport partition (last 3h; tcp via 'tcp:' arg) ===
+is_tcp	is_copy	queries	copied	adopted
+0	0	1232	0	471190
+0	1	1250	489480	0
+1	0	597	221051	0
+KEY: is_tcp=1 -> copied>0 & adopted=0; no (is_tcp=1,is_copy=1) mixed; adopt (0,0) -> adopted>0 copied=0.

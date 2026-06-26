@@ -1,0 +1,6 @@
+[ RUN      ] TcpStreamSource.DrainsHandshakeAndBlocks
+[       OK ] TcpStreamSource.DrainsHandshakeAndBlocks (0 ms)
+[ RUN      ] TcpStreamSource.LoopbackThroughputMicrobench
+[microbench] loopback TCP (1024 MiB, 2 MiB chunks, 32 MiB bufs): 7.90244 GB/s, 0.126543 ns/byte
+[       OK ] TcpStreamSource.LoopbackThroughputMicrobench (136 ms)
+[  PASSED  ] 2 tests.

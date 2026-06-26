@@ -1372,6 +1372,15 @@ shm_build_offload_settings(int nworkers)
         items = lappend(items, makeDefElem(pstrdup(it.name),
                                            (Node *) makeString(pstrdup(it.value)), -1));
     }
+    /*
+     * Force the CH consumer's max_threads to the total producer count across all sources.
+     * DEADLOCK-SAFETY INVARIANT for the TCP transport (Hot-Cold D-HC-0104): TcpStreamSource is a
+     * BLOCKING leaf source (its generate() blocks in recv()), so it holds one executor thread for
+     * the lifetime of its stream. max_threads = Σ producers guarantees threads >= the number of
+     * blocking TCP sources, so a multi-source query can never starve a source of its thread. Do NOT
+     * lower max_threads below the producer count while the consumer source blocks (the durable fix
+     * is an async TcpStreamSource; see dev/hotcold/phase1/REPORT.md §9).
+     */
     items = lappend(items, makeDefElem(pstrdup("max_threads"),
                                        (Node *) makeString(psprintf("%d", nworkers)), -1));
     items = lappend(items, makeDefElem(pstrdup("join_use_nulls"),
@@ -1390,9 +1399,32 @@ shm_build_offload_settings(int nworkers)
  * lifts the single-source bottleneck. Worker w creates the matching ring
  * "<base>_<w>". W=1 yields a single-source subquery (semantically identical).
  */
-static char *
-shm_build_union_sql(const char *sql, const char *base, const char *schema, int nworkers)
+/*
+ * The streamed_table() transport argument (Hot-Cold D-HC-0001/0002) for the current
+ * pg_clickhouse.shm_transport_mode. Returns an already-quoted ClickHouse string literal to
+ * append as the optional 3rd argument, or NULL for the default zero-copy adopt mode (which
+ * emits the original 2-argument call, byte-identical to before). Read at execution time so
+ * the per-query session GUC selects the consumer transport.
+ */
+static const char *
+shm_transport_arg_literal(void)
 {
+    switch (pgch_shm_transport_mode)
+    {
+        case PGCH_TRANSPORT_COPY:
+            return "'shm:copy'";
+        case PGCH_TRANSPORT_ADOPT:
+        default:
+            return NULL;
+    }
+}
+
+static char *
+shm_build_union_sql(const char *sql, const char *base, const char *schema, int nworkers,
+                    ShmWorkerHandle *worker)
+{
+    const char   *transport = shm_transport_arg_literal();   /* NULL or 'shm:copy' (non-TCP modes) */
+    bool          is_tcp = (pgch_shm_transport_mode == PGCH_TRANSPORT_TCP);
     char         *needle = psprintf("streamed_table(%s, %s)",
                                     ch_quote_literal(base), ch_quote_literal(schema));
     const char   *pos = strstr(sql, needle);
@@ -1412,8 +1444,19 @@ shm_build_union_sql(const char *sql, const char *base, const char *schema, int n
 
         if (w > 0)
             appendStringInfoString(&out, " UNION ALL ");
-        appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s)",
-                         ch_quote_literal(name), ch_quote_literal(schema));
+        /* The optional 3rd arg carries the consumer transport (D-HC-0001). The deparsed source the
+         * needle matched is always the 2-arg form, so adopt re-emits an identical 2-arg call; copy
+         * appends 'shm:copy'; TCP appends this worker's reported listener port (D-HC-0102/0103). */
+        if (is_tcp)
+            appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s, 'tcp:127.0.0.1:%u')",
+                             ch_quote_literal(name), ch_quote_literal(schema),
+                             (unsigned) pgch_shm_worker_tcp_port(worker, w));
+        else if (transport != NULL)
+            appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s, %s)",
+                             ch_quote_literal(name), ch_quote_literal(schema), transport);
+        else
+            appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s)",
+                             ch_quote_literal(name), ch_quote_literal(schema));
         pfree(name);
     }
     appendStringInfoChar(&out, ')');
@@ -1495,7 +1538,8 @@ shm_scan_access_mtd(ScanState *ss)
             for (i = 0; i < sss->nsources; i++)
                 union_sql = shm_build_union_sql(union_sql, sss->sources[i].shm_name,
                                                 sss->sources[i].schema_string,
-                                                sss->sources[i].nproducers);
+                                                sss->sources[i].nproducers,
+                                                sss->sources[i].worker);
 
             {
             ch_query query = new_query(union_sql, 0, NULL, sss->tupdesc, sss->retrieved_attrs);

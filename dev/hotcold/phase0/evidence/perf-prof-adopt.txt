@@ -1,0 +1,26 @@
+-- copy/adopt-relevant frames in adopt profile --
+    27.85%  QueryPipeline  clickhouse             [.] DB::ColumnString::validateAdoptedOffsets() const
+     0.97%  QueryPipeline  clickhouse             [.] void DB::filterArraysImpl<char8_t>(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long)
+     0.31%  QueryPipeline  clickhouse             [.] DB::MatchImpl<DB::NameLike, (DB::MatchTraits::Syntax)0, (DB::MatchTraits::Case)0, (DB::MatchTraits::Result)0>::vectorConstant(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, COW<DB::IColumn>::immutable_ptr<DB::IColumn> const&, DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul>&, DB::ColumnVector<char8_t>*, unsigned long)
+     0.17%  QueryPipeline  clickhouse             [.] DB::ColumnVector<short>::~ColumnVector()
+     0.11%  QueryPipeline  clickhouse             [.] DB::ColumnString::~ColumnString()
+     0.09%  QueryPipeline  clickhouse             [.] DB::ColumnDecimal<DB::DateTime64>::filter(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long) const
+     0.08%  QueryPipeline  [kernel.kallsyms]      [k] __pi_memcpy_generic
+     0.08%  QueryPipeline  clickhouse             [.] DB::ColumnString::byteSize() const
+     0.07%  QueryPipeline  clickhouse             [.] DB::ColumnVector<int>::~ColumnVector()
+     0.06%  QueryPipeline  clickhouse             [.] DB::ColumnVector<int>::filter(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long) const
+     0.05%  QueryPipeline  clickhouse             [.] DB::ColumnVector<unsigned short>::byteSize() const
+     0.04%  QueryPipeline  clickhouse             [.] DB::SortCursorImpl::reset(std::__1::vector<COW<DB::IColumn>::immutable_ptr<DB::IColumn>, std::__1::allocator<COW<DB::IColumn>::immutable_ptr<DB::IColumn> > > const&, DB::Block const&, unsigned long, DB::PODArray<unsigned long, 4096ul, Allocator<false, false>, 63ul, 64ul>*)
+     0.03%  MemoryWorker   [kernel.kallsyms]      [k] __pi_memcpy_generic
+     0.03%  QueryPipeline  clickhouse             [.] DB::ColumnDecimal<DB::Decimal<int> >::byteSize() const
+     0.03%  QueryPipeline  clickhouse             [.] DB::ColumnDecimal<DB::Decimal<long> >::size() const
+     0.03%  QueryPipeline  clickhouse             [.] DB::ColumnString::insertRangeFrom(DB::IColumn const&, unsigned long, unsigned long)
+     0.02%  QueryPipeline  clickhouse             [.] DB::ColumnDecimal<DB::Decimal<long> >::byteSize() const
+     0.02%  QueryPipeline  clickhouse             [.] DB::ColumnString::cloneResized(unsigned long) const
+     0.02%  QueryPipeline  clickhouse             [.] DB::ColumnVector<long>::~ColumnVector()
+     0.02%  QueryPipeline  clickhouse             [.] DB::ColumnVector<short>::filter(DB::PODArray<char8_t, 4096ul, Allocator<false, false>, 63ul, 64ul> const&, long) const
+     0.02%  QueryPipeline  clickhouse             [.] DB::ColumnVector<unsigned short>::size() const
+     0.01%  HTTPHandler    clickhouse             [.] memmove@plt
+     0.01%  QueryPipeline  clickhouse             [.] DB::ColumnDecimal<DB::DateTime64>::~ColumnDecimal()
+     0.01%  QueryPipeline  clickhouse             [.] DB::ColumnString::insertFrom(DB::IColumn const&, unsigned long)
+     0.01%  QueryPipeline  clickhouse             [.] DB::ColumnVector<int>::insertRangeFrom(DB::IColumn const&, unsigned long, unsigned long)

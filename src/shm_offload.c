@@ -53,6 +53,15 @@ int   pgch_shm_min_rows = 100000;
 bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
+int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
+
+/* adopt/copy = SHM transport (consumer-side data path); tcp = TCP stream transport (Phase 1). */
+static const struct config_enum_entry pgch_shm_transport_options[] = {
+    {"adopt", PGCH_TRANSPORT_ADOPT, false},
+    {"copy",  PGCH_TRANSPORT_COPY,  false},
+    {"tcp",   PGCH_TRANSPORT_TCP,   false},
+    {NULL, 0, false},
+};
 
 PG_FUNCTION_INFO_V1(clickhouse_stream_relation);
 
@@ -1083,7 +1092,8 @@ clickhouse_stream_relation(PG_FUNCTION_ARGS)
     producer = shm_producer_create(shm_name, schema, ncols,
                                    (uint32_t) PGCH_SHM_RING_DEPTH_K,
                                    PGCH_SHM_DATA_REGION_BYTES,
-                                   CurrentMemoryContext);
+                                   CurrentMemoryContext,
+                                   PGCH_PRODUCER_TRANSPORT_SHM);
 
     /* Stream under the active (query) snapshot for correct MVCC visibility
      * (single producer: no shared block cursor), then signal end-of-stream. */
@@ -1140,6 +1150,16 @@ pgch_shm_offload_init(void)
                             "shape reuse the cached code).",
                             NULL, &pgch_jit_row_threshold, 2000000, 0, INT_MAX,
                             PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable("pg_clickhouse.shm_transport_mode",
+                             "Transport for offload: 'adopt' (zero-copy adoption out of the "
+                             "shared-memory ring, default), 'copy' (the ClickHouse consumer copies "
+                             "each block out of shared memory and releases the ring slot immediately), "
+                             "or 'tcp' (each producer streams its blocks to the consumer over a "
+                             "per-stream TCP connection instead of shared memory). Selected per query "
+                             "and emitted as the streamed_table() transport argument.",
+                             NULL, &pgch_shm_transport_mode, PGCH_TRANSPORT_ADOPT,
+                             pgch_shm_transport_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
      * last_query_used_clickhouse observability GUC. */

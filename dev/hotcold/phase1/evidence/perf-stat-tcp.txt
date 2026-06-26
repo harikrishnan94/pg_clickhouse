@@ -1,0 +1,11 @@
+===== perf stat CH (tcp) 8x Q1 =====
+
+ Performance counter stats for process id '1482137':
+
+       53465165607      cycles                                                                
+      204324301386      instructions                                                          
+         746883505      cache-misses                                                          
+             43791      context-switches                                                      
+
+       7.052820495 seconds time elapsed
+
