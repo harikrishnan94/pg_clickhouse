@@ -325,3 +325,62 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE (producer arrow path selectable + green; bespoke unaffected). CONTINUE → A4: the CH
   consumer (`ShmTransportMode::ArrowTcp` + `TcpStreamSource` Arrow recv/decode + round-trip gtest vs the
   stock `ArrowColumnToCHColumn` oracle).
+
+---
+
+### L0009 — Branch A: Apache Arrow IPC consumer + the correctness gates (GREEN)  [branch A]  [iteration 1]  2026-06-26
+- **Goal / hypothesis:** The CH consumer reads the standard Arrow IPC stream the producer now emits and
+  reconstructs byte-identical Chunks (Branch-A COPYING decode), with no new `DIFF` vs native/other
+  transports and no bespoke regression. Correctness is the Branch-A bar; perf parity is measured in A5.
+- **What I did (ClickHouse repo, branch `streamed_table`, commit f2128e5a7fb):**
+  - `TransportMode.h`: `ShmTransportMode::ArrowTcp` + `arrow:<host>:<port>` parse (shared
+    `tryParseHostPort` with `tcp:`) + `toString`.
+  - `StorageShm::read()`: dispatch `Tcp|ArrowTcp` → `TcpStreamSource` with a `WireFormat` flag.
+  - `TcpStreamSource.{h,cpp}`: a `WireFormat{Bespoke,Arrow}` mode REUSING the whole Branch-0 async
+    recv / wake-bridge / `onCancel` / `RetainToken` / charge machinery (wire-agnostic). Arrow path:
+    `ensureConnected` → `readArrowSchema()` (read the leading Arrow IPC Schema message, validate the
+    field count, build the projection map — replaces the bespoke handshake); `tryRecvArrowMessage()` =
+    a resumable 3-phase recv (8-byte prefix / metadata / body) over the same `tryRecvInto`, with a
+    0-length-metadata continuation as the stream EOS; `buildChunkFromArrow()` parses with Arrow C++
+    (`Message::Open` + `ReadRecordBatch`) and COPIES each column into an owned CH column of the
+    SQL-declared type (`copyArrowColumnToCH`: bulk memcpy of the contiguous LE data buffer for
+    fixed-width incl. raw Date/DateTime/DateTime64/Decimal; `LargeBinary`→`ColumnString` chars + N END
+    offsets). `ArrowRecvState` is a pimpl (arrow headers stay out of the .h). Charges `copied=true`
+    (bumps `ShmCopiedBlocks`, the offload oracle). Guarded `#if USE_ARROW`.
+  - `tests/gtest_arrow_stream_source.cpp`: loopback drain (async / blocking / slow-fragmented) with an
+    **Arrow-C++ reference stream writer** as the producer, + a stock **ArrowColumnToCHColumn** decode
+    oracle cross-check.
+  - `test/shm/verify_offload.sh` (pg repo): `arrow` added to the `ShmCopiedBlocks` offload-oracle case.
+- **How I did it (commands):** `ninja -C build/reldeb clickhouse unit_tests_dbms`; restart CH onto the
+  new binary (live pid via `ss`); `TRANSPORT=arrow … verify_offload.sh`; `unit_tests_dbms --gtest_filter`.
+- **How verified (≥3 INDEPENDENT converging instrument classes — all GREEN):**
+  1. **End-to-end offload oracle** (the authoritative one): `CH_BIN=… PG_DB=shmdemo TRANSPORT=arrow bash
+     test/shm/verify_offload.sh` → **PASS=137 FAIL=0** (`/tmp/bA_verify_arrow.log`). Producer nanoarrow →
+     this consumer, results byte-identical to native + the other transports across every type, NULLs,
+     SEMI/ANTI joins (one Arrow stream per relation), Decimal, projection, `count()`, EOS,
+     producer-death/cancel, and leak teardown. The offload oracle asserted `ShmCopiedBlocks≥1` per heavy
+     fragment — i.e. the arrow transport actually ran, not a base scan.
+  2. **gtests** (`unit_tests_dbms`, fresh binary): `ArrowStreamSource.*` = **4/4 PASS** —
+     `DrainsSchemaAndBatches`, `DrainsBlocking`, `AsyncResumesAcrossPartialMessages` (1022 ms ≈ the
+     fragment-rate → the resumable 3-phase Arrow recv reassembles a message straddling schedule cycles
+     without busy-spin), and `DecodeMatchesStockArrowReader` (the **independent stock
+     `ArrowColumnToCHColumn` decoder agrees** cell-for-cell with the custom Branch-A decode AND the known
+     values — uint16 'd' → Date via the header type hint).
+  3. **Cross-implementation encode check:** the gtest producer uses Arrow C++'s OWN
+     `RecordBatchStreamWriter` (not nanoarrow), so the consumer is proven to read *standard* Arrow IPC,
+     not just nanoarrow's output. (End-to-end #1 independently proves the nanoarrow encode side.)
+  4. **No bespoke regression:** `TRANSPORT=tcp` = **137/137** on the new binary; `TcpStreamSource.*` =
+     **4/4** (loopback microbench 7.47 GB/s, invariant). The async machinery is shared, byte-unchanged.
+- **Result (RAW):** verify_offload arrow `PASS=137 FAIL=0 EXIT=0`; tcp `PASS=137 FAIL=0`; gtests
+  `[ PASSED ] 8 tests` (ArrowStreamSource 4 + TcpStreamSource 4).
+- **Interpretation:** the Arrow wire is correct end to end and the bespoke `TcpFrame.h` is now retire-able
+  on the `arrow:` transport (intention 1 substantially delivered). Four independent classes converge on
+  correctness; no new `DIFF`. The decode is COPYING by design (Branch A) — Branch B drives the copies out.
+- **Learnings:** (1) the chicken-and-egg of "need bodyLength to size the body recv, but it's inside the
+  metadata flatbuffer" is solved cleanly by `Message::Open(metadata, /*body=*/nullptr)` to read
+  `body_length()` before recv'ing the body — and this metadata-then-body split IS exactly Branch B's
+  single-copy-recv shape. (2) Reusing the Branch-0 async source (vs a new class) meant the riskiest code
+  (executor contract, cancel/teardown) was already hardened — the new surface is just framing + decode.
+- **Verdict:** DONE. Branch A correctness GREEN, committed (CH f2128e5a7fb; pg A2/A3). CONTINUE → A5:
+  W=8 sweep (arrow-tcp vs bespoke-tcp vs shm-adopt/copy) for the fixed-width-parity / String-bounded-
+  regression gate, then the independent adversarial review + REPORT-branchA.md.

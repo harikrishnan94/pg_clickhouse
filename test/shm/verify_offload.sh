@@ -258,8 +258,8 @@ SET_ON="LOAD 'pg_clickhouse'; SET pg_clickhouse.local_ch_server='local_ch'; SET 
 TRANSPORT="${TRANSPORT:-adopt}"
 SET_ON="$SET_ON SET pg_clickhouse.shm_transport_mode='$TRANSPORT';"
 case "$TRANSPORT" in
-    copy|tcp) BLOCK_EVENT="ShmCopiedBlocks" ;;   # copy + tcp both increment the copy counter family
-    *)        BLOCK_EVENT="ShmAdoptedBlocks" ;;
+    copy|tcp|arrow) BLOCK_EVENT="ShmCopiedBlocks" ;;   # copy/tcp/arrow all bump the copy counter family
+    *)              BLOCK_EVENT="ShmAdoptedBlocks" ;;
 esac
 say "Transport under test: $TRANSPORT (offload oracle asserts ProfileEvents['$BLOCK_EVENT'])"
 
