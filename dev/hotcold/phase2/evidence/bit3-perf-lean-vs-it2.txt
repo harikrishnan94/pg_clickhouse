@@ -1,0 +1,39 @@
+# B-it3 perf — CH consumer during CB Q24 offloads (sudo perf -F999), arrow-lean vs arrow-it2
+# Captured 2026-06-26 (L0014). ~1350 samples/mode. Confirms: lean ELIMINATES the ReadRecordBatch/
+# ArrayLoader decode path (present in it2, absent in lean) but it is only ~0.37% of consumer CPU,
+# so the wall is unmoved (NULL). Dominant: __arch_copy_to_user (kernel recv copy) ~35%;
+# validateAdoptedOffsets 14.4%; Volnitsky (URL LIKE) 9.4%.
+
+===== it2 (ReadRecordBatch adopt) — decode-path symbols =====
+     0.13%  QueryPipelineEx  clickhouse             [.] DB::TcpStreamSource::buildChunkFromArrowViaReader(char*, long)
+     0.11%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::ArrayLoader::LoadCommon(arrow::Type::type)
+     0.08%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::ReadRecordBatchInternal(arrow::Buffer const&, std::__1::shared_ptr<arrow::Schema> const&, std::__1::vector<bool, std::__1::allocator<bool> > const&, arrow::ipc::(anonymous namespace)::IpcReadContext&, arrow::io::RandomAccessFile*)
+     0.06%  QueryPipelineEx  clickhouse             [.] arrow::SimpleRecordBatch::column(int) const
+     0.03%  QueryPipelineEx  clickhouse             [.] arrow::SimpleRecordBatch::~SimpleRecordBatch()
+     0.02%  QueryPipelineEx  clickhouse             [.] arrow::Status arrow::VisitTypeInline<arrow::ipc::(anonymous namespace)::ArrayLoader>(arrow::DataType const&, arrow::ipc::(anonymous namespace)::ArrayLoader*)
+     0.02%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::ArrayLoader::GetBuffer(int, std::__1::shared_ptr<arrow::Buffer>*)
+     0.02%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::ArrayLoader::GetFieldMetadata(int, arrow::ArrayData*)
+     0.01%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::DictionaryResolver::VisitChildren(std::__1::vector<std::__1::shared_ptr<arrow::ArrayData>, std::__1::allocator<std::__1::shared_ptr<arrow::ArrayData> > > const&, arrow::ipc::internal::FieldPosition)
+     0.01%  QueryPipelineEx  clickhouse             [.] DB::ColumnVector<int>::createAdopted(int*, unsigned long, std::__1::shared_ptr<void>, std::__1::shared_ptr<void>)
+     0.01%  QueryPipelineEx  clickhouse             [.] DB::(anonymous namespace)::adoptFixedRaw(std::__1::shared_ptr<DB::IDataType const> const&, unsigned char*, unsigned long, std::__1::shared_ptr<void> const&, std::__1::shared_ptr<void> const&)
+     0.01%  QueryPipelineEx  clickhouse             [.] arrow::ipc::(anonymous namespace)::DictionaryResolver::VisitField(arrow::ipc::internal::FieldPosition, arrow::ArrayData*)
+     0.01%  QueryPipelineEx  clickhouse             [.] DB::ColumnString::createAdopted(char8_t*, unsigned long, unsigned long*, unsigned long, std::__1::shared_ptr<void>, std::__1::shared_ptr<void>)
+
+===== lean (direct flatbuffer) — decode-path symbols (ArrayLoader/ReadRecordBatch ABSENT) =====
+     0.11%  QueryPipelineEx  clickhouse             [.] DB::TcpStreamSource::buildChunkFromArrowLean(char*, long)
+     0.02%  QueryPipelineEx  clickhouse             [.] DB::(anonymous namespace)::adoptFixedRaw(std::__1::shared_ptr<DB::IDataType const> const&, unsigned char*, unsigned long, std::__1::shared_ptr<void> const&, std::__1::shared_ptr<void> const&)
+     0.01%  QueryPipelineEx  clickhouse             [.] DB::ColumnString::createAdopted(char8_t*, unsigned long, unsigned long*, unsigned long, std::__1::shared_ptr<void>, std::__1::shared_ptr<void>)
+
+===== lean — top consumer symbols (where the time really goes) =====
+    34.88%  QueryPipelineEx  [kernel.kallsyms]      [k] __arch_copy_to_user
+    14.40%  QueryPipelineEx  clickhouse             [.] DB::ColumnString::validateAdoptedOffsets() const
+     9.35%  QueryPipelineEx  clickhouse             [.] DB::VolnitskyBase<true, false, DB::impl::StringSearcher<true, false> >::search(char8_t const*, unsigned long) const
+     2.42%  QueryPipelineEx  [kernel.kallsyms]      [k] __pi_clear_page
+     2.21%  QueryPipelineEx  [kernel.kallsyms]      [k] down_read_trylock
+     2.17%  QueryPipelineEx  [kernel.kallsyms]      [k] check_heap_object
+     1.79%  QueryPipelineEx  [kernel.kallsyms]      [k] _raw_spin_unlock_irqrestore
+     1.67%  QueryPipelineEx  [kernel.kallsyms]      [k] __skb_datagram_iter
+     1.64%  QueryPipelineEx  [kernel.kallsyms]      [k] up_read
+     1.28%  QueryPipelineEx  [kernel.kallsyms]      [k] local_daif_inherit
+     1.24%  QueryPipelineEx  clickhouse             [.] void DB::TargetSpecific::Default::doFilterAligned<short, DB::ResultInserter<short>, 64ul>(char8_t const*&, char8_t const*&, short const*&, DB::ResultInserter<short>&)
+     1.14%  QueryPipelineEx  [kernel.kallsyms]      [k] mod_memcg_state

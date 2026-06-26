@@ -314,3 +314,27 @@ class: the async recv / wake-bridge / `onCancel` / `RetainToken` / charge machin
 hardened in Branch 0 — only `tryRecvBlock` (framing) and `buildChunkFromPayload` (decode) get an Arrow
 branch. Avoids duplicating ~400 lines of bug-prone async code.
 
+
+## D-HC-0208 — `shm_arrow_lean_extract` defaults OFF (lean Arrow extraction is wall-neutral on loopback; parked as a tested alternative)
+**Date:** 2026-06-26. **Context:** Branch B iteration 3 (METHODOLOGY-LOG L0014). The lean direct-flatbuffer
+Arrow RecordBatch extraction (`buildChunkFromArrowLean`) was implemented to attack the +7.4% CB Q24 wall
+residual that L0012 had attributed to `arrow::ipc::ReadRecordBatch`'s per-block `arrow::Array`/`ArrayData`/
+`Buffer`-slice construction (~105 cols/block on `SELECT *`).
+**Measured (3 converging instruments + perf, FRESH W=8):** lean vs the it2 `ReadRecordBatch` adopt = **−0.5%
+wall (within noise) — a NULL**. perf attributes the entire it2 decode path to only **~0.37% of consumer CPU**
+(present in it2, provably ABSENT in lean), so eliminating it cannot move the wall. The L0012 attribution is
+**falsified**: the +7% arrow-vs-bespoke residual is the producer Arrow-serialize (+55 ms/worker, partly on
+the W=8 critical path) + recv-side `cons_sys`, NOT the decode (and NOT wire size: arrow `send_bytes` +0.7%).
+The dominant consumer cost is the kernel recv copy (~35%, irreducible single-copy recv on this NIC-less host).
+**Decision:** ship `shm_arrow_lean_extract = 0` (the standard `arrow::ipc::ReadRecordBatch` adopt path is the
+default). The lean path is correct (gtests + verify_offload 137/137) and a legitimate alternative — it
+eliminates the per-block `arrow::Array` allocations, which is leaner for the **capable-NIC north star** (where
+the recv copy vanishes and per-block allocations matter relatively more) — but it shows **no loopback wall or
+CPU benefit** and adds a dependency on arrow's internal generated flatbuffer headers (`metadata_internal.h`
+→ `generated/Message_generated.h`, requiring the flatbuffers include be exposed to `dbms`). Defaulting to the
+simpler standard-API path with no extra dependency is the evidence-based, conservative choice; lean stays
+selectable (`shm_arrow_lean_extract=1`) for the real-NIC future and for A/B measurement.
+**Alternatives.** (a) Default lean ON — rejected: ships a more-complex, dependency-adding path for zero
+measured loopback benefit. (b) Revert the lean path entirely — rejected: it is correct, tested, and a
+documented alternative whose elimination of the per-block construction is real (perf-proven) and relevant to
+the capable-NIC future; keeping it OFF-by-default preserves the option at no imposed cost.

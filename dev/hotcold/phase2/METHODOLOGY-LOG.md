@@ -543,3 +543,75 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   Branch B optimization iterations still owe ≥2 more (only it2 = a full optimization iteration so far):
   CONTINUE → B-it3 (lean Arrow buffer-extraction vs the +7.4% Arrow-parse residual) + send-zc measured-null
   + B-it1 producer-1-copy confirm; then adversarial review + REPORT-branchB.md.
+
+---
+
+### L0014 — Branch B iteration 3: lean Arrow buffer-extraction — MEASURED NULL (falsifies the L0012 parse-cost attribution)  [branch B]  [iteration 3]  2026-06-26
+- **Goal / hypothesis (pre-registered, 00-PRE-REGISTRATION B-it3 amendment):** the +7.4% CB Q24 wall
+  residual L0012 attributed to `arrow::ipc::Message::Open(body)` + `ReadRecordBatch` constructing one
+  `arrow::Array` (+ ArrayData + 2-3 Buffer slices) PER COLUMN PER BLOCK (~105 cols/block on the wide
+  `SELECT *`). Predicted: a LEAN direct-flatbuffer extraction that skips that construction → `cons_user`
+  −40..47 ms vs it2, wall recovers from +7.4% toward parity (+0..4%). **Pre-registered contingency:** if
+  the wall does NOT move, the residual is elsewhere (recv-side `cons_sys` / producer serialize), a finding.
+- **What I did:** committed CH `b47ce3d1291` — new setting `shm_arrow_lean_extract` (default 1; 0 selects
+  the it2 `ReadRecordBatch` adopt for A/B on one binary). `buildChunkFromArrow` dispatches lean vs
+  `buildChunkFromArrowViaReader` (renamed it2 body, unchanged). `buildChunkFromArrowLean` parses the
+  RecordBatch flatbuffer in `arrow_state.metadata` directly (`flatbuf::GetMessage(...)->header_as_RecordBatch()`,
+  walking `buffers()`/`nodes()` exactly as arrow's `ArrayLoader` does for our flat primitive/LargeBinary
+  schema), adopting each buffer at `body_buf + Buffer.offset()` with NO `arrow::Array` objects; pass-1
+  bails the whole block to the ReadRecordBatch path on any non-adoptable/structural case (body untouched).
+  Adopt switch factored into shared `adoptFixedRaw`/`adoptStringRaw` (one source of truth). `src/CMakeLists.txt`
+  exposes the flatbuffers (header-only) include to dbms (metadata_internal.h → generated/Message_generated.h
+  needs `<flatbuffers/flatbuffers.h>`, a PRIVATE dep of `_arrow`).
+- **How verified (≥3 INDEPENDENT classes; FRESH same-binary same-session, idle load <0.5 at start):**
+  1. **Correctness:** unit_tests_dbms `ArrowStreamSource.*` 9/9 (lean default + it2 + both slow-fragmented
+     + blocking ×2 + copy + stock-ArrowColumnToCHColumn oracle), `TcpStreamSource.*` 4/4, `AdoptedConvert.*`
+     2/2 (15/15). `verify_offload TRANSPORT=arrow` (lean default) = **137/137 PASS, no new DIFF, clean teardown**.
+  2. **End-to-end W=8 wall (median(sd) ms, N=5):** CB Q24 **arrow-lean 1235(10) / arrow-it2 1241(8) /
+     bespoke-tcp 1154(10)**. lean vs it2 = **−6 ms (−0.5%) — WITHIN the max(5%,1σ) band → NULL**. lean vs
+     tcp = **+81 ms (+7.0%)** (it2 vs tcp +87 ms / +7.5%, matches L0012). CB Q2 (fixed-width) lean 406 /
+     it2 404 / tcp 404 = parity. correct=exact in all cells.
+  3. **Consumer CPU split (query_log, ms):** CB Q24 `cons_user` lean 668 / it2 627 / tcp 603; `cons_sys`
+     lean 1071 / it2 1081 / tcp 986. lean ≈ it2 (the +41 ms user is within getrusage-sum noise; lean is NOT
+     a CPU win). arrow-vs-tcp overhead is `cons_sys`-heavy (+85..95 ms), NOT `cons_user`.
+  4. **perf profile (sudo perf -F999 on the CH consumer, ~1350 samples/mode):** the it2 profile shows the
+     full decode path — `ReadRecordBatchInternal` 0.08%, `ArrayLoader::LoadCommon` 0.11%, `GetBuffer`/
+     `GetFieldMetadata` 0.02%×2, `SimpleRecordBatch::column`+dtor 0.09%, `DictionaryResolver` 0.02% ≈
+     **~0.37% of consumer CPU total**. The lean profile shows **NONE of those** (only `buildChunkFromArrowLean`
+     0.11% + `adoptFixedRaw` 0.02% + `createAdopted` 0.01%) — the construction is provably ELIMINATED. BUT
+     the dominant consumer frames (IDENTICAL lean/it2): **`__arch_copy_to_user` 34.9% (lean) / 36.3% (it2)**
+     = the kernel recv copy (irreducible single-copy recv, real-NIC north star); **`ColumnString::
+     validateAdoptedOffsets()` 14.4%** (a scalar monotonicity safety scan, common to ALL adopt paths —
+     bespoke tcp:578, arrow:883/1015, shm:672); `VolnitskyBase::search` 9.4% (the `URL LIKE '%google%'`).
+  5. **Wire-size + producer split (the +7% mechanism):** producer `send_bytes/worker` arrow **~1175 MB** vs
+     tcp **~1167 MB** = **+0.7%** (NOT a wire-size issue). Producer `publish_cpu/worker` arrow **~260 ms**
+     vs tcp **~205 ms = +55 ms** (the nanoarrow Arrow-serialize costs more than the bespoke serialize); at
+     W=8 the recv-copy-bound consumer waits on the producer, so this lands largely on the wall.
+- **Result (RAW):** above. lean vs it2 wall −0.5% (null). Decode path 0.37% (perf). Wire +0.7%. Producer
+  serialize +55 ms/worker. Kernel recv copy ~35% (dominant, irreducible). validateAdoptedOffsets 14.4%.
+- **Interpretation (prediction vs observation — a falsification, NOT a rationalization):** B-it3 is a
+  **MEASURED NULL**: the lean extraction provably eliminates the per-block `arrow::Array` construction
+  (perf: present in it2, absent in lean; gtests confirm a distinct correct path) — **but that construction
+  was only ~0.37% of consumer CPU, so eliminating it cannot move the wall.** This **FALSIFIES the L0012
+  hypothesis** that the +7.4% Q24 residual was the `ReadRecordBatch` parse. Three independent instruments
+  converge on the null (wall −0.5%, cons_user ≈, perf 0.37%). The +7% arrow-vs-bespoke residual is instead
+  (a) the producer Arrow-serialize CPU (+55 ms/worker, partly on the W=8 critical path) and (b) consumer
+  recv-side `cons_sys` — NOT the decode and NOT wire size (+0.7%). The dominant consumer cost is the kernel
+  recv copy (~35%, the known irreducible single-copy-recv residual). The pre-registered contingency was
+  correct.
+- **Learnings / whole-system:** (1) On a recv-copy-bound loopback consumer, decode-layer micro-optimizations
+  are invisible at the wall — the lever is the recv copy (irreducible here) and the producer serialize.
+  (2) **NEW finding:** `ColumnString::validateAdoptedOffsets()` is **14.4%** of consumer CPU on String-heavy
+  cells — a scalar O(rows) monotonicity safety scan paid by ALL adopt transports (arrow/tcp/shm); a
+  vectorization candidate (a general adopt-path win, orthogonal to the arrow-vs-tcp gap). (3) The real
+  arrow-vs-bespoke lever is the producer Arrow-serialize (+55 ms/worker) — connects to B-it1.
+- **Decision (D-HC-0208):** lean is correct + a legitimate alternative (eliminates the per-block Array/
+  ArrayData/Buffer-slice allocations — leaner for the capable-NIC future where the recv copy vanishes) but
+  shows **no loopback wall/CPU benefit** and adds an arrow-internal-header dependency. → default
+  **shm_arrow_lean_extract = 0** (it2 `ReadRecordBatch`, the standard-API path, is the shipped default);
+  lean stays selectable + measured. (Flip committed separately; gtests cover both paths.)
+- **Verdict:** DONE as iteration 3 (a logged NULL that killed a hypothesis — the most valuable kind). The
+  +7% Q24 shortfall is now mechanism-explained (producer serialize + recv-side, NOT decode → DoD-compatible
+  "mechanism explains the shortfall"). CONTINUE → flip the default (D-HC-0208), then B-it4 (send-zc
+  measured-null) + B-it1 (producer 1-copy confirm); validateAdoptedOffsets vectorization is a candidate
+  bonus real-win iteration if time permits.

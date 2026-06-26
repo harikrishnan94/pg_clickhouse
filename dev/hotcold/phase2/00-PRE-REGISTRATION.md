@@ -228,3 +228,53 @@ RecordBatch messages) via nanoarrow + its vendored flatcc runtime, and the stock
 can be the decode oracle — the producer path is viable as decided. Branch-A implementation sequencing:
 fixed-width numeric round-trip first (highest confidence) → `LargeBinary` String → Nullable/Date. (This
 amends, does not change, the Branch-A plan above.)
+
+---
+
+## Amendment 2026-06-26 (Branch-B iteration renumber + B-it3 = lean Arrow buffer-extraction)
+**Iteration renumber (truthful):** the originally-pre-registered B-it3 (send-side `IORING_OP_SEND_ZC`
+measured-null) is **renamed B-it4**. B-it2 (zero-copy adopt) shipped + measured (L0012) and was a
+**partial** recovery: the consumer copy-decode is genuinely eliminated (CB Q24 `cons_user` −299 ms) but the
+wall is **+7.4 % vs bespoke-tcp on Q24** (above the `max(5%,1σ)` band) — a logged prediction-miss whose
+mechanism (L0012) is the Arrow IPC framing/parse: `Message::Open(body)` + `ReadRecordBatch` construct one
+`arrow::Array` (+ its `ArrayData` + 2–3 `Buffer` slices) **per column per block** — ~105 columns/block on
+the CB Q24 `SELECT *` cell. **B-it3 is the scientifically-motivated iteration that attacks that residual.**
+
+### B-it3 — lean Arrow buffer-extraction (skip the per-block `arrow::Array` construction)
+- **Hypothesis:** the +7.4 % Q24 residual is the per-block `arrow::Array`/`ArrayData`/`Buffer`-slice
+  construction inside `ReadRecordBatch` (hundreds of small heap allocs/block) + a redundant second
+  `Message::Open`. Parsing the RecordBatch **flatbuffer directly** (the metadata is already recv'd into
+  `arrow_state.metadata` and validated by the metadata-phase `Message::Open`) and adopting each buffer from
+  `body_buf + flatbuf::Buffer.offset()` — with **no** `arrow::Array` objects — eliminates that work.
+- **Mechanism (pre-registered):** include `<arrow/ipc/metadata_internal.h>` (in-tree precedent: arrow's own
+  `ipc/reader.cc`; resolves via the `_arrow` PUBLIC include dir `contrib/arrow/cpp/src`). Walk
+  `flatbuf::GetMessage(metadata.data())->header_as_RecordBatch()->buffers()`/`->nodes()` in **schema order**,
+  mirroring `ArrayLoader` exactly: fixed-width field consumes `[validity, data]` (data = buffer index +1,
+  advance 2); `LargeBinary` consumes `[validity, offsets, data]` (offsets = +1, data = +2, advance 3). Per
+  column `ptr = body_buf + buffer.offset()`; then the **same** `createAdopted` (`ColumnVector`/`ColumnString`/
+  `ColumnDecimal`) as B-it2 — the offsets aliased via `&arrow_offsets[1]`, `arrow_offsets[0]==0` sentinel
+  validated, Decimal128 16-byte-alignment / sliced / `n==0` / any structural bound failure → **bail to the
+  B-it2 `ReadRecordBatch` adopt path** (which keeps the per-column copy-fallback). Gated by a new setting
+  `shm_arrow_lean_extract` (default 1) so lean-adopt / ReadRecordBatch-adopt / copy / bespoke-tcp / shm-adopt
+  all A/B on **one** binary, one session.
+- **Predicted magnitude:** lean removes the per-block `arrow::Array` construction → predicted **`cons_user`
+  drops ~40–47 ms on CB Q24** vs B-it2 ReadRecordBatch-adopt (the `cons_user` arrow−tcp delta L0012). Wall:
+  recovers from **+7.4 %** toward parity — predicted **+0…+4 % vs bespoke-tcp** (partial-to-full). Fixed-width
+  stays at parity (it already was). Microbench: lean decode of one CB-width batch **faster** than ReadRecordBatch.
+- **Prediction-miss contingency (a finding, not a rationalization):** if the **wall does not move** while
+  `cons_user` drops, the conclusion is that the eliminated CPU was overlapped with the bandwidth-bound recv
+  and the +7.4 % wall is dominated by **`cons_sys` (+118 ms, L0012)** — recv syscalls + the per-cycle async
+  wake-bridge thread spawn (Branch-0 adversarial finding #2), **not** the Arrow parse. Then B-it3's honest
+  result is "lean cuts consumer CPU/energy (real, instrument-proven) but the loopback wall is recv-sys-bound",
+  and the next lever is recv-buffer sizing / a persistent bridge thread — reported, not buried.
+- **Instruments (≥3):** (1) end-to-end W=8 wall — `run_bB_sweep.sh` lean/non-lean/copy/tcp/shm, median(sd)
+  N≥5; (2) consumer CPU split — `cells.tsv` `cons_user_us`/`cons_sys_us` (query_log); (3) a gtest microbench
+  timing lean vs `ReadRecordBatch` decode of an identical wide batch (ns/block); (4) perf profile — absence
+  of `arrow::ipc::...ArrayLoader`/`ReadRecordBatch` frames on the lean path. Correctness gate: `verify_offload
+  TRANSPORT=arrow` 137/137 (lean default) + the Arrow gtests (lean + non-lean + slow-fragmented + stock oracle).
+
+### B-it4 — send-side `IORING_OP_SEND_ZC` measured-null (was B-it3) — unchanged
+As originally pre-registered above (mechanism #2): implement `IORING_OP_SEND_ZC` on the producer + handle the
+errqueue completion; prove the loopback **deferred copy** via the `SO_EE_CODE_ZEROCOPY_COPIED` flag (an honest
+null — no wall win on loopback by design). Plus **B-it1** producer 1-userspace-copy confirmation (a SERIALIZE
+per-block copy counter == 1/block).
