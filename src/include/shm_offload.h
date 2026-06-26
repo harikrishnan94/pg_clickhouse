@@ -87,7 +87,8 @@ typedef enum PgchTcpSendMethod
      * loopback/NIC-less host this is a MEASURED NULL by design -- every completion carries
      * SO_EE_CODE_ZEROCOPY_COPIED (the kernel defers a copy), proving zero-copy send is a pessimization,
      * not an elimination, here; the real elimination is the capable-NIC payoff (the retained real-NIC
-     * zero-copy-send lever). It composes with the P1 non-blocking/EAGAIN loop. */
+     * zero-copy-send lever). It is a SEPARATE dispatch branch from the epoll path (its own blocking-socket
+     * SO_SNDTIMEO-sliced EAGAIN loop + errqueue drain), unaffected by the P1 epoll send. */
     PGCH_TCP_SEND_MSG_ZEROCOPY = 2,
 } PgchTcpSendMethod;
 extern int   pgch_tcp_send_method;

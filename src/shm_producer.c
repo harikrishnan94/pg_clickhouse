@@ -869,7 +869,12 @@ tcp_accept_conn(ShmProducer *p)
             struct epoll_event ev;
 
             memset(&ev, 0, sizeof(ev));
-            ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+            /* Watch for writability. EPOLLERR/EPOLLHUP are ALWAYS reported by epoll_wait regardless of the
+             * requested set (epoll(7)), so we need not request them; on a dying peer epoll_wait then
+             * returns immediately and the next send() surfaces the real error (EPIPE/ECONNRESET) within
+             * sub-ms -- a bounded, CHECK_FOR_INTERRUPTS-checked transient in tcp_send_all_epoll, not a hang
+             * (adversarial review P1 NB2). */
+            ev.events = EPOLLOUT;
             ev.data.fd = p->tcp_conn_fd;
             if (epoll_ctl(p->tcp_send_epoll_fd, EPOLL_CTL_ADD, p->tcp_conn_fd, &ev) < 0)
             {
