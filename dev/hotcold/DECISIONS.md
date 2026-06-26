@@ -180,3 +180,97 @@ duplicated minimally. Counters: TCP increments the `ShmCopied*` family (it is a 
 TCP-specific cost split is needed.
 
 See `phase1/00-PRE-REGISTRATION.md` for the predicted magnitude + convergence plan.
+
+---
+# Phase 2 — Apache Arrow wire + zero-copy transport (D-HC-02xx)
+
+Phase 2 moves the `streamed_table` TCP wire onto **Apache Arrow** and drives copies to the minimum, on an
+io_uring/async substrate. Sequenced 0 → A → B. These decisions are pre-registered from the three
+adversarial feasibility reviews (`phase2/evidence/PROMPT-FEASIBILITY-REVIEW{,-v2,-v3}.md`), which are binding.
+
+## D-HC-0201 — Phase-2 wire format = Apache Arrow (LargeBinary String, raw fixed-width); custom zero-copy adopter
+**Date:** 2026-06-26
+**Decision.** The Arrow record-batch body replaces the bespoke `TcpFrame.h` `ColumnDescriptor` payload.
+`String` → Arrow **`LargeBinary`** (int64 offsets); fixed-width → contiguous little-endian buffers
+(== CH `PODArray`); `Nullable` → validity bitmap + nested. A **custom** Arrow→`adopt()` path does the
+zero-copy adoption (Branch B); the stock `ArrowColumnToCHColumn` (which COPIES) is the independent decode
+**oracle**, not the fast path.
+**Why Arrow (not Native).** This fork's `ColumnString` stores **non-terminated** bytes (`ColumnString.h:43`),
+so Arrow's `values` buffer *is* CH `chars` and `offsets`=`&arrow_offsets[1]` makes Arrow's leading 0 double
+as CH's `offsets[-1]` sentinel — Arrow is the one standard format that is both standard AND zero-copy here.
+ClickHouse Native encodes String as per-row `varint(len)+bytes` → mandatory parse copy → rejected.
+**Caveats (binding).** `LargeBinary` not `Binary` (int32 offsets force a widening copy); `LargeBinary` not
+`LargeUtf8` (CH String is arbitrary bytes). Adopter MUST validate `array.offset()==0 && arrow_offsets[0]==0`
+(Arrow only *recommends* the leading 0; sliced arrays violate it) → else copy/error.
+**Alternatives.** ClickHouse Native — rejected (String parse copy, kills zero-copy intention). Keep bespoke —
+rejected (it is the format intention 1 wants to retire). Arrow Flight transport — deferred (the wire is the
+substrate; Flight is a future producer).
+
+## D-HC-0202 — Producer emits Arrow IPC via vendored **nanoarrow**; IPC alignment 64
+**Date:** 2026-06-26
+**Decision.** `pg_clickhouse` is a C extension with no Arrow library. Vendor **nanoarrow + nanoarrow_ipc**
+(amalgamation) into `src/nanoarrow/` and link via the extension Makefile. nanoarrow's IPC writer produces
+the standards-valid encapsulated `Message`/`Schema`/`RecordBatch` metadata + body, so the stock
+`ArrowColumnToCHColumn` can be the decode oracle and a third party can read the bytes. Set IPC write
+**alignment = 64** (≥16 minimum) so `Decimal128`/SIMD buffers land aligned and the `Buffer` (offset,length)
+metadata stays consistent with the CH-padded body. Version logged at vendoring time.
+**Alternatives.** Hand-rolled flatbuffer metadata — rejected (error-prone, defeats the oracle). Arrow-GLib /
+full Arrow C++ in a PG bgworker — rejected (too heavy). Body-only private framing — rejected (forfeits the
+stock-reader oracle + cross-engine interop, i.e. intention 1).
+
+## D-HC-0203 — Date/DateTime/DateTime64 ship RAW (uint16 / uint32 / int64) for true zero-copy
+**Date:** 2026-06-26
+**Decision.** CH stores `Date` as UInt16(days), `DateTime` as UInt32(secs), `DateTime64(p)` as int64 ticks.
+Standard Arrow has no 2-byte date / 4-byte timestamp (`Date32`=int32, `Timestamp`=int64) and `DateTime64(p)`
+maps to a standard Arrow `Timestamp` unit only for p∈{0,3,6,9}. To keep these **zero-copy adopt**, ship the
+column's **raw storage buffer** as Arrow `uint16`/`uint32`/`int64`. The CH type (and DateTime64 scale) is
+recovered from the handshake/SQL schema, not the Arrow logical type.
+**Accepted tradeoff (logged).** The Arrow *schema* for these 3 types is non-semantic — a third-party Arrow
+reader sees plain integers — slightly weakening intention-1 interop for these types in exchange for zero copy
+and matching today's adopt path. **Oracle:** supply CH type hints (`ArrowColumnToCHColumn` has raw
+UINT16/UINT32 hint handling) or restore the Date/DateTime wrappers before comparing, so the oracle does not
+flag a spurious type DIFF. Optional: a `DateTime64(p∈{0,3,6,9})` column MAY be tagged Arrow `Timestamp` of
+the matching unit (same int64 width → still zero-copy AND semantic); default is raw.
+
+## D-HC-0204 — Branch-0 io_uring substrate: producer IORING_OP_SEND; consumer async (PollableShmSource pattern)
+**Date:** 2026-06-26
+**Decision.** Producer: a per-bgworker io_uring ring replaces blocking `send()` in `tcp_send_all`
+(`IORING_OP_SEND`, submit + bounded-timeout wait so the loop still polls `CHECK_FOR_INTERRUPTS` +
+`origin_backend_dead`). This is the substrate for Branch-B `IORING_OP_SEND_ZC`. Consumer: convert
+`TcpStreamSource` to an **async** source mirroring `PollableShmSource` (readiness eventfd + async-wake bridge
++ `prepare()→schedule()→onAsyncJobReady()` contract) so recv overlaps downstream processing. CH's
+`IOUringReader` is file-only and **not** epoll-integrated (zero `IORING_OP_RECV` in-tree), so an io_uring
+recv variant uses a dedicated completion thread that signals the readiness eventfd.
+**Honest scope (pre-registered).** Multi-stream W=8 throughput delta ≈ 0 (cost is the kernel copy, not
+syscalls; Phase-1 context-switches flat). The genuine win is the **single-stream** regime (async overlap
+fixes the Phase-1 `max_threads=1` serialization). The bespoke wire is UNCHANGED in Branch 0.
+**Deadlock invariant re-derived.** Blocking rule `max_threads = Σ producers ≥ #blocking sources` relaxes for
+async (a source no longer pins a thread inside recv); new invariant = "every async source's readiness fd is
+registered and re-scheduled on readiness/cancel/stall". Pinned with a code comment + liveness gtest.
+
+## D-HC-0205 — Arrow-TCP selected by a distinct transport token `arrow:<host>:<port>`
+**Date:** 2026-06-26
+**Decision.** During the migration both wires stay selectable: bespoke TCP keeps `tcp:<host>:<port>`; the
+Arrow wire uses a new token **`arrow:<host>:<port>`** (parsed in `tryParseShmTransportSpec` → a new
+`ShmTransportMode::ArrowTcp`). The PG GUC `pg_clickhouse.shm_transport_mode` gains an `arrow` value that the
+deparser emits. This lets every sweep compare Arrow-TCP vs bespoke-TCP on the SAME binary, and lets the
+bespoke path be retired later by flipping the default — not by deleting code mid-migration.
+**Alternatives.** Reuse `tcp:` and switch the wire by a server GUC — rejected (can't A/B both wires in one
+binary/session; the evidence standard requires fresh same-binary comparison). Replace `tcp:` outright —
+rejected (loses the bespoke parity baseline mid-branch).
+
+## D-HC-0206 — `convertToFullColumnIfAdopted` stays materializing where callers mutate; add ColumnNullable recurse
+**Date:** 2026-06-26
+**Decision.** `convertToFullColumnIfAdopted` MUST continue to return a materialized, **mutable, owned**
+column wherever a caller mutates the result — its only callers, `Squashing.cpp:346` (in-place squash
+accumulator) and `HashJoin.cpp:126` (build-side materialization), both mutate, so a blanket `owned_full`
+no-op would make them throw `READONLY` on the first join/aggregate over a streamed table. Add a
+`ColumnNullable::convertToFullColumnIfAdopted` override that recurses into the nested column (the default
+does not recurse → a `Nullable(adopted)` would never materialize). A no-op is permitted ONLY on a path
+proven non-mutating; the zero-copy pass-through/drop path never calls this method, so the no-op buys nothing
+there. This is **NOT** a Definition-of-Done item. Proven with gtests through Squashing + HashJoin + the
+Nullable recurse path.
+**Why (round-2 review).** The round-1 `owned_full` idea addressed only *lifetime*; it missed *mutability*.
+Resolved: single-copy-recv puts the bytes in a CH-heap buffer (lifetime fine), but the column stays in
+adopted PODArray mode (mutators throw), so the mutating callers still need a real owned column.
+
