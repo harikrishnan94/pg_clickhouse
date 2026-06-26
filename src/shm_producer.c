@@ -23,6 +23,7 @@
 #include "shm_producer.h"
 #include "shm_offload.h"        /* PgchTcpSendMethod */
 #include "shm_phase.h"
+#include "shm_arrow.h"          /* Apache Arrow IPC serializer (Phase 2 Branch A, D-HC-0207) */
 
 #ifdef PGCH_USE_LIBURING
 #include <liburing.h>
@@ -136,6 +137,17 @@ StaticAssertDecl(sizeof(TcpHandshakeHeader) == 16, "TcpHandshakeHeader must be 1
 StaticAssertDecl(sizeof(TcpBlockHeader) == 32, "TcpBlockHeader must be 32 bytes");
 StaticAssertDecl(sizeof(ShmColumnDescriptor) == 56, "ShmColumnDescriptor must be 56 bytes");
 
+/* The Arrow serializer consumes the deformed buffers via ShmArrowColBuffers, which is
+ * field-for-field identical to ShmColumnPayload, so a published payload array can be passed
+ * to shm_arrow_encode_record_batch() by reinterpret-cast (no per-block copy). Pin that. */
+StaticAssertDecl(sizeof(ShmArrowColBuffers) == sizeof(ShmColumnPayload),
+                 "ShmArrowColBuffers must match ShmColumnPayload");
+StaticAssertDecl(offsetof(ShmArrowColBuffers, value_buf)     == offsetof(ShmColumnPayload, value_buf) &&
+                 offsetof(ShmArrowColBuffers, value_len)     == offsetof(ShmColumnPayload, value_len) &&
+                 offsetof(ShmArrowColBuffers, offsets_buf)   == offsetof(ShmColumnPayload, offsets_buf) &&
+                 offsetof(ShmArrowColBuffers, offsets_count) == offsetof(ShmColumnPayload, offsets_count),
+                 "ShmArrowColBuffers layout must match ShmColumnPayload");
+
 #define MAX_PARKED_CONNS 16
 
 struct ShmProducer {
@@ -201,6 +213,13 @@ struct ShmProducer {
     bool       tcp_handshake_sent;
     char      *tcp_scratch;
     size_t     tcp_scratch_cap;
+
+    /*
+     * Hot-Cold Phase 2 Branch A (PGCH_PRODUCER_TRANSPORT_ARROW, D-HC-0207): the Arrow IPC
+     * serializer. Lazily created on the first publish (when the connection is accepted and the
+     * Arrow Schema message is sent); NULL for every other transport. Freed in producer_cleanup.
+     */
+    ShmArrowEncoder *arrow_enc;
 
     /*
      * Hot-Cold Phase 2, Branch 0 (D-HC-0204): TCP send submission method. `tcp_send_method`
@@ -451,6 +470,11 @@ producer_cleanup(ShmProducer *p)
      * callback, before tcp_scratch's context memory is freed, so no SQE can outlive its buffer. */
     if (p->tcp_ring_ready) { io_uring_queue_exit(&p->tcp_ring); p->tcp_ring_ready = false; }
 #endif
+#ifdef PGCH_USE_NANOARROW
+    /* Free the Arrow encoder's malloc'd nanoarrow buffers (not palloc'd, so not reclaimed by the
+     * owner-context reset that drives this callback). */
+    if (p->arrow_enc != NULL) { shm_arrow_encoder_destroy(p->arrow_enc); p->arrow_enc = NULL; }
+#endif
     if (p->tcp_conn_fd >= 0) { close(p->tcp_conn_fd); p->tcp_conn_fd = -1; }
     if (p->listen_fd >= 0) { close(p->listen_fd); p->listen_fd = -1; }
     if (p->event_fd >= 0)  { close(p->event_fd);  p->event_fd = -1; }
@@ -637,16 +661,14 @@ tcp_send_all(ShmProducer *p, const void *buf, size_t n)
     tcp_send_all_blocking(p, buf, n);
 }
 
-/* Accept the consumer (poll loop honouring cancel + backend death), set TCP_NODELAY + a send
- * timeout, and send the one-shot handshake (header + ShmSchemaEntry[n_columns]). */
+/* Accept the consumer connection (poll loop honouring cancel + backend death) and set
+ * TCP_NODELAY + a send timeout + a multi-block send buffer. Shared by the bespoke TCP and
+ * Arrow transports (the wire-specific handshake/schema is sent by the caller). */
 static void
-tcp_accept_and_handshake(ShmProducer *p)
+tcp_accept_conn(ShmProducer *p)
 {
-    TcpHandshakeHeader hs;
-    ShmSchemaEntry *se;
     struct timeval tv;
     int one = 1;
-    int i;
 
     for (;;)
     {
@@ -680,6 +702,17 @@ tcp_accept_and_handshake(ShmProducer *p)
         int sndbuf = 32 * 1024 * 1024;
         (void) setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     }
+}
+
+/* Accept the consumer and send the bespoke one-shot handshake (header + ShmSchemaEntry[]). */
+static void
+tcp_accept_and_handshake(ShmProducer *p)
+{
+    TcpHandshakeHeader hs;
+    ShmSchemaEntry *se;
+    int i;
+
+    tcp_accept_conn(p);
 
     hs.magic = PGCH_TCP_MAGIC;
     hs.abi_version = PGCH_TCP_ABI_VERSION_1;
@@ -696,6 +729,90 @@ tcp_accept_and_handshake(ShmProducer *p)
     pfree(se);
     p->tcp_handshake_sent = true;
 }
+
+#ifdef PGCH_USE_NANOARROW
+/* Arrow transport (D-HC-0207): accept the consumer, build the Arrow encoder from the column
+ * schema, and send the Arrow IPC Schema message. The wire is a standard Arrow IPC stream
+ * (Schema message, then one RecordBatch message per block, then the EOS marker) -- NO bespoke
+ * TcpHandshakeHeader/TcpBlockHeader. tcp_handshake_sent is reused as the "stream started" flag. */
+static void
+arrow_accept_and_send_schema(ShmProducer *p)
+{
+    ShmArrowField *fields;
+    const uint8_t *msg;
+    size_t msg_len;
+    char errbuf[256];
+    int i;
+
+    tcp_accept_conn(p);
+
+    fields = (ShmArrowField *) palloc(sizeof(ShmArrowField) * (p->n_columns > 0 ? p->n_columns : 1));
+    for (i = 0; i < p->n_columns; i++)
+    {
+        fields[i].wire = p->schema[i].wire;
+        fields[i].name = p->schema[i].name;   /* outlives the encoder (producer-owned schema) */
+    }
+    p->arrow_enc = shm_arrow_encoder_create(fields, p->n_columns, errbuf, sizeof(errbuf));
+    pfree(fields);
+    if (p->arrow_enc == NULL)
+        ereport(ERROR, (errmsg("pg_clickhouse: Arrow encoder init failed: %s", errbuf)));
+
+    if (!shm_arrow_encode_schema(p->arrow_enc, &msg, &msg_len, errbuf, sizeof(errbuf)))
+        ereport(ERROR, (errmsg("pg_clickhouse: Arrow schema encode failed: %s", errbuf)));
+    tcp_send_all(p, msg, msg_len);
+    p->tcp_handshake_sent = true;
+}
+
+/* Arrow analog of tcp_publish_block: lazy accept + schema on the first call, then one Arrow IPC
+ * RecordBatch message per block (encapsulated metadata followed by the body), and the Arrow IPC
+ * EOS marker for end-of-stream. */
+static void
+arrow_publish_block(ShmProducer *p, const ShmColumnPayload *payloads, int n_payloads,
+                    size_t row_count, bool is_eos)
+{
+    int saved_phase = -1;
+    const uint8_t *meta, *body;
+    size_t meta_len, body_len;
+    char errbuf[256];
+
+    if (p->eos_published)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm stream already ended")));
+    if (!is_eos && n_payloads != p->n_columns)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm payload count %d != schema %d", n_payloads, p->n_columns)));
+    if (row_count > SHM_IMPL_MAX_ROWS)
+        ereport(ERROR, (errmsg("pg_clickhouse: shm row_count %zu exceeds limit %u", row_count, SHM_IMPL_MAX_ROWS)));
+
+    if (!p->tcp_handshake_sent)
+        arrow_accept_and_send_schema(p);
+
+    if (p->timers != NULL && p->timers->enabled)
+        saved_phase = p->timers->cur;
+    pgch_phase_switch(p->timers, PGCH_PH_PUBLISH);
+
+    if (is_eos)
+    {
+        tcp_send_all(p, SHM_ARROW_EOS_MARKER, sizeof(SHM_ARROW_EOS_MARKER));
+    }
+    else
+    {
+        /* ShmColumnPayload is field-compatible with ShmArrowColBuffers (static-asserted above). */
+        if (!shm_arrow_encode_record_batch(p->arrow_enc,
+                                           (const ShmArrowColBuffers *) payloads, n_payloads, row_count,
+                                           &meta, &meta_len, &body, &body_len, errbuf, sizeof(errbuf)))
+        {
+            if (saved_phase >= 0)
+                pgch_phase_switch(p->timers, saved_phase);
+            ereport(ERROR, (errmsg("pg_clickhouse: Arrow record-batch encode failed: %s", errbuf)));
+        }
+        tcp_send_all(p, meta, meta_len);
+        if (body_len > 0)
+            tcp_send_all(p, body, body_len);
+    }
+
+    if (saved_phase >= 0)
+        pgch_phase_switch(p->timers, saved_phase);
+}
+#endif /* PGCH_USE_NANOARROW */
 
 /* Lay one block into p->tcp_scratch frame-relative (descriptors at offset 0, then per-column
  * buffers with the SHM align / SIMD-padding / offsets[-1]-zero-sentinel layout). Returns the
@@ -894,9 +1011,10 @@ shm_producer_create(const char *name,
     p->schema = palloc0(sizeof(ShmColumnSchema) * n_columns);
     memcpy(p->schema, schema, sizeof(ShmColumnSchema) * n_columns);
 
-    /* TCP transport: no SHM object / control socket / pump thread — a per-stream TCP listener and
-     * a serialize scratch buffer instead. The cleanup callback (registered above) closes them. */
-    if (transport == PGCH_PRODUCER_TRANSPORT_TCP)
+    /* Socket transports (bespoke TCP or Arrow): no SHM object / control socket / pump thread — a
+     * per-stream TCP listener (+ a bespoke serialize scratch; the Arrow encoder owns its own
+     * buffers). The cleanup callback (registered above) closes them. */
+    if (transport == PGCH_PRODUCER_TRANSPORT_TCP || transport == PGCH_PRODUCER_TRANSPORT_ARROW)
     {
         tcp_producer_setup(p, data_region_size);
         MemoryContextSwitchTo(old);
@@ -1260,6 +1378,12 @@ shm_producer_publish(ShmProducer *p, const ShmColumnPayload *payloads, int n_pay
 {
     if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
         tcp_publish_block(p, payloads, n_payloads, row_count, false);
+    else if (p->transport == PGCH_PRODUCER_TRANSPORT_ARROW)
+#ifdef PGCH_USE_NANOARROW
+        arrow_publish_block(p, payloads, n_payloads, row_count, false);
+#else
+        ereport(ERROR, (errmsg("pg_clickhouse: arrow transport requires a build with nanoarrow")));
+#endif
     else
         publish_block(p, payloads, n_payloads, row_count, false);
 }
@@ -1269,6 +1393,12 @@ shm_producer_signal_eos(ShmProducer *p)
 {
     if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
         tcp_publish_block(p, NULL, p->n_columns, 0, true);
+    else if (p->transport == PGCH_PRODUCER_TRANSPORT_ARROW)
+#ifdef PGCH_USE_NANOARROW
+        arrow_publish_block(p, NULL, p->n_columns, 0, true);
+#else
+        ereport(ERROR, (errmsg("pg_clickhouse: arrow transport requires a build with nanoarrow")));
+#endif
     else
         publish_block(p, NULL, p->n_columns, 0, true);
     p->eos_published = true;
@@ -1292,9 +1422,10 @@ shm_producer_destroy(ShmProducer *p)
     if (p->cleaned)
         return;
 
-    /* TCP transport has no shared ring/slots to drain: the consumer reads the byte stream and the
-     * kernel guarantees buffered bytes are delivered before the FIN, so close immediately. */
-    if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP)
+    /* Socket transports (bespoke TCP / Arrow) have no shared ring/slots to drain: the consumer
+     * reads the byte stream and the kernel guarantees buffered bytes are delivered before the FIN,
+     * so close immediately. */
+    if (p->transport == PGCH_PRODUCER_TRANSPORT_TCP || p->transport == PGCH_PRODUCER_TRANSPORT_ARROW)
     {
         producer_cleanup(p);
         return;

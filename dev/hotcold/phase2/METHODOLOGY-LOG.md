@@ -289,3 +289,39 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE for the producer encoder module (round-trip green, builds clean). CONTINUE →
   `arrow:` transport plumbing + wiring the encoder into `shm_producer.c` behind
   `PGCH_PRODUCER_TRANSPORT_ARROW`.
+
+---
+
+### L0008 — Branch A: wire the Arrow encoder into the producer + `arrow:` transport plumbing  [branch A]  [iteration 1]  2026-06-26
+- **Goal / hypothesis:** Make `pg_clickhouse.shm_transport_mode='arrow'` end-to-end *selectable* on the
+  producer: the deparser emits `arrow:127.0.0.1:<port>`, the worker maps it to a new producer transport,
+  and the producer streams a standard Arrow IPC stream (Schema + RecordBatch* + EOS) over the same
+  per-stream TCP socket the bespoke path uses (D-HC-0205/0207). Predicted: bespoke path byte-unchanged
+  (137/137); arrow path not yet runnable end-to-end (the consumer doesn't parse `arrow:` until A4).
+- **What I did (files):**
+  - **Plumbing:** `shm_offload.{h,c}` — `PGCH_TRANSPORT_ARROW=3` + GUC value `arrow` + description.
+    `shm_producer.h` — `PGCH_PRODUCER_TRANSPORT_ARROW=2`. `shm_worker.c` — GUC→producer-transport map
+    gains the arrow case; the send-stats LOG gate widened from `==TCP` to `!=SHM`. `shm_customscan.c` —
+    `shm_build_union_sql` emits `'<scheme>:127.0.0.1:<port>'` with `scheme ∈ {tcp,arrow}`.
+  - **Producer integration:** `shm_producer.c` — `#include "shm_arrow.h"`; an `arrow_enc` field;
+    extracted `tcp_accept_conn()` (shared accept+sockopts) out of `tcp_accept_and_handshake()`; new
+    `arrow_accept_and_send_schema()` (accept → build encoder from `p->schema` → send Arrow Schema msg)
+    and `arrow_publish_block()` (per block: encode RecordBatch, send encapsulated metadata + body; EOS:
+    send `SHM_ARROW_EOS_MARKER`), both `#ifdef PGCH_USE_NANOARROW`. Dispatch in
+    `shm_producer_create/publish/signal_eos/destroy` treats ARROW like a socket transport; the publish/eos
+    dispatch errors cleanly if ARROW is selected in a non-nanoarrow build. `producer_cleanup` frees
+    `arrow_enc` (its nanoarrow buffers are malloc'd, not palloc'd). The deformed payloads are passed to
+    the encoder by reinterpret-cast (`ShmColumnPayload`≡`ShmArrowColBuffers`, two `StaticAssertDecl`s pin
+    the layout) — no per-block adaptation copy.
+- **How verified (correctness gate; end-to-end arrow is A5):**
+  1. **Build:** `make -j32` clean; `pg_clickhouse.so` links `shm_arrow.o` + the integration.
+  2. **Bespoke regression oracle (floor):** `verify_offload.sh TRANSPORT=tcp` → **PASS=137 FAIL=0**
+     (`/tmp/bA_step3_verify.log`) — the bespoke wire + SHM paths are byte-unchanged by the arrow plumbing.
+- **Interpretation:** the producer can now speak Arrow IPC on `arrow:` selection without disturbing any
+  existing transport. Correctness of the arrow data path is proven end-to-end in A5 (needs the consumer).
+- **Learnings:** the bespoke accept loop was cleanly shared (just the wire-specific handshake differs);
+  reusing `tcp_handshake_sent` as the generic "stream started" flag kept the lazy-first-publish structure
+  identical across wires.
+- **Verdict:** DONE (producer arrow path selectable + green; bespoke unaffected). CONTINUE → A4: the CH
+  consumer (`ShmTransportMode::ArrowTcp` + `TcpStreamSource` Arrow recv/decode + round-trip gtest vs the
+  stock `ArrowColumnToCHColumn` oracle).

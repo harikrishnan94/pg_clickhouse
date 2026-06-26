@@ -1431,8 +1431,10 @@ static char *
 shm_build_union_sql(const char *sql, const char *base, const char *schema, int nworkers,
                     ShmWorkerHandle *worker)
 {
-    const char   *transport = shm_transport_arg_literal();   /* NULL or 'shm:copy' (non-TCP modes) */
+    const char   *transport = shm_transport_arg_literal();   /* NULL or 'shm:copy' (non-socket modes) */
     bool          is_tcp = (pgch_shm_transport_mode == PGCH_TRANSPORT_TCP);
+    bool          is_arrow = (pgch_shm_transport_mode == PGCH_TRANSPORT_ARROW);
+    const char   *sock_scheme = is_arrow ? "arrow" : "tcp";   /* per-worker socket transports */
     char         *needle = psprintf("streamed_table(%s, %s)",
                                     ch_quote_literal(base), ch_quote_literal(schema));
     const char   *pos = strstr(sql, needle);
@@ -1454,10 +1456,11 @@ shm_build_union_sql(const char *sql, const char *base, const char *schema, int n
             appendStringInfoString(&out, " UNION ALL ");
         /* The optional 3rd arg carries the consumer transport (D-HC-0001). The deparsed source the
          * needle matched is always the 2-arg form, so adopt re-emits an identical 2-arg call; copy
-         * appends 'shm:copy'; TCP appends this worker's reported listener port (D-HC-0102/0103). */
-        if (is_tcp)
-            appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s, 'tcp:127.0.0.1:%u')",
-                             ch_quote_literal(name), ch_quote_literal(schema),
+         * appends 'shm:copy'; the socket transports (bespoke 'tcp:' / Arrow 'arrow:', D-HC-0205)
+         * append this worker's reported listener port (D-HC-0102/0103). */
+        if (is_tcp || is_arrow)
+            appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s, '%s:127.0.0.1:%u')",
+                             ch_quote_literal(name), ch_quote_literal(schema), sock_scheme,
                              (unsigned) pgch_shm_worker_tcp_port(worker, w));
         else if (transport != NULL)
             appendStringInfo(&out, "SELECT * FROM streamed_table(%s, %s, %s)",

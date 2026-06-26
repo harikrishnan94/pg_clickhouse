@@ -189,8 +189,9 @@ pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
     hdr->log_stream_stats = pgch_log_stream_stats;
     hdr->enable_jit_deform = pgch_enable_jit_deform;
     hdr->jit_row_threshold = pgch_jit_row_threshold;
-    hdr->transport = (pgch_shm_transport_mode == PGCH_TRANSPORT_TCP)
-        ? PGCH_PRODUCER_TRANSPORT_TCP : PGCH_PRODUCER_TRANSPORT_SHM;
+    hdr->transport = (pgch_shm_transport_mode == PGCH_TRANSPORT_TCP)   ? PGCH_PRODUCER_TRANSPORT_TCP
+                   : (pgch_shm_transport_mode == PGCH_TRANSPORT_ARROW) ? PGCH_PRODUCER_TRANSPORT_ARROW
+                   : PGCH_PRODUCER_TRANSPORT_SHM;
     hdr->tcp_send_method = pgch_tcp_send_method;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
@@ -608,8 +609,8 @@ pgch_shm_worker_main(Datum main_arg)
 
             /* Branch-0 (D-HC-0204) TCP send-method proof: how many logical sends went via
              * io_uring vs blocking. io_uring>0 && blocking==0 proves the io_uring path ran
-             * (not a silent fallback). Only meaningful for the TCP transport. */
-            if (hdr->transport == PGCH_PRODUCER_TRANSPORT_TCP)
+             * (not a silent fallback). Meaningful for any socket transport (bespoke TCP or Arrow). */
+            if (hdr->transport != PGCH_PRODUCER_TRANSPORT_SHM)
             {
                 uint64 iou = 0, blk = 0, sb = 0;
 

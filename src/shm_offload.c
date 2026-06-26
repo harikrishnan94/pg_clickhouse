@@ -56,11 +56,13 @@ int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
 int   pgch_tcp_send_method = PGCH_TCP_SEND_IOURING;
 
-/* adopt/copy = SHM transport (consumer-side data path); tcp = TCP stream transport (Phase 1). */
+/* adopt/copy = SHM transport (consumer-side data path); tcp = bespoke TCP stream (Phase 1);
+ * arrow = Apache Arrow IPC over the same per-stream TCP socket (Phase 2 Branch A). */
 static const struct config_enum_entry pgch_shm_transport_options[] = {
     {"adopt", PGCH_TRANSPORT_ADOPT, false},
     {"copy",  PGCH_TRANSPORT_COPY,  false},
     {"tcp",   PGCH_TRANSPORT_TCP,   false},
+    {"arrow", PGCH_TRANSPORT_ARROW, false},
     {NULL, 0, false},
 };
 
@@ -1164,9 +1166,11 @@ pgch_shm_offload_init(void)
                              "Transport for offload: 'adopt' (zero-copy adoption out of the "
                              "shared-memory ring, default), 'copy' (the ClickHouse consumer copies "
                              "each block out of shared memory and releases the ring slot immediately), "
-                             "or 'tcp' (each producer streams its blocks to the consumer over a "
-                             "per-stream TCP connection instead of shared memory). Selected per query "
-                             "and emitted as the streamed_table() transport argument.",
+                             "'tcp' (each producer streams its blocks to the consumer over a "
+                             "per-stream TCP connection instead of shared memory, bespoke framing), "
+                             "or 'arrow' (the same per-stream TCP connection carrying a standard "
+                             "Apache Arrow IPC stream). Selected per query and emitted as the "
+                             "streamed_table() transport argument.",
                              NULL, &pgch_shm_transport_mode, PGCH_TRANSPORT_ADOPT,
                              pgch_shm_transport_options, PGC_USERSET, 0, NULL, NULL, NULL);
 

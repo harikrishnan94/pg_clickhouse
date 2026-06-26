@@ -67,7 +67,8 @@ typedef struct ShmProducer ShmProducer;
 typedef enum ShmProducerTransport
 {
     PGCH_PRODUCER_TRANSPORT_SHM = 0,
-    PGCH_PRODUCER_TRANSPORT_TCP = 1,
+    PGCH_PRODUCER_TRANSPORT_TCP = 1,    /* bespoke TcpFrame.h block bytes (Phase 1)              */
+    PGCH_PRODUCER_TRANSPORT_ARROW = 2,  /* Apache Arrow IPC stream over the same TCP socket (A)  */
 } ShmProducerTransport;
 
 /*

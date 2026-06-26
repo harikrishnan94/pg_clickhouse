@@ -66,7 +66,8 @@ typedef enum PgchShmTransport
 {
     PGCH_TRANSPORT_ADOPT = 0,   /* zero-copy adoption straight out of the ring (default)        */
     PGCH_TRANSPORT_COPY = 1,    /* consumer copies each block out of SHM, releases slot early   */
-    PGCH_TRANSPORT_TCP = 2,     /* reserved (Phase 1: block bytes over a TCP socket)            */
+    PGCH_TRANSPORT_TCP = 2,     /* Phase 1: bespoke block bytes over a per-stream TCP socket    */
+    PGCH_TRANSPORT_ARROW = 3,   /* Phase 2 Branch A: Apache Arrow IPC over a per-stream TCP sock */
 } PgchShmTransport;
 extern int   pgch_shm_transport_mode;
 
