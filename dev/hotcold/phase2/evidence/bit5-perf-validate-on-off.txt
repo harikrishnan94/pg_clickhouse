@@ -1,0 +1,13 @@
+# B-it5 perf -- validateAdoptedOffsets present(ON)/absent(OFF), CH consumer, CB Q24 it2 adopt
+# Captured 2026-06-26. Confirms shm_adopt_validate_offsets gates the O(n) monotonicity scan.
+
+=== validate ON (shm_adopt_validate_offsets=1) ===
+    35.47%  QueryPipelineEx  [kernel.kallsyms]      [k] __arch_copy_to_user
+    12.39%  QueryPipelineEx  clickhouse             [.] DB::ColumnString::validateAdoptedOffsets() const
+     9.62%  QueryPipelineEx  clickhouse             [.] DB::VolnitskyBase<true, false, DB::impl::StringSearcher<true, false> >::search(char8_t const*, unsigned long) const
+     0.01%  MergeMutate      [kernel.kallsyms]      [k] __arch_copy_to_user
+
+=== validate OFF (default) -- validateAdoptedOffsets ABSENT ===
+    41.32%  QueryPipelineEx  [kernel.kallsyms]      [k] __arch_copy_to_user
+    11.51%  QueryPipelineEx  clickhouse             [.] DB::VolnitskyBase<true, false, DB::impl::StringSearcher<true, false> >::search(char8_t const*, unsigned long) const
+     0.01%  MemoryWorker     [kernel.kallsyms]      [k] __arch_copy_to_user

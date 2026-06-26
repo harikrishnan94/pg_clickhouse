@@ -20,7 +20,7 @@ the −299 ms consumer-user-CPU drop on the String-heavy cell and parity on fixe
 zero-copy is honestly proven a **measured negative** on loopback via `SO_EE_CODE_ZEROCOPY_COPIED`; the
 **recv-side** is single-copy (one kernel copy into the to-be-adopted buffer, no userspace recopy) with the
 residual kernel recv copy reported as the dominant (~35%) cost — the real-NIC north star, not closable
-here. **4 evidence-based iterations** logged — it2/it3/it4 (the ≥3 required optimization iterations) +
+here. **5 evidence-based iterations** logged — it2/it3/it4/it5 (the optimization iterations, ≥3 required) +
 it1 (the 1-copy confirmation) + the D-HC-0206 capability; every claim backed by ≥3 converging
 instruments; no new `DIFF`; the default path is unaffected. Independent adversarial review: **PASS, zero
 blocking findings.**
@@ -62,8 +62,8 @@ Per stage, end to end, labelled with the instrument that proves it:
   B-it1) — it is the **distributed cost of the standard Arrow framing** (per-block metadata message +
   `LargeBinary` offsets-prepend + recv-side bookkeeping), bounded to the widest String cell. Default
   `shm_arrow_lean_extract=0` (D-HC-0208): ship the standard-API path; lean is a tested alternative for the
-  capable-NIC future. (Surfaced finding: `ColumnString::validateAdoptedOffsets()` is **14.4%** of consumer
-  CPU — a safety scan common to all adopt transports, a future vectorization candidate.)
+  capable-NIC future. (Surfaced finding: `ColumnString::validateAdoptedOffsets()` is ~12–14% of consumer
+  CPU — a safety scan common to all adopt transports — actioned in **B-it5** below.)
 - **B-it4 — send-side `MSG_ZEROCOPY` (L0015): MEASURED NEGATIVE (the pre-registered loopback null).** Every
   `SO_EE_ORIGIN_ZEROCOPY` completion carries `SO_EE_CODE_ZEROCOPY_COPIED` (zc_copied==zc_notifs 100%) → the
   kernel defers a copy; msg_zerocopy is **+7.3% SLOWER** than io_uring-send on Q24. The authoritative
@@ -71,6 +71,14 @@ Per stage, end to end, labelled with the instrument that proves it:
 - **B-it1 — producer 1-userspace-copy (L0016): CONFIRMED.** The serialize is one concat pass (profile +
   code-structure + wire bytes); the producer is deform-bound; the serialize copy == 1/block, the mirror of
   bespoke's scratch copy.
+- **B-it5 — drop the adopted-offsets monotonicity scan (L0017, D-HC-0209): CPU WIN, wall-neutral.** The
+  trusted same-codebase producer makes `ColumnString::validateAdoptedOffsets()` (the O(rows) scan,
+  ~12–14% of consumer CPU) unnecessary; gated behind `shm_adopt_validate_offsets` (default OFF; the O(1)
+  `offsets[0]==0` sentinel stays). Measured: `cons_user` **−200 ms (−31%)** on CB Q24 (perf: 12.39% →
+  **absent**); **wall −0.8% (within noise)** — like B-it3, the freed CPU is overlapped with the dominant
+  recv copy (whose share grows 35%→41%), so it is a real CPU/energy win that is wall-neutral on this
+  recv-bound loopback cell (would help the wall on a capable NIC / a CPU-bound query). `verify_offload`
+  137/137, no DIFF; reversible (set =1 for an untrusted producer).
 
 ## 4. Performance: W=8, arrow-adopt vs bespoke-TCP vs SHM-adopt (N=5, idle host, noise band `max(5%,1σ)`)
 | cell | arrow-adopt | bespoke-tcp | SHM-adopt | arrow vs tcp | verdict |

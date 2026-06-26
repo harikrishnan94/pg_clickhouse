@@ -697,3 +697,43 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   deform-directly-into-the-Arrow-body -- 1 copy heap->body, skipping the column buffer -- is NOT
   implemented and is the same as for bespoke; it is a separate future optimization, out of scope.)
 - **Verdict:** DONE (copy-budget row 1 confirmed by profile + code-structure + wire bytes).
+
+---
+
+### L0017 — Branch B iteration 5: drop the adopted-offsets monotonicity scan — a real CPU win, wall-neutral (recv-bound)  [branch B]  [iteration 5]  2026-06-26
+- **Goal (pre-registered, B-it5 amendment; user request):** `ColumnString::validateAdoptedOffsets()` was
+  14.4% of consumer CPU (L0014) — an O(rows) monotonicity + terminal-offset scan run on every adopted
+  String column by ALL adopt transports. The producer is a trusted same-codebase PG bgworker → drop it.
+  Predicted: `cons_user` −~14%; wall UNCERTAIN (recv-bound — measure, don't assume).
+- **What I did (CH):** new setting `shm_adopt_validate_offsets` (default **false** = dropped), plumbed via
+  StorageShm to `TcpStreamSource` (arrow lean:1015 / it2:883 / bespoke:578) + `PollableShmSource` (SHM:672);
+  each of the 4 `validateAdoptedOffsets()` calls gated on it. The cheap O(1) `offs[0]==0` leading sentinel
+  (in `adoptStringRaw` / the bespoke adopt) is UNCHANGED — only the O(n) full-array scan is dropped. =1
+  re-enables (A/B baseline + untrusted-producer escape hatch). gtest `DrainsWithOffsetValidationEnabled`
+  (validate=1) added.
+- **How verified (≥3 INDEPENDENT classes; FRESH same binary, idle):**
+  1. **Correctness:** `verify_offload TRANSPORT=arrow` (validate off, default) = **137/137 PASS, no DIFF**
+     (the producer emits valid offsets, so the scan was a no-op on results — dropping it changes nothing
+     observable). gtests **16/16** (incl. the validate-on test). The result-vs-native oracle still guards
+     correctness without the scan.
+  2. **End-to-end W=8 wall (median(sd) ms, N=5):** CB Q24 **validate-off 1234(17) vs validate-on 1244(18)
+     = −0.8% (WITHIN noise) → wall-NULL.** CB Q2 (no String cols) 407/407 parity (the scan is a no-op there).
+  3. **Consumer CPU split (query_log):** CB Q24 `cons_user` **validate-off 443 ms vs validate-on 643 ms =
+     −200 ms (−31%)** — the scan's CPU is genuinely removed.
+  4. **perf (evidence/bit5-perf-validate-on-off.txt):** validate-ON `validateAdoptedOffsets` **12.39%** of
+     consumer CPU → validate-OFF **ABSENT** (gate works). The kernel recv copy `__arch_copy_to_user` share
+     grows **35%→41%** as the freed CPU is removed — confirming the consumer is recv-copy-bound and the
+     ~200 ms was ~95% overlapped with the dominant recv (so the wall barely moves).
+- **Result/interpretation (prediction vs observation — MATCH to the pre-registered contingency):** dropping
+  the scan is a **real CPU/energy win (−200 ms / −31% consumer user CPU on the String-heavy cell)** but a
+  **wall-NULL on this loopback host** (−0.8%, within noise) — because the consumer is kernel-recv-copy-bound
+  (~35–41%) and the freed CPU was overlapped with the recv. This is the SAME recv-bound dynamic as B-it3.
+  The drop is correct + worth it (the user's call; the CPU/energy is real and instrument-proven; it WOULD
+  help the wall on a capable NIC where recv is not the bottleneck, or on a CPU-bound query). Honest: it does
+  NOT speed up the CB Q24 wall on this host.
+- **Safety (D-HC-0209):** the scan was the OOB-read guard for adopted String offsets; dropping it trades a
+  clean throw for a potential segfault ON A PRODUCER BUG. Mitigations: trusted same-codebase producer; the
+  O(1) `offs[0]==0` sentinel stays; the result-vs-native oracle catches a bad-offset corruption as a DIFF;
+  reversible via `shm_adopt_validate_offsets=1`.
+- **Verdict:** DONE as iteration 5 — the scan is dropped (default off), correct (137/137, no DIFF), a
+  measured −200 ms/−31% consumer-CPU win, wall-neutral on the recv-bound loopback cell (honestly reported).

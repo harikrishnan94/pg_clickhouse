@@ -338,3 +338,31 @@ selectable (`shm_arrow_lean_extract=1`) for the real-NIC future and for A/B meas
 measured loopback benefit. (b) Revert the lean path entirely — rejected: it is correct, tested, and a
 documented alternative whose elimination of the per-block construction is real (perf-proven) and relevant to
 the capable-NIC future; keeping it OFF-by-default preserves the option at no imposed cost.
+
+## D-HC-0209 — drop `validateAdoptedOffsets` by default (`shm_adopt_validate_offsets=0`); trusted producer
+**Date:** 2026-06-26 (user request). **Context:** Branch B iteration 5 (METHODOLOGY-LOG L0017). The L0014
+perf surfaced `ColumnString::validateAdoptedOffsets()` — an O(rows) scan that the adopted String offsets are
+monotonically non-decreasing + the terminal offset equals the chars buffer size — as **~12–14% of consumer
+CPU** on the String-heavy `SELECT *` cell, run by ALL adopt transports (SHM / bespoke `tcp:` / `arrow:`).
+**Decision:** gate it behind `shm_adopt_validate_offsets` (default **false** = dropped). The producer is a
+trusted, same-codebase PG background worker that lays out monotonic offsets by construction, so the runtime
+re-validation is unnecessary overhead. **Measured (L0017):** dropping it removes **−200 ms / −31% of
+consumer user CPU** on CB Q24 (perf: 12.39% → absent); the wall is unchanged (−0.8%, within noise) because
+the consumer is kernel-recv-copy-bound and the freed CPU was overlapped — a real CPU/energy win that is
+wall-neutral on this loopback host (would help the wall on a capable NIC / a CPU-bound query). Correctness
+unaffected: `verify_offload arrow` 137/137, no new DIFF.
+**Safety tradeoff (accepted, explicit):** the scan is the OOB-read guard for adopted String offsets — a
+non-monotonic offset would make `sizeAt` underflow and a downstream read go out of bounds; dropping it
+trades a clean `SHM_BUFFER_LAYOUT_INVALID` throw for a potential segfault **on a producer bug** (not on
+correct data). **Mitigations:** (a) the producer is same-codebase + trusted; (b) the cheap O(1)
+`offsets[0]==0` leading-sentinel check (which makes the `&arrow_offsets[1]` alias sound) is STILL always
+performed in `adoptStringRaw` / the bespoke adopt; (c) the harness result-vs-native oracle catches any
+bad-offset corruption as a `DIFF` on any correct test; (d) **reversible** — set
+`shm_adopt_validate_offsets=1` to restore the full monotonicity scan (defense-in-depth for an untrusted
+producer or when debugging a producer that emits malformed offsets). The method + its throw-on-bad-data are
+still unit-tested directly (`gtest_adoption_layer`).
+**Alternatives.** (a) Hard removal — rejected: loses the reversible safety escape hatch + the same-binary
+A/B baseline. (b) Debug-build-only (`chassert`) — rejected: would not let an operator re-enable it in a
+release build for an untrusted-producer deployment, and complicates the A/B measurement on the `reldeb`
+binary. (c) Vectorize the scan instead of dropping it — a future option if it is ever re-enabled by default;
+out of scope given the user's trusted-producer decision.

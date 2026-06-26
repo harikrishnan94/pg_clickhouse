@@ -278,3 +278,34 @@ As originally pre-registered above (mechanism #2): implement `IORING_OP_SEND_ZC`
 errqueue completion; prove the loopback **deferred copy** via the `SO_EE_CODE_ZEROCOPY_COPIED` flag (an honest
 null — no wall win on loopback by design). Plus **B-it1** producer 1-userspace-copy confirmation (a SERIALIZE
 per-block copy counter == 1/block).
+
+---
+
+## Amendment 2026-06-26 (B-it5) — drop the adopted-offsets monotonicity scan (trusted producer)
+**Trigger:** the L0014 perf surfaced `ColumnString::validateAdoptedOffsets()` as **14.4% of consumer CPU**
+on the String-heavy CB Q24 — a scalar O(rows) monotonicity + terminal-offset scan run on every adopted
+String column by ALL adopt transports (bespoke tcp:578, arrow it2:883 / lean:1015, SHM:672). User decision:
+the producer is trusted (same-codebase pg_clickhouse bgworker), so drop it.
+
+### B-it5 — gate validateAdoptedOffsets behind `shm_adopt_validate_offsets` (default OFF)
+- **Hypothesis:** the O(n) monotonicity scan is pure consumer CPU on the chunk-production path; dropping it
+  removes ~14% of consumer CPU on String-heavy cells. The O(1) `offs[0]==0` leading-sentinel check (in
+  `adoptStringRaw`/the bespoke adopt) STAYS — only the full-array scan is dropped.
+- **Mechanism:** new `Bool` setting `shm_adopt_validate_offsets` (default false) plumbed via StorageShm to
+  `TcpStreamSource` + `PollableShmSource`; each of the 4 `validateAdoptedOffsets()` call sites is gated on
+  it. Default off = dropped (the user's call); =1 re-enables (A/B baseline + paranoid/untrusted-producer
+  escape hatch). The method itself stays (still unit-tested directly in `gtest_adoption_layer`).
+- **Predicted magnitude:** `cons_user` drops by ~the validateAdoptedOffsets share (~14% of consumer CPU
+  on CB Q24). **Wall: UNCERTAIN — measure, do not assume.** The consumer is recv-copy-bound (~35%, L0014);
+  as B-it3 showed, removing consumer CPU does not fully translate to wall on a bandwidth-bound cell. Predict
+  a PARTIAL wall win on CB Q24 (0…~14%); fixed-width cells unaffected (few/no String columns). **Contingency:**
+  if the wall does not move (recv-bound), it is a CPU/energy win only — still honors the drop, reported honestly.
+- **Safety tradeoff (→ D-HC-0209):** the scan is the OOB-read guard for adopted String offsets (a
+  non-monotonic offset → `sizeAt` underflow → OOB). Dropping it trades a clean throw for a potential
+  segfault ON A PRODUCER BUG. Mitigations: (a) trusted same-codebase producer; (b) the O(1) `offs[0]==0`
+  sentinel stays; (c) the harness result-vs-native oracle catches a bad-offset corruption as a DIFF on any
+  correct test; (d) reversible via `shm_adopt_validate_offsets=1`.
+- **Instruments (≥3):** (1) end-to-end W=8 wall — A/B validate-off vs validate-on, SAME binary, CB Q24 +
+  a fixed-width cell, median(sd) N≥5; (2) consumer CPU split (`cons_user`/`cons_sys`, query_log); (3) perf —
+  `validateAdoptedOffsets` ABSENT from the consumer profile when off. Correctness gate: `verify_offload
+  TRANSPORT=arrow` (validate off, default) 137/137 + gtests.
