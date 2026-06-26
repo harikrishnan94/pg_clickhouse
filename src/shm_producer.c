@@ -45,6 +45,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <linux/errqueue.h>    /* Branch B B-it4: sock_extended_err + SO_EE_* zero-copy completion flags */
 
 /* --------------------------------------------------------------------- */
 /* Wire layout — byte-for-byte mirror of ClickHouse Wire/Layout.h (ABI v1).
@@ -233,6 +234,18 @@ struct ShmProducer {
     uint64_t   tcp_iouring_sends;   /* logical tcp_send_all calls taken via io_uring */
     uint64_t   tcp_blocking_sends;  /* logical tcp_send_all calls taken via blocking send() */
     uint64_t   tcp_send_bytes;      /* total bytes handed to tcp_send_all (header+schema+payloads) */
+    /* Branch B (B-it4): MSG_ZEROCOPY send-side measured-null. With SO_ZEROCOPY set on tcp_conn_fd,
+     * each send(MSG_ZEROCOPY) is acknowledged by an SO_EE_ORIGIN_ZEROCOPY errqueue completion whose
+     * SO_EE_CODE_ZEROCOPY_COPIED flag, set on this loopback/NIC-less host, proves the DEFERRED COPY
+     * (a pessimization, not an elimination). tcp_zc_seq_* mirror the kernel's per-socket zerocopy
+     * sequence counter so the send buffer is reused only after the kernel releases it. */
+    uint64_t   tcp_zc_sends;            /* send(MSG_ZEROCOPY) calls issued */
+    uint64_t   tcp_zc_notifs;           /* SO_EE_ORIGIN_ZEROCOPY completions drained */
+    uint64_t   tcp_zc_copied;           /* completions with SO_EE_CODE_ZEROCOPY_COPIED (deferred copy) */
+    uint32_t   tcp_zc_seq_next;         /* next send's zerocopy seq (mirrors the kernel counter) */
+    uint32_t   tcp_zc_seq_acked;        /* highest completed seq drained off the errqueue */
+    bool       tcp_zc_seq_acked_valid;  /* tcp_zc_seq_acked holds a real value */
+    bool       tcp_zc_sockopt_set;      /* SO_ZEROCOPY applied to tcp_conn_fd (else fall back to copy) */
 #ifdef PGCH_USE_LIBURING
     struct io_uring tcp_ring;
     bool       tcp_ring_ready;
@@ -641,14 +654,175 @@ tcp_send_all_iouring(ShmProducer *p, const void *buf, size_t n)
 }
 #endif /* PGCH_USE_LIBURING */
 
+#ifndef SOL_IP
+#define SOL_IP IPPROTO_IP
+#endif
+
 /*
- * Send-all dispatcher: io_uring (Branch 0 default) when selected + available, else blocking.
- * The selection is per-stream (snapshotted into the worker header from the backend GUC).
+ * Branch B (B-it4): reap all currently-ready SO_EE_ORIGIN_ZEROCOPY completions off MSG_ERRQUEUE
+ * (non-blocking -- returns when the queue is momentarily empty), releasing the kernel's pin on the
+ * sent pages so subsequent sends do not hit ENOBUFS (RLIMIT_MEMLOCK). Counts completions and -- the
+ * measured-null proof -- the ones carrying SO_EE_CODE_ZEROCOPY_COPIED (set on this loopback host: the
+ * kernel deferred a copy). Advances tcp_zc_seq_acked to the highest completed sequence seen.
+ */
+static void
+tcp_zc_reap(ShmProducer *p)
+{
+    for (;;)
+    {
+        struct msghdr msg;
+        struct cmsghdr *cm;
+        char ctrl[256];
+        ssize_t r;
+
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_control = ctrl;
+        msg.msg_controllen = sizeof(ctrl);
+        r = recvmsg(p->tcp_conn_fd, &msg, MSG_ERRQUEUE);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return;   /* errqueue momentarily empty */
+            ereport(ERROR, (errcode_for_file_access(),
+                            errmsg("pg_clickhouse: MSG_ERRQUEUE recvmsg failed: %m")));
+        }
+        for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm))
+        {
+            struct sock_extended_err *serr;
+
+            if (!((cm->cmsg_level == SOL_IP && cm->cmsg_type == IP_RECVERR) ||
+                  (cm->cmsg_level == SOL_IPV6 && cm->cmsg_type == IPV6_RECVERR)))
+                continue;
+            serr = (struct sock_extended_err *) CMSG_DATA(cm);
+            if (serr->ee_origin != SO_EE_ORIGIN_ZEROCOPY)
+                continue;
+            p->tcp_zc_notifs++;
+            if (serr->ee_code & SO_EE_CODE_ZEROCOPY_COPIED)
+                p->tcp_zc_copied++;
+            /* ee_data is the highest sequence number in this (possibly coalesced) completion range. */
+            if (!p->tcp_zc_seq_acked_valid || (int32_t) (serr->ee_data - p->tcp_zc_seq_acked) > 0)
+            {
+                p->tcp_zc_seq_acked = serr->ee_data;
+                p->tcp_zc_seq_acked_valid = true;
+            }
+        }
+    }
+}
+
+/*
+ * Block (reaping + polling the errqueue) until the kernel has released every send up to `target_seq`
+ * (the last send's zerocopy sequence), so the just-sent buffer is safe for the caller to reuse.
+ */
+static void
+tcp_zc_drain_until(ShmProducer *p, uint32_t target_seq)
+{
+    for (;;)
+    {
+        struct pollfd pfd;
+
+        tcp_zc_reap(p);
+        if (p->tcp_zc_seq_acked_valid && (int32_t) (p->tcp_zc_seq_acked - target_seq) >= 0)
+            return;
+        CHECK_FOR_INTERRUPTS();
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                   "abandoning TCP stream", p->origin_pid)));
+        pfd.fd = p->tcp_conn_fd; pfd.events = POLLERR; pfd.revents = 0;
+        (void) poll(&pfd, 1, 100);
+    }
+}
+
+/* Bound the pages pinned by a single send(MSG_ZEROCOPY) well under RLIMIT_MEMLOCK (8 MiB here), so the
+ * accounting limit is not exceeded; combined with reap-after-each-send, outstanding stays ~1 chunk. */
+#define PGCH_ZC_SEND_CHUNK (1024 * 1024)
+
+/*
+ * Branch B (B-it4): send `n` bytes via send(MSG_ZEROCOPY) in <=PGCH_ZC_SEND_CHUNK chunks, reaping the
+ * zerocopy completions as it goes, then block until the kernel releases the buffer so the caller may
+ * reuse it next block. ENOBUFS (too many outstanding pins) is handled by draining + retrying, NOT a
+ * hard error. If SO_ZEROCOPY was not enabled on the fd, fall back to the plain blocking copying send.
+ */
+static void
+tcp_send_all_msg_zerocopy(ShmProducer *p, const void *buf, size_t n)
+{
+    const char *ptr = (const char *) buf;
+    uint32_t last_seq = 0;
+    bool sent_zc = false;
+
+    if (!p->tcp_zc_sockopt_set)
+    {
+        tcp_send_all_blocking(p, buf, n);
+        return;
+    }
+
+    while (n > 0)
+    {
+        size_t chunk = n < (size_t) PGCH_ZC_SEND_CHUNK ? n : (size_t) PGCH_ZC_SEND_CHUNK;
+        ssize_t w;
+
+        CHECK_FOR_INTERRUPTS();
+        w = send(p->tcp_conn_fd, ptr, chunk, MSG_NOSIGNAL | MSG_ZEROCOPY);
+        if (w > 0)
+        {
+            ptr += w; n -= (size_t) w;
+            last_seq = p->tcp_zc_seq_next++;   /* mirrors the kernel's per-socket zerocopy counter */
+            p->tcp_zc_sends++;
+            sent_zc = true;
+            tcp_zc_reap(p);   /* release pinned pages so the next send does not hit ENOBUFS */
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && errno == ENOBUFS)
+        {
+            /* Outstanding zerocopy pins hit RLIMIT_MEMLOCK -- block until they are released, then retry
+             * (the chunk cap guarantees a single send fits once nothing else is outstanding). */
+            if (sent_zc)
+                tcp_zc_drain_until(p, last_seq);
+            else if (origin_backend_dead(p))
+                ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                       "abandoning TCP stream", p->origin_pid)));
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            struct pollfd pfd;
+
+            if (origin_backend_dead(p))
+                ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                       "abandoning TCP stream", p->origin_pid)));
+            pfd.fd = p->tcp_conn_fd; pfd.events = POLLOUT; pfd.revents = 0;
+            (void) poll(&pfd, 1, 100);
+            continue;
+        }
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                   "abandoning TCP stream", p->origin_pid)));
+        ereport(ERROR, (errcode_for_file_access(),
+                        errmsg("pg_clickhouse: MSG_ZEROCOPY send to consumer failed: %m")));
+    }
+
+    /* Wait for the kernel to release this buffer before the caller reuses it. On loopback the deferred
+     * copy completes promptly with SO_EE_CODE_ZEROCOPY_COPIED set -- the honest measured null. */
+    if (sent_zc)
+        tcp_zc_drain_until(p, last_seq);
+}
+
+/*
+ * Send-all dispatcher: msg_zerocopy (Branch B B-it4) / io_uring (Branch 0 default) when selected +
+ * available, else blocking. The selection is per-stream (snapshotted into the worker header).
  */
 static void
 tcp_send_all(ShmProducer *p, const void *buf, size_t n)
 {
     p->tcp_send_bytes += n;
+    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY)
+    {
+        tcp_send_all_msg_zerocopy(p, buf, n);
+        return;
+    }
 #ifdef PGCH_USE_LIBURING
     if (p->tcp_send_method == PGCH_TCP_SEND_IOURING && tcp_iouring_ensure(p))
     {
@@ -701,6 +875,19 @@ tcp_accept_conn(ShmProducer *p)
     {
         int sndbuf = 32 * 1024 * 1024;
         (void) setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+    /* Branch B (B-it4): enable SO_ZEROCOPY so send(MSG_ZEROCOPY) attempts a zero-copy send and posts
+     * an SO_EE_ORIGIN_ZEROCOPY completion to the errqueue. Only when that send method is selected (it
+     * changes completion semantics -- every such send MUST be drained). If unavailable, the send path
+     * falls back to a plain copying send (tcp_zc_sockopt_set stays false). */
+    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY)
+    {
+        int z = 1;
+        if (setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_ZEROCOPY, &z, sizeof(z)) == 0)
+            p->tcp_zc_sockopt_set = true;
+        else
+            ereport(LOG, (errmsg("pg_clickhouse: SO_ZEROCOPY unavailable (%m); MSG_ZEROCOPY send "
+                                 "falls back to a plain copying send")));
     }
 }
 
@@ -1154,6 +1341,15 @@ shm_producer_tcp_send_stats(const ShmProducer *p, uint64_t *iouring_sends,
     if (iouring_sends)  *iouring_sends = p->tcp_iouring_sends;
     if (blocking_sends) *blocking_sends = p->tcp_blocking_sends;
     if (send_bytes)     *send_bytes = p->tcp_send_bytes;
+}
+
+void
+shm_producer_tcp_zc_stats(const ShmProducer *p, uint64_t *zc_sends,
+                          uint64_t *zc_notifs, uint64_t *zc_copied)
+{
+    if (zc_sends)  *zc_sends = p->tcp_zc_sends;
+    if (zc_notifs) *zc_notifs = p->tcp_zc_notifs;
+    if (zc_copied) *zc_copied = p->tcp_zc_copied;
 }
 
 void

@@ -83,6 +83,11 @@ typedef enum PgchTcpSendMethod
 {
     PGCH_TCP_SEND_BLOCKING = 0,
     PGCH_TCP_SEND_IOURING = 1,
+    /* Branch B (B-it4): send(MSG_ZEROCOPY) with SO_ZEROCOPY + errqueue completion handling. On this
+     * loopback/NIC-less host this is a MEASURED NULL by design -- every completion carries
+     * SO_EE_CODE_ZEROCOPY_COPIED (the kernel defers a copy), proving zero-copy send is a pessimization,
+     * not an elimination, here; the real elimination is the capable-NIC payoff. */
+    PGCH_TCP_SEND_MSG_ZEROCOPY = 2,
 } PgchTcpSendMethod;
 extern int   pgch_tcp_send_method;
 

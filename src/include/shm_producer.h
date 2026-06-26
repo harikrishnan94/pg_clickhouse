@@ -167,4 +167,15 @@ extern void shm_producer_tcp_send_stats(const ShmProducer *p,
                                         uint64_t *blocking_sends,
                                         uint64_t *send_bytes);
 
+/*
+ * Branch B (B-it4) observability: MSG_ZEROCOPY send accounting -- how many send(MSG_ZEROCOPY) calls
+ * were issued, how many SO_EE_ORIGIN_ZEROCOPY completions were drained, and how many of those carried
+ * SO_EE_CODE_ZEROCOPY_COPIED. On a loopback/NIC-less host zc_copied == zc_notifs proves the deferred
+ * copy (the measured null). Any out-param may be NULL. All zero unless tcp_send_method=msg_zerocopy.
+ */
+extern void shm_producer_tcp_zc_stats(const ShmProducer *p,
+                                      uint64_t *zc_sends,
+                                      uint64_t *zc_notifs,
+                                      uint64_t *zc_copied);
+
 #endif /* PG_CLICKHOUSE_SHM_PRODUCER_H */

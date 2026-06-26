@@ -68,9 +68,10 @@ static const struct config_enum_entry pgch_shm_transport_options[] = {
 
 /* TCP producer send submission method (Branch 0): io_uring (default) or blocking. */
 static const struct config_enum_entry pgch_tcp_send_method_options[] = {
-    {"io_uring", PGCH_TCP_SEND_IOURING,  false},
-    {"iouring",  PGCH_TCP_SEND_IOURING,  true},   /* hidden alias */
-    {"blocking", PGCH_TCP_SEND_BLOCKING, false},
+    {"io_uring",     PGCH_TCP_SEND_IOURING,      false},
+    {"iouring",      PGCH_TCP_SEND_IOURING,      true},   /* hidden alias */
+    {"blocking",     PGCH_TCP_SEND_BLOCKING,     false},
+    {"msg_zerocopy", PGCH_TCP_SEND_MSG_ZEROCOPY, false},  /* Branch B B-it4: SO_ZEROCOPY + errqueue */
     {NULL, 0, false},
 };
 
@@ -1175,12 +1176,16 @@ pgch_shm_offload_init(void)
                              pgch_shm_transport_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
     DefineCustomEnumVariable("pg_clickhouse.tcp_send_method",
-                             "For the 'tcp' transport, how the producer submits its socket send: "
+                             "For the 'tcp'/'arrow' transports, how the producer submits its socket send: "
                              "'io_uring' (default; one IORING_OP_SEND per buffer via a per-worker "
-                             "io_uring ring -- the substrate for zero-copy send) or 'blocking' (the "
-                             "Phase-1 blocking send() path). Snapshotted into the streaming-worker "
-                             "header so the background worker honors the backend session's choice; "
-                             "falls back to blocking if the build lacks liburing or ring init fails.",
+                             "io_uring ring -- the substrate for zero-copy send), 'blocking' (the "
+                             "Phase-1 blocking send() path), or 'msg_zerocopy' (Branch B B-it4: "
+                             "send(MSG_ZEROCOPY) with SO_ZEROCOPY + errqueue completion handling -- a "
+                             "MEASURED NULL on this loopback host, where every completion carries "
+                             "SO_EE_CODE_ZEROCOPY_COPIED proving the kernel defers a copy). Snapshotted "
+                             "into the streaming-worker header so the background worker honors the "
+                             "backend session's choice; falls back to blocking if the build lacks "
+                             "liburing or ring init fails (io_uring) or SO_ZEROCOPY is unavailable.",
                              NULL, &pgch_tcp_send_method, PGCH_TCP_SEND_IOURING,
                              pgch_tcp_send_method_options, PGC_USERSET, 0, NULL, NULL, NULL);
 

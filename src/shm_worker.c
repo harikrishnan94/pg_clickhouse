@@ -613,12 +613,18 @@ pgch_shm_worker_main(Datum main_arg)
             if (hdr->transport != PGCH_PRODUCER_TRANSPORT_SHM)
             {
                 uint64 iou = 0, blk = 0, sb = 0;
+                uint64 zc_s = 0, zc_n = 0, zc_c = 0;
 
                 shm_producer_tcp_send_stats(producer, &iou, &blk, &sb);
+                shm_producer_tcp_zc_stats(producer, &zc_s, &zc_n, &zc_c);
                 elog(LOG, "pg_clickhouse shm tcp-send: method=%s iouring_sends=" UINT64_FORMAT
-                          " blocking_sends=" UINT64_FORMAT " send_bytes=" UINT64_FORMAT,
-                     iou > 0 && blk == 0 ? "io_uring" : (blk > 0 && iou == 0 ? "blocking" : "mixed"),
-                     iou, blk, sb);
+                          " blocking_sends=" UINT64_FORMAT " send_bytes=" UINT64_FORMAT
+                          " zc_sends=" UINT64_FORMAT " zc_notifs=" UINT64_FORMAT
+                          " zc_copied=" UINT64_FORMAT,
+                     zc_s > 0 ? "msg_zerocopy"
+                              : (iou > 0 && blk == 0 ? "io_uring"
+                                                     : (blk > 0 && iou == 0 ? "blocking" : "mixed")),
+                     iou, blk, sb, zc_s, zc_n, zc_c);
             }
         }
         else

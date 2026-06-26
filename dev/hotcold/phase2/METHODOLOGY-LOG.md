@@ -615,3 +615,53 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   "mechanism explains the shortfall"). CONTINUE → flip the default (D-HC-0208), then B-it4 (send-zc
   measured-null) + B-it1 (producer 1-copy confirm); validateAdoptedOffsets vectorization is a candidate
   bonus real-win iteration if time permits.
+
+---
+
+### L0015 — Branch B iteration 4: send-side MSG_ZEROCOPY — measured NEGATIVE result (honest loopback null)  [branch B]  [iteration 4]  2026-06-26
+- **Goal / hypothesis (pre-registered, 00-PRE-REGISTRATION mech #2 / B-it4):** implement zero-copy kernel
+  send + handle the completion, and PROVE the loopback **deferred copy** via the `SO_EE_CODE_ZEROCOPY_COPIED`
+  errqueue flag (NOT "absence of copy_from_user"). Predicted: a measured NULL/NEGATIVE on loopback (the
+  kernel defers a copy ⇒ no elimination ⇒ no wall win); the real elimination is the capable-NIC payoff.
+- **What I did (pg_clickhouse, producer):** added `tcp_send_method='msg_zerocopy'` (PgchTcpSendMethod enum +
+  GUC option). `tcp_accept_conn` sets `SO_ZEROCOPY` on the conn fd (only for this method). New
+  `tcp_send_all_msg_zerocopy` sends in <=1 MiB chunks via `send(MSG_NOSIGNAL|MSG_ZEROCOPY)`, reaping the
+  `SO_EE_ORIGIN_ZEROCOPY` errqueue completions after each chunk (`tcp_zc_reap`) + a blocking
+  `tcp_zc_drain_until` before the buffer is reused next block (buffer-reuse safety). ENOBUFS (outstanding
+  pins hit `RLIMIT_MEMLOCK`=8 MiB) is handled by drain-then-retry, NOT a hard error. Counters
+  `tcp_zc_{sends,notifs,copied}` + `shm_producer_tcp_zc_stats` + the worker tcp-send LOG. (The 1 MiB chunk
+  + reap-after-each keeps outstanding ~1 chunk << the 8 MiB lock limit — the first naive impl sent the whole
+  ~26 MB body in one send() and crashed every worker with ENOBUFS; root-caused via the PG log, fixed.)
+- **How verified (≥3 INDEPENDENT classes; FRESH same session, idle load <0.6):**
+  1. **errqueue flag (the authoritative send-side proof — per spec, NOT the PMU/profile):** every
+     `SO_EE_ORIGIN_ZEROCOPY` completion carries `SO_EE_CODE_ZEROCOPY_COPIED`. Manual CB Q24 offload (4
+     workers): per worker `zc_sends=279 zc_notifs=247 zc_copied=247` (and 281/238/238, 275/238/238,
+     277/238/238) — **zc_copied == zc_notifs (100%)**. Sweep CB Q2 (1 worker): `zc_sends=41 zc_notifs=41
+     zc_copied=41`. (zc_sends >= zc_notifs because the kernel coalesces completion ranges.) → on this
+     NIC-less loopback host the kernel **defers a copy on every zero-copy send**: a pessimization, not an
+     elimination.
+  2. **End-to-end W=8 wall (median(sd) ms, N=5):** CB Q24 **msg_zerocopy 1335(8) vs io_uring-send 1244(9)
+     = +7.3% SLOWER** (above band → a measured NEGATIVE result). CB Q2 (little data) 407 vs 403 = ~parity.
+     The regression = the deferred kernel copy (same bytes copied as a plain send) PLUS the synchronous
+     zc-completion bookkeeping (per-chunk reap recvmsg + the end-of-buffer blocking drain). On loopback
+     MSG_ZEROCOPY cannot win (deferred copy is the floor) and the bookkeeping adds cost → net loss.
+  3. **Correctness:** the offload result is correct (`SELECT count(*),sum(length(URL)) ... = 646|118934`);
+     the sweep's per-cell `correct=exact` for both Q24 and Q2 (the MSG_ZEROCOPY data path streams identical
+     bytes — it changes only HOW the send buffer is handed to the kernel). No crash, no leak after the
+     ENOBUFS fix.
+- **Result (RAW):** zc_copied/zc_notifs = 100% (loopback deferred copy). Wall Q24 +7.3% vs io_uring-send.
+  Q2 parity. correct=exact.
+- **Interpretation (prediction vs observation — MATCH):** exactly the pre-registered honest null/negative.
+  The `SO_EE_CODE_ZEROCOPY_COPIED` flag is the definitive proof the loopback path copies (the spec's
+  required proof, not "absence of copy_from_user"). The capable-NIC path (no `copy_from_user`) is the
+  real-NIC north star, recorded for the future, NOT claimed here. A faster async zc (overlapping
+  completions) could shave the bookkeeping but still could not beat io_uring-send on loopback — the
+  deferred copy is the floor. So zero-copy SEND is a NO on this host, by design.
+- **Learnings:** (1) MSG_ZEROCOPY on loopback is a measured pessimization — the loopback success criterion
+  was a null, and it is met (proven, reported). (2) The send-side has no copy to eliminate on this host;
+  the producer's one userspace copy (the Arrow serialize, B-it1) + the kernel recv copy (B-it3, ~35%
+  consumer) are the real costs, neither closable on loopback. (3) RLIMIT_MEMLOCK bounds MSG_ZEROCOPY pinned
+  pages — large sends MUST be chunked + completions reaped, else ENOBUFS.
+- **Verdict:** DONE as iteration 4 (the pre-registered send-zc measured-null/negative, proven via
+  SO_EE_CODE_ZEROCOPY_COPIED + the +7.3% wall + exact correctness). DoD send-side item satisfied. CONTINUE →
+  B-it1 (producer 1-userspace-copy confirmation), then adversarial review + REPORT-branchB.md.
