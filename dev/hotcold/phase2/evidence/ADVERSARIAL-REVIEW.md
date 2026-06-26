@@ -159,3 +159,30 @@ spurious?" and "buffer-reuse corruption?" traps.
    the copy-budget. **DISPOSITION: DOCUMENTED** — a truly-fused deform-into-body is a separate future opt.
 
 **Outcome:** PASS. Finding #1 FIXED in-branch; #2 documented. Branch B is GREEN.
+
+---
+
+## Branch B — B-it5 (drop validateAdoptedOffsets, D-HC-0209) — 2026-06-26 — VERDICT: PASS (zero blocking)
+
+Focused independent reviewer (fresh context) attacked the single B-it5 gating change and re-ran its gates.
+
+**Confirmed sound:**
+- **All 4 call sites gated + default OFF everywhere:** TcpStreamSource.cpp:581 (bespoke) / :887 (arrow it2) /
+  :1020 (arrow lean) + PollableShmSource.cpp:675 (SHM) each wrapped in `if (validate_adopted_offsets)`;
+  Settings default `false`; wired via StorageShm to BOTH ctors; PollableShmSource init-list order matches
+  declaration (no `-Wreorder`); the O(1) `offsets[0]==0` sentinel (adoptStringRaw + lean + AdoptionLayer)
+  is UNCHANGED — only the O(n) scan is dropped. Reversibility is real (`=1` re-runs the genuine loop).
+- **Gates re-run:** unit_tests_dbms **16/16** (incl. `DrainsWithOffsetValidationEnabled`); verify_offload
+  **137/137 on ALL THREE default-OFF adopt transports** — `TRANSPORT=arrow` (it2+lean), `=adopt` (SHM),
+  `=tcp` (bespoke) — no DIFF, no holism regression.
+- **Numbers re-derive exactly:** Q24 wall off 1234(17) vs on 1244(18) = −0.80% (within the 35 ms noise band —
+  not a hidden regression, not an overclaimed win); cons_user 442.8 vs 642.5 ms = −31.1%; perf
+  validateAdoptedOffsets 12.39%→ABSENT, recv-copy share 35.47%→41.32%. L0017 is NOT spun ("Honest: it does
+  NOT speed up the CB Q24 wall on this host"); the wall null matches the pre-registered contingency.
+- **Safety disclosure (D-HC-0209) exemplary:** the OOB-on-producer-bug tradeoff + 4 mitigations + rejected
+  alternatives, not buried.
+
+**Non-blocking note:** the wall (−0.8%) landed at the bottom of the pre-registered "partial win 0…~14%" range
+(effectively the null contingency) — reported transparently, not spun.
+
+**Outcome:** PASS. B-it5 is GREEN.
