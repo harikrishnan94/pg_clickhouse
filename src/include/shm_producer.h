@@ -27,40 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/*
- * Wire column type tags. Values MUST match ClickHouse's
- * SharedMemoryWire::WireColumnType (Layout.h). Only the subset the producer
- * can emit is listed here.
- */
-typedef enum ShmWireType {
-    SHM_WIRE_UINT64 = 1,
-    SHM_WIRE_STRING = 2,
-    SHM_WIRE_INT8 = 3,
-    SHM_WIRE_INT16 = 4,
-    SHM_WIRE_INT32 = 5,
-    SHM_WIRE_INT64 = 6,
-    SHM_WIRE_UINT8 = 7,
-    SHM_WIRE_UINT16 = 8,
-    SHM_WIRE_UINT32 = 9,
-    SHM_WIRE_FLOAT32 = 10,
-    SHM_WIRE_FLOAT64 = 11,
-    SHM_WIRE_DATE = 12,     /* UInt16 storage */
-    SHM_WIRE_DATETIME = 13, /* UInt32 storage */
-    SHM_WIRE_DATE32 = 14,   /* Int32 storage  */
-    /*
-     * Fixed-width decimals. The on-wire value is the unscaled two's-complement
-     * little-endian integer; the SCALE is carried only in the type string
-     * ("Decimal(P, S)") that the ClickHouse consumer parses, never in the value
-     * buffer. SHM_WIRE_DECIMAL128's value buffer must be 16-byte aligned.
-     */
-    SHM_WIRE_DECIMAL32 = 15,  /* Int32 storage  */
-    SHM_WIRE_DECIMAL64 = 16,  /* Int64 storage  */
-    SHM_WIRE_DECIMAL128 = 17, /* Int128 storage, 16-byte aligned */
-    SHM_WIRE_DATETIME64 = 18, /* Int64 storage (Decimal64 ticks) */
-} ShmWireType;
-
-/* Returns the fixed-width element size in bytes, or 0 for String. */
-extern size_t shm_wire_fixed_width_size(ShmWireType t);
+#include "shm_wire.h"    /* ShmWireType + shm_wire_fixed_width_size (PG-free) */
 
 /*
  * One column's schema entry. `name` and `type_string` are the column name and

@@ -226,3 +226,66 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   flatbuffer headers, so `-Iinclude` is the only include flag needed.
 - **Verdict:** DONE (A1 green, committed). CONTINUE → A2 (`arrow:` transport-token plumbing) + A3
   (producer Arrow IPC serialize behind the `arrow:` token).
+
+---
+
+### L0007 — Branch A: producer Arrow IPC encoder module (TDD round-trip)  [branch A]  [iteration 1]  2026-06-26
+- **Goal / hypothesis:** A PG-free, standalone-testable producer-side serializer that turns the
+  already-deformed `ShmColumnPayload` buffers into standards-valid encapsulated Arrow IPC (Schema +
+  RecordBatch) via nanoarrow, viewing the buffers zero-copy (D-HC-0201/0202/0203/0207). Predicted: a
+  value-exact round trip across every Branch-A type family, decoded by nanoarrow's stock stream reader.
+- **What I did (files):**
+  - `src/include/shm_wire.h` (NEW, PG-free): relocated `ShmWireType` + made `shm_wire_fixed_width_size`
+    a `static inline` (shared by the bespoke serializer and the Arrow one, no value drift). Rewired
+    `src/include/shm_producer.h` (include it; drop the inline enum + extern) and `src/shm_producer.c`
+    (drop the now-inline definition).
+  - `src/include/shm_arrow.h` + `src/shm_arrow.c` (NEW, PG-free; guarded `#ifdef PGCH_USE_NANOARROW`):
+    `shm_arrow_encoder_create/destroy`, `shm_arrow_encode_schema`, `shm_arrow_encode_record_batch`,
+    `SHM_ARROW_EOS_MARKER`. Builds one `ArrowSchema` (struct of N children) once; per block builds a
+    hand-rolled C-Data-Interface `ArrowArray` whose child buffers point at the deformed buffers (only
+    extra work: prepend a `0` to the N END offsets to make Arrow's `N+1` LargeBinary offsets),
+    `ArrowArrayViewSetArray`s it, and emits via `ArrowIpcEncoderEncodeSchema`/`EncodeSimpleRecordBatch`
+    + `FinalizeBuffer(encapsulate=1)`. Type map per D-HC-0207 (raw uint16/uint32/int64 for
+    Date/DateTime/DateTime64; raw int32/int64 for Decimal32/64; FixedSizeBinary(16) for Decimal128;
+    LargeBinary for String).
+  - `dev/hotcold/phase2/tests/arrow_roundtrip_test.c` (NEW): the TDD test.
+  - `dev/hotcold/DECISIONS.md`: D-HC-0207 (wire = standard Arrow IPC stream; no bespoke handshake).
+- **How I did it (TDD):** wrote `arrow_roundtrip_test.c` first (7 columns: UInt64, String, Int32,
+  Float64, Date, DateTime, Decimal128) → built WITHOUT `shm_arrow.c` → **RED** (4 undefined refs, test
+  + nanoarrow decode API compiled clean). Implemented `shm_arrow.c` → debugged 2 crashes with gdb
+  (below) → **GREEN**.
+- **How verified (3 instrument classes):**
+  1. **Standalone round-trip gtest-equivalent:** `gcc -DPGCH_USE_NANOARROW … arrow_roundtrip_test.c
+     shm_arrow.c nanoarrow*.c` → encode Schema+RecordBatch, reassemble the IPC stream, decode via
+     nanoarrow's **stock** `ArrowIpcArrayStreamReader` → `ALL 3-row round trip across 7 columns PASSED`
+     (exit 0). Values + the LargeBinary strings + the 16-byte Decimal128 bytes all match.
+  2. **Extension build under -Wall -Werror:** `make -j32` compiles `src/shm_arrow.o` clean (a
+     `#pragma GCC diagnostic` brackets only the nanoarrow includes; my code stays -Wall -Werror) and
+     links it into `pg_clickhouse.so`.
+  3. **Bespoke regression oracle (the floor):** `verify_offload.sh TRANSPORT=tcp` — caught a real
+     LTO bug (below); after the fix, re-run = **PASS=137 FAIL=0** (`/tmp/bA_step2_verify2.log`).
+- **THE LTO BUG (gate-caught):** the first cut made `shm_wire_fixed_width_size` a `static inline` in
+  `shm_wire.h`. The local `.so` inlined it everywhere (no symbol), but `make install`'s rebuild under
+  `-flto=auto` *non-deterministically* out-of-lined a call into an **undefined external** symbol →
+  `dlopen` failed: "undefined symbol: shm_wire_fixed_width_size" (the two `.so`s had different md5s).
+  Fix: give it ONE real external definition in its own PG-free TU `src/shm_wire.c` (declared `extern`
+  in the header). Lesson: a cross-TU `static inline` in a header is an `-flto` footgun; prefer a single
+  out-of-line definition.
+- **THE BUGS (gdb-found, real entries):** (1) `ArrowBufferReset` calls `allocator.free()`
+  *unconditionally*; a calloc'd-zero buffer has a NULL free ptr, so a `create` failure → `destroy`
+  segfaulted at 0x0. Fix: `ArrowBufferInit(body/message)` BEFORE any goto-fail. (2)
+  `ArrowSchemaAllocateChildren` leaves each child `release==NULL` (released); `ArrowSchemaSetType` then
+  silently no-ops and `ArrowArrayViewInitFromSchema` rejects "released schema". Fix: `ArrowSchemaInit`
+  each child before setting its type. Also a TEST-only bug: the encoder reuses one output buffer, so the
+  schema bytes must be copied to the stream before encoding the record batch (documented contract).
+- **Interpretation:** the producer emits well-formed, value-exact Arrow IPC for all Branch-A types,
+  cross-decoded by an independent reader. The hand-built C-Data-Interface ArrowArray views the deformed
+  buffers with no copy; nanoarrow's single body concatenation is the one userspace serialize copy
+  (mirrors the bespoke scratch copy; Branch B fuses it).
+- **Learnings:** (1) nanoarrow's encoder requires the view be backed by a real `ArrowArray`
+  (`child->array->n_buffers`), so a hand-built C-ABI array + `ArrowArrayViewSetArray` is the zero-copy
+  feed path (not a bare hand-populated view). (2) `ArrowArrayViewSetArray`→ValidateDefault derives the
+  LargeBinary data-buffer size from the last offset, so the `N+1` offsets must be correct.
+- **Verdict:** DONE for the producer encoder module (round-trip green, builds clean). CONTINUE →
+  `arrow:` transport plumbing + wiring the encoder into `shm_producer.c` behind
+  `PGCH_PRODUCER_TRANSPORT_ARROW`.

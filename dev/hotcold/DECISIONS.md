@@ -274,3 +274,43 @@ Nullable recurse path.
 Resolved: single-copy-recv puts the bytes in a CH-heap buffer (lifetime fine), but the column stays in
 adopted PODArray mode (mutators throw), so the mutating callers still need a real owned column.
 
+## D-HC-0207 — `arrow:` wire = a standard Arrow IPC STREAM (Schema + RecordBatch* + EOS); no bespoke handshake/block headers
+**Date:** 2026-06-26
+**Decision.** The `arrow:<host>:<port>` transport (D-HC-0205) carries a **standard Apache Arrow IPC stream**
+— a Schema message, then one RecordBatch message per block, then the stream EOS marker (`0xFFFFFFFF`
+continuation + `0x00000000` length) — and **drops** the bespoke `TcpHandshakeHeader`/`TcpBlockHeader`
+framing entirely on this wire. This is what makes the bespoke `TcpFrame.h` *retire-able* on the Arrow path
+(intention 1): a third-party Arrow reader / Arrow Flight could consume the stream as-is.
+- **Producer** (`src/shm_arrow.c`, behind `PGCH_PRODUCER_TRANSPORT_ARROW`): builds one `ArrowSchema`
+  (struct of N children) from the column schema; per block builds a hand-rolled C-Data-Interface
+  `ArrowArray` whose child buffers point **zero-copy** at the already-deformed `ShmColumnPayload` buffers,
+  `ArrowArrayViewSetArray`s it, and emits `ArrowIpcEncoderEncodeSchema` (once) / `EncodeSimpleRecordBatch`
+  (per block) + `FinalizeBuffer(encapsulate=1)`; sends the encapsulated metadata then the body.
+- **Consumer**: recovers the **exact** CH types (Decimal scale, DateTime64 precision, Date-vs-UInt16 —
+  intentionally non-semantic Arrow per D-HC-0203) from the **`streamed_table()` SQL schema argument**, which
+  is authoritative and already in hand. The received Arrow Schema message is validated against that (field
+  count + per-field layout) — this replaces the bespoke handshake's `ShmSchemaEntry[]` cross-check.
+- **Per-block framing** = the Arrow IPC encapsulated message itself (`0xFFFFFFFF` + int32 metadata_size,
+  then metadata_size padded metadata bytes, then `bodyLength` body bytes). The consumer reads the small
+  metadata, parses it (Arrow C++ `arrow::ipc::ReadMessage`/`Message::Open`), then reads the body into the
+  to-be-adopted buffer — **exactly the Branch-B single-copy-recv shape** (small metadata read = parse, not a
+  data copy; body read = the one kernel copy).
+**Type mapping (Branch A, non-Nullable — the PG producer emits non-Nullable columns; the same
+`ShmColumnPayload` buffers as bespoke, so results are identical by construction).** Numerics → matching Arrow
+primitive; String → `LargeBinary` (int64 offsets; producer builds the `N+1` offsets `[0,end0..endN-1]` from
+its `N` END offsets); Date/DateTime/DateTime64 → raw `uint16`/`uint32`/`int64` (D-HC-0203);
+Decimal32/64 → raw `int32`/`int64`; **Decimal128 → Arrow `FixedSizeBinary(16)`** (16 raw 2's-complement LE
+bytes == CH `Decimal128` PODArray; avoids parsing P/S and keeps it zero-copy & non-semantic, recovered from
+the SQL schema). Nullable (validity bitmap ↔ CH null_map) is a **consumer + gtest** capability for a future
+Arrow producer with nulls (+ the D-HC-0206 `ColumnNullable` recurse), not exercised by the current PG
+producer.
+**Alternatives.** Keep the bespoke `TcpHandshakeHeader` + wrap each block payload in a bespoke
+`TcpBlockHeader` carrying an Arrow message — rejected (the bespoke frame is exactly what intention 1 retires;
+a third party couldn't read the wire). Send no Schema message and rebuild the `arrow::Schema` on the consumer
+from CH types — rejected (forfeits a valid standalone Arrow IPC stream / third-party readability for the
+trivial cost of one Schema message per stream).
+**Consumer source class.** Extend `TcpStreamSource` with a wire mode (Bespoke|Arrow) rather than a new
+class: the async recv / wake-bridge / `onCancel` / `RetainToken` / charge machinery is wire-agnostic and was
+hardened in Branch 0 — only `tryRecvBlock` (framing) and `buildChunkFromPayload` (decode) get an Arrow
+branch. Avoids duplicating ~400 lines of bug-prone async code.
+

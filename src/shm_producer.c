@@ -228,22 +228,8 @@ struct ShmProducer {
 /* Small helpers */
 /* --------------------------------------------------------------------- */
 
-size_t
-shm_wire_fixed_width_size(ShmWireType t)
-{
-    switch (t)
-    {
-        case SHM_WIRE_INT8:  case SHM_WIRE_UINT8:  return 1;
-        case SHM_WIRE_INT16: case SHM_WIRE_UINT16: case SHM_WIRE_DATE: return 2;
-        case SHM_WIRE_INT32: case SHM_WIRE_UINT32: case SHM_WIRE_FLOAT32:
-        case SHM_WIRE_DATETIME: case SHM_WIRE_DATE32: case SHM_WIRE_DECIMAL32: return 4;
-        case SHM_WIRE_INT64: case SHM_WIRE_UINT64: case SHM_WIRE_FLOAT64:
-        case SHM_WIRE_DECIMAL64: case SHM_WIRE_DATETIME64: return 8;
-        case SHM_WIRE_DECIMAL128: return 16;
-        case SHM_WIRE_STRING: return 0;
-    }
-    return 0;
-}
+/* shm_wire_fixed_width_size() is now a static inline in shm_wire.h (PG-free,
+ * shared with the Arrow serializer shm_arrow.c). */
 
 static inline size_t
 align_up(size_t v, size_t a)
