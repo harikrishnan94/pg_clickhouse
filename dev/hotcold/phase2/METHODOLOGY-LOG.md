@@ -521,3 +521,25 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   that skips `ReadRecordBatch`'s per-block `arrow::Array` construction (walk the RecordBatch flatbuffer's
   `Buffer{offset,length}` directly → adopt), pre-registered to attack the +7.4%. (Also B-it1 producer-1-copy
   confirm; send-zc measured-null.) D-HC-0206 ColumnNullable recurse + gtest pending a build.
+
+---
+
+### L0013 — Branch B: D-HC-0206 gate + a post-restart query_log flake (ruled out)  [branch B]  [iteration 2]  2026-06-26
+- **What I did:** committed D-HC-0206 (CH cf91028a9d7: `ColumnNullable::convertToFullColumnIfAdopted`
+  recurse + `gtest_adopted_nullable_convert.cpp`) and the copy-budget table (pg 1d2fed8). Rebuilt
+  clickhouse (ColumnNullable.h is widely included), restarted the server, re-ran the arrow-adopt gate.
+- **How verified:** gtests `AdoptedConvert.*` **2/2** + `ArrowStreamSource.*`/`TcpStreamSource.*` **10/10**
+  (no regression). End-to-end re-gate on the rebuilt server: **first run SOME CHECKS FAILED (131/137)** —
+  6 failures, all in `count_filtered` + `join_inner_project`, all of the form "no new streamed_table query
+  in system.query_log" / "read_rows=1000000 != 5" / "ShmCopiedBlocks=1 < 2" (the offload/query_log ORACLE
+  not seeing the fresh queries, NOT a DIFF/data corruption). Per systematic-debugging I did NOT assume
+  flaky: **re-ran on the warmed server → 137/137 PASS, FAIL=0.**
+- **Interpretation:** a post-restart `query_log` flush/visibility race (the oracle queries system.query_log
+  before its async flush lands; the cold server's first queries' rows aren't visible yet) — a known
+  CH-restart/oracle-flush trap. The D-HC-0206 change is consumer-column-neutral (additive override; no-op
+  for non-adopted Nullables) and the offload path is unchanged → confirmed NOT a regression by the clean
+  re-run. Learning: after a CH restart, warm the server / re-run the oracle before trusting a partial fail.
+- **Verdict:** DONE for D-HC-0206 (binding decision implemented + gtested + end-to-end-neutral 137/137).
+  Branch B optimization iterations still owe ≥2 more (only it2 = a full optimization iteration so far):
+  CONTINUE → B-it3 (lean Arrow buffer-extraction vs the +7.4% Arrow-parse residual) + send-zc measured-null
+  + B-it1 producer-1-copy confirm; then adversarial review + REPORT-branchB.md.
