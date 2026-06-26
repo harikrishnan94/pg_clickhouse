@@ -148,22 +148,21 @@ struct PgchPhaseTimers;
 extern void shm_producer_set_phase_timers(ShmProducer *p, struct PgchPhaseTimers *t);
 
 /*
- * Select the TCP producer's socket-send submission method (Hot-Cold Phase 2, Branch 0).
- * `method` is a PgchTcpSendMethod (0 = blocking send(), 1 = io_uring IORING_OP_SEND). No-op
- * for an SHM producer. io_uring is lazily initialised on the first send; if the build lacks
- * liburing or ring init fails, the producer transparently falls back to the blocking path.
- * Must be called before the first publish.
+ * Select the TCP producer's socket-send submission method (Hot-Cold Phase 3, Branch P1).
+ * `method` is a PgchTcpSendMethod (0 = blocking send(), 1 = epoll non-blocking send(), 2 = msg_zerocopy).
+ * No-op for an SHM producer. The epoll path lazily creates a per-worker epoll fd on the first send
+ * (registering the conn fd for EPOLLOUT). Must be called before the first publish.
  */
 extern void shm_producer_set_tcp_send_method(ShmProducer *p, int method);
 
 /*
- * Branch-0 observability: how many logical TCP sends the producer issued via io_uring vs the
- * blocking send() path, and the total bytes sent. Lets a test/benchmark prove io_uring is
- * actually on the path (io_uring sends > 0, blocking sends == 0) rather than silently falling
+ * Branch-P1 observability: how many logical TCP sends the producer issued via the epoll non-blocking
+ * path vs the blocking send() path, and the total bytes sent. Lets a test/benchmark prove the epoll
+ * path is actually on the wire (epoll sends > 0, blocking sends == 0) rather than silently falling
  * back. Any out-param may be NULL. All zero for an SHM producer.
  */
 extern void shm_producer_tcp_send_stats(const ShmProducer *p,
-                                        uint64_t *iouring_sends,
+                                        uint64_t *epoll_sends,
                                         uint64_t *blocking_sends,
                                         uint64_t *send_bytes);
 

@@ -30,8 +30,8 @@ with only `-Iinclude`.
 Compiled into `MODULE_big` as three explicit objects (`src/nanoarrow/src/*.o`), kept out of
 the `src/*/*.c` auto-glob by living one level deeper. Built with warnings relaxed (`-w`)
 since it is third-party generated code; the base extension keeps `-Wall -Werror`. Enabled by
-`-DPGCH_USE_NANOARROW` (guarded on the header's presence, mirroring `PGCH_USE_LIBURING`); the
-Arrow producer path is `#ifdef PGCH_USE_NANOARROW`.
+`-DPGCH_USE_NANOARROW` (guarded on the header's presence); the Arrow producer path is
+`#ifdef PGCH_USE_NANOARROW`.
 
 Do not hand-edit the vendored sources. To upgrade, re-bundle the desired upstream release
 and replace this directory wholesale, then update the version above.

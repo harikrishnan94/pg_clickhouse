@@ -72,21 +72,22 @@ typedef enum PgchShmTransport
 extern int   pgch_shm_transport_mode;
 
 /*
- * TCP-transport producer send submission method (Hot-Cold Phase 2, Branch 0, D-HC-0204).
- * 'io_uring' submits each socket send via a per-worker io_uring (IORING_OP_SEND) -- the
- * substrate for Branch B's IORING_OP_SEND_ZC; 'blocking' keeps the Phase-1 blocking send()
- * path. Selected per query (snapshotted into the worker header so the bgworker honors it),
- * primarily so io_uring-TCP and bespoke-blocking-TCP can be A/B-measured on one binary.
- * Falls back to blocking automatically if the build lacks liburing or ring init fails.
+ * TCP-transport producer send submission method (Hot-Cold Phase 3, Branch P1, D-HC-0302; was Phase 2
+ * Branch 0). 'epoll' (default) does a non-blocking send() and, on EAGAIN, waits for writability via a
+ * per-worker epoll (EPOLLOUT) with a ~100ms slice that re-checks interrupts + backend death -- one send
+ * in flight; 'blocking' keeps the Phase-1 blocking send() path. Selected per query (snapshotted into the
+ * worker header so the bgworker honors it). io_uring was removed in P1 (it was used synchronously, so a
+ * loopback wash; dropping it + liburing buys simplicity/robustness/portability).
  */
 typedef enum PgchTcpSendMethod
 {
     PGCH_TCP_SEND_BLOCKING = 0,
-    PGCH_TCP_SEND_IOURING = 1,
+    PGCH_TCP_SEND_EPOLL = 1,   /* P1 default: non-blocking send() + epoll(EPOLLOUT) readiness wait */
     /* Branch B (B-it4): send(MSG_ZEROCOPY) with SO_ZEROCOPY + errqueue completion handling. On this
      * loopback/NIC-less host this is a MEASURED NULL by design -- every completion carries
      * SO_EE_CODE_ZEROCOPY_COPIED (the kernel defers a copy), proving zero-copy send is a pessimization,
-     * not an elimination, here; the real elimination is the capable-NIC payoff. */
+     * not an elimination, here; the real elimination is the capable-NIC payoff (the retained real-NIC
+     * zero-copy-send lever). It composes with the P1 non-blocking/EAGAIN loop. */
     PGCH_TCP_SEND_MSG_ZEROCOPY = 2,
 } PgchTcpSendMethod;
 extern int   pgch_tcp_send_method;

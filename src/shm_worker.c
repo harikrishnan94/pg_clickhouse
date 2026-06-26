@@ -104,7 +104,7 @@ typedef struct ShmWorkerHeader
     bool        enable_jit_deform;   /* honor the backend session's enable_jit_deform GUC */
     int         jit_row_threshold;   /* honor the backend session's jit_row_threshold GUC */
     int         transport;           /* ShmProducerTransport: SHM ring or per-stream TCP listener */
-    int         tcp_send_method;     /* PgchTcpSendMethod: TCP send via io_uring or blocking send() */
+    int         tcp_send_method;     /* PgchTcpSendMethod: epoll non-blocking send / blocking / msg_zerocopy */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     int         backend_pid;         /* originating backend PID, for liveness checks */
@@ -516,7 +516,7 @@ pgch_shm_worker_main(Datum main_arg)
          * ClickHouse consumer was cancelled and this ring will never drain. */
         shm_producer_set_origin_pid(producer, hdr->backend_pid);
 
-        /* Honor the backend session's TCP send method (io_uring vs blocking); no-op for SHM. */
+        /* Honor the backend session's TCP send method (epoll / blocking / msg_zerocopy); no-op for SHM. */
         shm_producer_set_tcp_send_method(producer, hdr->tcp_send_method);
 
         /* Publish the TCP listener port (0 for SHM) BEFORE marking ready, so the backend reads a
@@ -607,24 +607,24 @@ pgch_shm_worker_main(Datum main_arg)
                      rd_w, df_w, pb_w, st_w);
             }
 
-            /* Branch-0 (D-HC-0204) TCP send-method proof: how many logical sends went via
-             * io_uring vs blocking. io_uring>0 && blocking==0 proves the io_uring path ran
+            /* Branch-P1 (D-HC-0302) TCP send-method proof: how many logical sends went via the epoll
+             * non-blocking path vs blocking. epoll_sends>0 && blocking==0 proves the epoll path ran
              * (not a silent fallback). Meaningful for any socket transport (bespoke TCP or Arrow). */
             if (hdr->transport != PGCH_PRODUCER_TRANSPORT_SHM)
             {
-                uint64 iou = 0, blk = 0, sb = 0;
+                uint64 epoll = 0, blk = 0, sb = 0;
                 uint64 zc_s = 0, zc_n = 0, zc_c = 0;
 
-                shm_producer_tcp_send_stats(producer, &iou, &blk, &sb);
+                shm_producer_tcp_send_stats(producer, &epoll, &blk, &sb);
                 shm_producer_tcp_zc_stats(producer, &zc_s, &zc_n, &zc_c);
-                elog(LOG, "pg_clickhouse shm tcp-send: method=%s iouring_sends=" UINT64_FORMAT
+                elog(LOG, "pg_clickhouse shm tcp-send: method=%s epoll_sends=" UINT64_FORMAT
                           " blocking_sends=" UINT64_FORMAT " send_bytes=" UINT64_FORMAT
                           " zc_sends=" UINT64_FORMAT " zc_notifs=" UINT64_FORMAT
                           " zc_copied=" UINT64_FORMAT,
                      zc_s > 0 ? "msg_zerocopy"
-                              : (iou > 0 && blk == 0 ? "io_uring"
-                                                     : (blk > 0 && iou == 0 ? "blocking" : "mixed")),
-                     iou, blk, sb, zc_s, zc_n, zc_c);
+                              : (epoll > 0 && blk == 0 ? "epoll"
+                                                       : (blk > 0 && epoll == 0 ? "blocking" : "mixed")),
+                     epoll, blk, sb, zc_s, zc_n, zc_c);
             }
         }
         else

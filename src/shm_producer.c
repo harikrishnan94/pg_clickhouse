@@ -25,10 +25,6 @@
 #include "shm_phase.h"
 #include "shm_arrow.h"          /* Apache Arrow IPC serializer (Phase 2 Branch A, D-HC-0207) */
 
-#ifdef PGCH_USE_LIBURING
-#include <liburing.h>
-#endif
-
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -36,6 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/epoll.h>       /* Phase 3 P1: producer-side EPOLLOUT readiness wait for non-blocking send */
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <signal.h>             /* kill() for backend-liveness checks */
@@ -223,15 +220,16 @@ struct ShmProducer {
     ShmArrowEncoder *arrow_enc;
 
     /*
-     * Hot-Cold Phase 2, Branch 0 (D-HC-0204): TCP send submission method. `tcp_send_method`
-     * is a PgchTcpSendMethod (blocking | io_uring). When io_uring is selected AND the build
-     * has liburing, a per-worker ring is lazily created on the first send (`tcp_ring_ready`);
-     * a failed init flips `tcp_ring_failed` and the producer falls back to blocking for the
-     * rest of the stream. The ring carries one IORING_OP_SEND at a time (the producer is
-     * single-threaded per stream). This is the substrate for Branch B's IORING_OP_SEND_ZC.
+     * Hot-Cold Phase 3, Branch P1 (D-HC-0302): TCP send submission method. `tcp_send_method` is a
+     * PgchTcpSendMethod (blocking | epoll | msg_zerocopy). The epoll path does a non-blocking send() and,
+     * on EAGAIN, waits for writability on a per-worker epoll fd (`tcp_send_epoll_fd`, conn fd registered
+     * EPOLLOUT, lazily created in tcp_accept_conn when this method is selected) with a ~100ms slice that
+     * re-checks interrupts + backend death -- one send in flight (the producer is single-threaded per
+     * stream). io_uring was removed in P1 (it was used synchronously, hence a loopback wash).
      */
     int        tcp_send_method;
-    uint64_t   tcp_iouring_sends;   /* logical tcp_send_all calls taken via io_uring */
+    int        tcp_send_epoll_fd;   /* P1 epoll path: conn fd registered EPOLLOUT; -1 until accept (epoll method) */
+    uint64_t   tcp_epoll_sends;     /* logical tcp_send_all calls taken via the epoll non-blocking path */
     uint64_t   tcp_blocking_sends;  /* logical tcp_send_all calls taken via blocking send() */
     uint64_t   tcp_send_bytes;      /* total bytes handed to tcp_send_all (header+schema+payloads) */
     /* Branch B (B-it4): MSG_ZEROCOPY send-side measured-null. With SO_ZEROCOPY set on tcp_conn_fd,
@@ -246,15 +244,7 @@ struct ShmProducer {
     uint32_t   tcp_zc_seq_acked;        /* highest completed seq drained off the errqueue */
     bool       tcp_zc_seq_acked_valid;  /* tcp_zc_seq_acked holds a real value */
     bool       tcp_zc_sockopt_set;      /* SO_ZEROCOPY applied to tcp_conn_fd (else fall back to copy) */
-#ifdef PGCH_USE_LIBURING
-    struct io_uring tcp_ring;
-    bool       tcp_ring_ready;
-    bool       tcp_ring_failed;
-#endif
 };
-
-/* io_uring ring depth for the producer send path (one send in flight at a time). */
-#define PGCH_TCP_IOURING_ENTRIES 8
 
 /* --------------------------------------------------------------------- */
 /* Small helpers */
@@ -477,12 +467,10 @@ producer_cleanup(ShmProducer *p)
         close(p->parked_conns[i]);
     p->n_parked = 0;
 
-#ifdef PGCH_USE_LIBURING
-    /* Exit the send ring before closing the socket: io_uring_queue_exit cancels any in-flight
-     * SQE (it references tcp_conn_fd + tcp_scratch). This runs as a memory-context reset
-     * callback, before tcp_scratch's context memory is freed, so no SQE can outlive its buffer. */
-    if (p->tcp_ring_ready) { io_uring_queue_exit(&p->tcp_ring); p->tcp_ring_ready = false; }
-#endif
+    /* Phase 3 P1 (H8): close the per-worker send-readiness epoll fd before the socket. It only holds an
+     * EPOLLOUT registration on tcp_conn_fd (no buffer references), so order vs the socket close is not
+     * load-bearing, but closing it here keeps the per-stream fd count honest (no leaked epoll fd). */
+    if (p->tcp_send_epoll_fd >= 0) { close(p->tcp_send_epoll_fd); p->tcp_send_epoll_fd = -1; }
 #ifdef PGCH_USE_NANOARROW
     /* Free the Arrow encoder's malloc'd nanoarrow buffers (not palloc'd, so not reclaimed by the
      * owner-context reset that drives this callback). */
@@ -548,111 +536,74 @@ tcp_send_all_blocking(ShmProducer *p, const void *buf, size_t n)
     }
 }
 
-#ifdef PGCH_USE_LIBURING
 /*
- * Hot-Cold Phase 2, Branch 0 (D-HC-0204): lazily create the per-worker io_uring ring on the
- * first io_uring send. Returns true if the ring is usable; on init failure flips
- * tcp_ring_failed so the producer falls back to the blocking send path for the rest of the
- * stream (io_uring may be disabled by seccomp / a restrictive policy; that must not break the
- * stream). The ring is torn down in producer_cleanup.
+ * Hot-Cold Phase 3, Branch P1: wait (~timeout_ms) for the connected socket to become writable.
+ * The readiness primitive is behind this tiny helper so a BSD/macOS kqueue backend is a drop-in: this
+ * host is Linux (the whole TU uses accept4/MSG_ZEROCOPY/linux errqueue), so only the epoll backend is
+ * implemented; on any other platform the helper is a bounded no-op and the caller's blocking-send
+ * fallback (tcp_send_all_blocking) carries the wait. Raw epoll (not PG's WaitEventSet) is used so it stays
+ * consistent with the raw poll() in the blocking/zerocopy paths and can later fold in the MSG_ZEROCOPY
+ * errqueue POLLERR. The bounded slice lets the send loop re-poll CHECK_FOR_INTERRUPTS + backend death.
  */
-static bool
-tcp_iouring_ensure(ShmProducer *p)
+static void
+tcp_wait_writable(ShmProducer *p, int timeout_ms)
 {
-    int ret;
+#if defined(__linux__)
+    struct epoll_event ev;
 
-    if (p->tcp_ring_ready)
-        return true;
-    if (p->tcp_ring_failed)
-        return false;
-
-    ret = io_uring_queue_init(PGCH_TCP_IOURING_ENTRIES, &p->tcp_ring, 0);
-    if (ret < 0)
+    if (p->tcp_send_epoll_fd < 0)
     {
-        /* Not fatal: fall back to blocking for the rest of the stream. */
-        ereport(LOG, (errmsg("pg_clickhouse: io_uring_queue_init failed (%d); "
-                             "TCP send falls back to blocking send()", ret)));
-        p->tcp_ring_failed = true;
-        return false;
+        /* No epoll fd (defensive): degrade to a bounded poll(POLLOUT) so we never busy-spin. */
+        struct pollfd pfd;
+        pfd.fd = p->tcp_conn_fd; pfd.events = POLLOUT; pfd.revents = 0;
+        (void) poll(&pfd, 1, timeout_ms);
+        return;
     }
-    p->tcp_ring_ready = true;
-    return true;
+    (void) epoll_wait(p->tcp_send_epoll_fd, &ev, 1, timeout_ms);
+#else
+    struct pollfd pfd;
+    pfd.fd = p->tcp_conn_fd; pfd.events = POLLOUT; pfd.revents = 0;
+    (void) poll(&pfd, 1, timeout_ms);
+#endif
 }
 
 /*
- * Send-all over io_uring: one IORING_OP_SEND per (remaining) buffer span, submitted and waited
- * with a 100ms completion timeout so the loop still polls CHECK_FOR_INTERRUPTS + backend death
- * (the io_uring analog of the blocking path's SO_SNDTIMEO slices). The kernel still copies from
- * userspace (this is IORING_OP_SEND, not _ZC) -- Branch 0 changes only how the send is
- * submitted, not the copy count. Partial sends resubmit the remainder; -EAGAIN/-EINTR resubmit.
+ * Send-all over a NON-BLOCKING send() with epoll(EPOLLOUT) backpressure (Branch P1 default). One send in
+ * flight: send() returning means the kernel has copied the bytes (buffer immediately reusable). On
+ * EAGAIN/EWOULDBLOCK (the socket send buffer is full -- TCP flow control) wait for writability on the
+ * per-worker epoll fd with a ~100ms slice that re-checks CHECK_FOR_INTERRUPTS + backend death (replacing
+ * the io_uring wait_cqe_timeout slice). The kernel copy count is identical to the old io_uring
+ * IORING_OP_SEND path -- P1 changes only the submission/readiness mechanism. Partial sends advance.
  */
 static void
-tcp_send_all_iouring(ShmProducer *p, const void *buf, size_t n)
+tcp_send_all_epoll(ShmProducer *p, const void *buf, size_t n)
 {
     const char *ptr = (const char *) buf;
 
     while (n > 0)
     {
-        struct io_uring_sqe *sqe;
-        struct io_uring_cqe *cqe;
-        struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100L * 1000L * 1000L };
-        int res;
-        int ret;
+        ssize_t w;
 
         CHECK_FOR_INTERRUPTS();
-
-        sqe = io_uring_get_sqe(&p->tcp_ring);
-        if (sqe == NULL)
+        w = send(p->tcp_conn_fd, ptr, n, MSG_NOSIGNAL);
+        if (w > 0) { ptr += w; n -= (size_t) w; continue; }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            /* SQ momentarily full (should not happen with one in-flight send); drain it. */
-            (void) io_uring_submit(&p->tcp_ring);
+            if (origin_backend_dead(p))
+                ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                       "abandoning TCP stream", p->origin_pid)));
+            tcp_wait_writable(p, 100);   /* epoll_wait(EPOLLOUT, 100ms) */
             continue;
         }
-        io_uring_prep_send(sqe, p->tcp_conn_fd, ptr, n, MSG_NOSIGNAL);
-        ret = io_uring_submit(&p->tcp_ring);
-        if (ret < 0)
-        {
-            if (ret == -EINTR || ret == -EAGAIN)
-                continue;
-            ereport(ERROR, (errmsg("pg_clickhouse: io_uring_submit (send) failed: %d", ret)));
-        }
-
-        /* Wait for the single completion, waking every 100ms to poll cancel + backend death. */
-        for (;;)
-        {
-            ret = io_uring_wait_cqe_timeout(&p->tcp_ring, &cqe, &ts);
-            if (ret == -ETIME || ret == -EINTR)
-            {
-                CHECK_FOR_INTERRUPTS();
-                if (origin_backend_dead(p))
-                    ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
-                                           "abandoning TCP stream", p->origin_pid)));
-                continue;
-            }
-            if (ret < 0)
-                ereport(ERROR, (errmsg("pg_clickhouse: io_uring_wait_cqe (send) failed: %d", ret)));
-            break;
-        }
-
-        res = cqe->res;
-        io_uring_cqe_seen(&p->tcp_ring, cqe);
-
-        if (res > 0) { ptr += res; n -= (size_t) res; continue; }
-        if (res == -EINTR || res == -EAGAIN)
-            continue;
-        if (res == 0)
-            continue;   /* zero-length completion: retry */
-
-        /* res < 0: a real send error (errno = -res). */
         if (origin_backend_dead(p))
             ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
                                    "abandoning TCP stream", p->origin_pid)));
-        errno = -res;
         ereport(ERROR, (errcode_for_file_access(),
-                        errmsg("pg_clickhouse: io_uring TCP send to consumer failed: %m")));
+                        errmsg("pg_clickhouse: epoll TCP send to consumer failed: %m")));
     }
 }
-#endif /* PGCH_USE_LIBURING */
 
 #ifndef SOL_IP
 #define SOL_IP IPPROTO_IP
@@ -820,8 +771,10 @@ tcp_send_all_msg_zerocopy(ShmProducer *p, const void *buf, size_t n)
 }
 
 /*
- * Send-all dispatcher: msg_zerocopy (Branch B B-it4) / io_uring (Branch 0 default) when selected +
- * available, else blocking. The selection is per-stream (snapshotted into the worker header).
+ * Send-all dispatcher: msg_zerocopy (Branch B B-it4) / epoll non-blocking send (Branch P1 default) when
+ * selected, else blocking. The selection is per-stream (snapshotted into the worker header). The epoll
+ * path uses tcp_send_epoll_fd (created in tcp_accept_conn when this method is selected); if that creation
+ * failed it stays -1 and tcp_wait_writable degrades to a bounded poll(POLLOUT) -- never a busy-spin.
  */
 static void
 tcp_send_all(ShmProducer *p, const void *buf, size_t n)
@@ -832,14 +785,12 @@ tcp_send_all(ShmProducer *p, const void *buf, size_t n)
         tcp_send_all_msg_zerocopy(p, buf, n);
         return;
     }
-#ifdef PGCH_USE_LIBURING
-    if (p->tcp_send_method == PGCH_TCP_SEND_IOURING && tcp_iouring_ensure(p))
+    if (p->tcp_send_method == PGCH_TCP_SEND_EPOLL)
     {
-        p->tcp_iouring_sends++;
-        tcp_send_all_iouring(p, buf, n);
+        p->tcp_epoll_sends++;
+        tcp_send_all_epoll(p, buf, n);
         return;
     }
-#endif
     p->tcp_blocking_sends++;
     tcp_send_all_blocking(p, buf, n);
 }
@@ -897,6 +848,37 @@ tcp_accept_conn(ShmProducer *p)
         else
             ereport(LOG, (errmsg("pg_clickhouse: SO_ZEROCOPY unavailable (%m); MSG_ZEROCOPY send "
                                  "falls back to a plain copying send")));
+    }
+    /* Branch P1: for the epoll non-blocking send path, switch the connection to O_NONBLOCK and build a
+     * per-worker epoll fd watching the conn fd for EPOLLOUT (the send loop waits on it under
+     * backpressure). The blocking/msg_zerocopy methods keep the socket blocking + SO_SNDTIMEO (unchanged).
+     * On any failure we leave tcp_send_epoll_fd = -1; tcp_wait_writable then degrades to a bounded
+     * poll(POLLOUT), so a missing epoll fd never busy-spins. */
+    if (p->tcp_send_method == PGCH_TCP_SEND_EPOLL)
+    {
+        int flags = fcntl(p->tcp_conn_fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(p->tcp_conn_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            ereport(ERROR, (errcode_for_file_access(),
+                            errmsg("pg_clickhouse: fcntl(O_NONBLOCK) on TCP conn failed: %m")));
+        p->tcp_send_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        if (p->tcp_send_epoll_fd < 0)
+            ereport(LOG, (errmsg("pg_clickhouse: epoll_create1 for TCP send failed (%m); "
+                                 "send backpressure falls back to poll(POLLOUT)")));
+        else
+        {
+            struct epoll_event ev;
+
+            memset(&ev, 0, sizeof(ev));
+            ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+            ev.data.fd = p->tcp_conn_fd;
+            if (epoll_ctl(p->tcp_send_epoll_fd, EPOLL_CTL_ADD, p->tcp_conn_fd, &ev) < 0)
+            {
+                ereport(LOG, (errmsg("pg_clickhouse: epoll_ctl(ADD conn) for TCP send failed (%m); "
+                                     "send backpressure falls back to poll(POLLOUT)")));
+                close(p->tcp_send_epoll_fd);
+                p->tcp_send_epoll_fd = -1;
+            }
+        }
     }
 }
 
@@ -1169,15 +1151,12 @@ shm_producer_create(const char *name,
     p->owner_cxt = owner_cxt;
     p->transport = transport;
     p->tcp_conn_fd = -1;
+    p->tcp_send_epoll_fd = -1;
     p->tcp_handshake_sent = false;
     p->tcp_scratch = NULL;
     p->tcp_scratch_cap = 0;
     p->tcp_port = 0;
     p->tcp_send_method = PGCH_TCP_SEND_BLOCKING;   /* set by shm_producer_set_tcp_send_method */
-#ifdef PGCH_USE_LIBURING
-    p->tcp_ring_ready = false;
-    p->tcp_ring_failed = false;
-#endif
 
     if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
         ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
@@ -1344,10 +1323,10 @@ shm_producer_set_tcp_send_method(ShmProducer *p, int method)
 }
 
 void
-shm_producer_tcp_send_stats(const ShmProducer *p, uint64_t *iouring_sends,
+shm_producer_tcp_send_stats(const ShmProducer *p, uint64_t *epoll_sends,
                             uint64_t *blocking_sends, uint64_t *send_bytes)
 {
-    if (iouring_sends)  *iouring_sends = p->tcp_iouring_sends;
+    if (epoll_sends)    *epoll_sends = p->tcp_epoll_sends;
     if (blocking_sends) *blocking_sends = p->tcp_blocking_sends;
     if (send_bytes)     *send_bytes = p->tcp_send_bytes;
 }

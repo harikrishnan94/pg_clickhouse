@@ -54,7 +54,7 @@ bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
-int   pgch_tcp_send_method = PGCH_TCP_SEND_IOURING;
+int   pgch_tcp_send_method = PGCH_TCP_SEND_EPOLL;
 
 /* adopt/copy = SHM transport (consumer-side data path); tcp = bespoke TCP stream (Phase 1);
  * arrow = Apache Arrow IPC over the same per-stream TCP socket (Phase 2 Branch A). */
@@ -66,10 +66,10 @@ static const struct config_enum_entry pgch_shm_transport_options[] = {
     {NULL, 0, false},
 };
 
-/* TCP producer send submission method (Branch 0): io_uring (default) or blocking. */
+/* TCP producer send submission method (Branch P1): epoll non-blocking send (default) or blocking. */
 static const struct config_enum_entry pgch_tcp_send_method_options[] = {
-    {"io_uring",     PGCH_TCP_SEND_IOURING,      false},
-    {"iouring",      PGCH_TCP_SEND_IOURING,      true},   /* hidden alias */
+    {"epoll",        PGCH_TCP_SEND_EPOLL,        false},
+    {"async",        PGCH_TCP_SEND_EPOLL,        true},   /* hidden alias for the epoll non-blocking send */
     {"blocking",     PGCH_TCP_SEND_BLOCKING,     false},
     {"msg_zerocopy", PGCH_TCP_SEND_MSG_ZEROCOPY, false},  /* Branch B B-it4: SO_ZEROCOPY + errqueue */
     {NULL, 0, false},
@@ -1177,16 +1177,16 @@ pgch_shm_offload_init(void)
 
     DefineCustomEnumVariable("pg_clickhouse.tcp_send_method",
                              "For the 'tcp'/'arrow' transports, how the producer submits its socket send: "
-                             "'io_uring' (default; one IORING_OP_SEND per buffer via a per-worker "
-                             "io_uring ring -- the substrate for zero-copy send), 'blocking' (the "
-                             "Phase-1 blocking send() path), or 'msg_zerocopy' (Branch B B-it4: "
-                             "send(MSG_ZEROCOPY) with SO_ZEROCOPY + errqueue completion handling -- a "
-                             "MEASURED NULL on this loopback host, where every completion carries "
-                             "SO_EE_CODE_ZEROCOPY_COPIED proving the kernel defers a copy). Snapshotted "
-                             "into the streaming-worker header so the background worker honors the "
-                             "backend session's choice; falls back to blocking if the build lacks "
-                             "liburing or ring init fails (io_uring) or SO_ZEROCOPY is unavailable.",
-                             NULL, &pgch_tcp_send_method, PGCH_TCP_SEND_IOURING,
+                             "'epoll' (default; non-blocking send() with epoll(EPOLLOUT) readiness wait on "
+                             "backpressure, one send in flight), 'blocking' (the Phase-1 blocking send() "
+                             "path), or 'msg_zerocopy' (Branch B B-it4: send(MSG_ZEROCOPY) with SO_ZEROCOPY "
+                             "+ errqueue completion handling -- a MEASURED NULL on this loopback host, "
+                             "where every completion carries SO_EE_CODE_ZEROCOPY_COPIED proving the kernel "
+                             "defers a copy; the retained real-NIC zero-copy-send lever). Snapshotted into "
+                             "the streaming-worker header so the background worker honors the backend "
+                             "session's choice; msg_zerocopy falls back to a plain copying send if "
+                             "SO_ZEROCOPY is unavailable.",
+                             NULL, &pgch_tcp_send_method, PGCH_TCP_SEND_EPOLL,
                              pgch_tcp_send_method_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
