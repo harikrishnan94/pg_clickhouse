@@ -10,7 +10,8 @@ materialize-on-mutate + `ColumnNullable` recurse (D-HC-0206). Decisions D-HC-020
 **Commits (this branch).** ClickHouse `streamed_table`: `f30ed9d6efc` (B-it2 zero-copy adopt),
 `cf91028a9d7` (D-HC-0206), `b47ce3d1291` (B-it3 lean extraction), `bddb2d2646e` (D-HC-0208 default flip).
 pg_clickhouse `streamed-table-shm-offload`: `854eacf` (L0014 + pre-reg + D-HC-0208), `81c1cb9` (B-it4
-MSG_ZEROCOPY), `57e34b6` (B-it1 + copy-budget final), `+ the review-fix commit`.
+MSG_ZEROCOPY), `57e34b6` (B-it1 + copy-budget final), `63b96f2` (adversarial review + review-fix #1 +
+this report), `1af9c95` (DoD checklist).
 
 ## Verdict: GREEN.
 The copy-budget is **measured** and each ELIMINATED copy is **profile-proven**; the consumer pass-through
@@ -19,7 +20,8 @@ the −299 ms consumer-user-CPU drop on the String-heavy cell and parity on fixe
 zero-copy is honestly proven a **measured negative** on loopback via `SO_EE_CODE_ZEROCOPY_COPIED`; the
 **recv-side** is single-copy (one kernel copy into the to-be-adopted buffer, no userspace recopy) with the
 residual kernel recv copy reported as the dominant (~35%) cost — the real-NIC north star, not closable
-here. **5 evidence-based iterations** logged (≥3 required); every claim backed by ≥3 converging
+here. **4 evidence-based iterations** logged — it2/it3/it4 (the ≥3 required optimization iterations) +
+it1 (the 1-copy confirmation) + the D-HC-0206 capability; every claim backed by ≥3 converging
 instruments; no new `DIFF`; the default path is unaffected. Independent adversarial review: **PASS, zero
 blocking findings.**
 
