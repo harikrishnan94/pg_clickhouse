@@ -781,9 +781,18 @@ tcp_send_all_msg_zerocopy(ShmProducer *p, const void *buf, size_t n)
              * (the chunk cap guarantees a single send fits once nothing else is outstanding). */
             if (sent_zc)
                 tcp_zc_drain_until(p, last_seq);
-            else if (origin_backend_dead(p))
-                ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
-                                       "abandoning TCP stream", p->origin_pid)));
+            else
+            {
+                /* Nothing outstanding yet but still ENOBUFS (only reachable if RLIMIT_MEMLOCK is set below
+                 * one chunk). Back off on the errqueue/socket instead of busy-spinning. (Review B #1.) */
+                struct pollfd pfd;
+
+                if (origin_backend_dead(p))
+                    ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                           "abandoning TCP stream", p->origin_pid)));
+                pfd.fd = p->tcp_conn_fd; pfd.events = POLLERR | POLLOUT; pfd.revents = 0;
+                (void) poll(&pfd, 1, 100);
+            }
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))

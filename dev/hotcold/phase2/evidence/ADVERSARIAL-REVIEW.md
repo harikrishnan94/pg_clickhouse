@@ -104,3 +104,58 @@ REPORT-branchA, the overhead table, and D-HC-0207.
 
 **Outcome:** PASS. Finding #1 FIXED in-branch (per-field layout validation); #2 documented; #3 carried
 into Branch B as a binding requirement. Branch A is GREEN.
+
+---
+
+## Branch B (copy reduction: B-it1/it2/it3/it4) — 2026-06-26 — VERDICT: PASS (zero blocking findings)
+
+Independent reviewer (fresh context, did NOT write the code) attacked all four angles, re-derived every
+headline number from the raw cells, re-ran the gates, and **wrote a standalone test against the real
+producer (nanoarrow) encoder** to attack the lean buffer-walk — specifically hunting the "is the null
+spurious?" and "buffer-reuse corruption?" traps.
+
+**Gates re-run (independently):**
+- `unit_tests_dbms --gtest_filter='ArrowStreamSource.*:TcpStreamSource.*:AdoptedConvert.*'` → **15/15 PASS**
+  (exercises BOTH lean and it2 ReadRecordBatch paths + copying decode + the stock-ArrowColumnToCHColumn oracle).
+- `verify_offload TRANSPORT=arrow` (default, lean OFF) → **PASS=137 FAIL=0**, no DIFF.
+- `verify_offload TRANSPORT=arrow` with `shm_arrow_lean_extract 1` FORCED → **PASS=137 FAIL=0** (lean correct e2e).
+- Live binary md5 == on-disk; runtime `shm_arrow_lean_extract=0` confirms the D-HC-0208 flip is compiled in.
+
+**Confirmed sound (per angle):**
+- **Correctness — the lean null is REAL, not spurious.** Proven three ways that lean genuinely runs (does NOT
+  silently bail to ReadRecordBatch): (a) arrow's `ArrayLoader::LoadCommon` (reader.cc:316) always advances past
+  the validity slot regardless of null_count; (b) the nanoarrow encoder emits a flatbuffer Buffer per
+  `n_buffers` = 2 fixed `{NULL-validity,data}` / 3 String `{NULL-validity,offsets,chars}` (shm_arrow.c:301-321);
+  (c) a STANDALONE test against the real encoder confirmed `n_buffers` 2/3, `buffers[0]==NULL`, total 11, String
+  offsets `[0,1,1,4,8]` sentinel 0 — exactly lean's `advance 2/3, validity at bi` assumption. Pass-1 bail
+  conditions don't fire for ClickBench; e2e result correct (646|118934). The `adoptArrowColumnToCH` refactor
+  (diffed vs f30ed9d6efc) preserves exact B-it2 behavior. 2-pass exception safety: `body_buf` has exactly one
+  owner at all times (13 bail sites hand it to the reader untouched; pass-2 hands it to one RetainToken; a
+  pass-2 throw unwinds the token, freeing once); metadata validated by Message::Open before the GetMessage walk;
+  allocFrameBuffer 64B slack keeps adoption over-reads in-allocation. **msg_zerocopy buffer-reuse: NO corruption
+  window** — tcp_send_all_msg_zerocopy blocks in tcp_zc_drain_until until the kernel released the buffer BEFORE
+  returning; seq mirror wrap-safe; drain can't hang (CHECK_FOR_INTERRUPTS + origin_backend_dead + 100ms poll);
+  SO_ZEROCOPY scoped to the ZC method only.
+- **Fidelity/honesty:** B-it3 null honest (lean cons_user 668 is actually HIGHER than it2 627 — stated, not
+  spun; ~0.37% decode re-derived from the perf file). B-it4 negative honest (`tcp_zc_copied++` fires only on
+  `ee_code & SO_EE_CODE_ZEROCOPY_COPIED`; the banned "absence of copy_from_user" claim is avoided). B-it1 "1
+  copy" defensible (apples-to-apples vs bespoke's one scratch copy; the truly-fused 1-copy is disclosed as NOT
+  implemented / out of scope). No new DIFF (every cell `correct=exact`).
+- **Performance/mechanism:** all wall deltas re-derived from raw cells match the log (lean−it2 −0.5% null,
+  lean−tcp +7.0%, zcsend−iouring +7.3%, adopt cons_user −299ms vs copy); kernel-recv-copy ~35% dominant
+  supported; mechanism shown, nothing cherry-picked (all modes FRESH same binary/session, W=8).
+- **Holism:** default it2 path + default io_uring send unaffected; CMake flatbuffers include scoped (PRIVATE,
+  SYSTEM, header-only, inside the parquet target — no link/ABI change); lifetime bounded; leak oracle 137/137.
+
+**Non-blocking findings + disposition:**
+1. **(Robustness) `tcp_send_all_msg_zerocopy` first-chunk `!sent_zc` ENOBUFS branch retries without a backoff
+   poll** — only hot-spins under external `RLIMIT_MEMLOCK` exhaustion below the 1 MiB chunk; currently
+   unreachable (drain-before-return keeps outstanding at 0 entering a new buffer, so the first chunk never
+   ENOBUFS). **DISPOSITION: FIXED in-branch** — added the same `poll(POLLERR, 100ms)` backoff the `sent_zc`
+   branch uses, so the defensive path can't busy-spin. (Re-gated: producer rebuild + msg_zerocopy offload
+   correct + gtests 15/15.)
+2. **(Disclosure) Pre-reg mechanism #1 "fuse deform+serialize" was downgraded to "confirm 1 serialize copy"**
+   — not achieved (deform→buffer→body stays 2 stages, same as bespoke), but honestly disclosed in L0016 and
+   the copy-budget. **DISPOSITION: DOCUMENTED** — a truly-fused deform-into-body is a separate future opt.
+
+**Outcome:** PASS. Finding #1 FIXED in-branch; #2 documented. Branch B is GREEN.
