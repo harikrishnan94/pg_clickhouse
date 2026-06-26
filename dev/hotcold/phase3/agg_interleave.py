@@ -5,6 +5,7 @@ from the OBSERVED between-run variance (not the within-run sd). Usage: agg_inter
 import sys, os, glob, statistics as st
 
 root = sys.argv[1]
+TREAT = sys.argv[2] if len(sys.argv) > 2 else "c1"   # treatment-side subdir name (c1 | p1)
 
 def collect(side):
     """side in {c1,baseline}; -> {(tr,bench,q): [off_med per round]}"""
@@ -28,7 +29,7 @@ def collect(side):
                 out.setdefault((tr, bench, c[h["q"]]), []).append(v)
     return out
 
-C1, BL = collect("c1"), collect("baseline")
+C1, BL = collect(TREAT), collect("baseline")
 keys = sorted(set(C1) & set(BL), key=lambda k: (k[0], k[1], int(k[2])))
 print(f"# Interleaved A/B parity (across-round). band = max(5%, max(sd_c1,sd_bl)/med).")
 print(f"{'tr':4} {'bench':10} {'q':>3} | {'bl_med':>7} {'bl_rng':>13} | {'c1_med':>7} {'c1_rng':>13} | {'rel%':>6} {'band%':>6} {'verdict':>8}")

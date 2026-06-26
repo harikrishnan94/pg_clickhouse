@@ -129,3 +129,54 @@ thread anyway. (3) Added C1CancelDuringConnect (200ms, pre-epoll cancelled-flag 
 arrow 137/137 on the review-fixed binary. Server runtime unchanged (dead-code + test-only).
 **DONE — C1 GREEN. Acceptance met: parity (drift-controlled) + thread elimination (deterministic) + no new
 DIFF + clean teardown + stall fires + cancel across all phases + review passed. → P1.**
+
+---
+
+## L0022 — P1 implemented: producer epoll non-blocking send; io_uring + liburing removed
+**Holistic note.** End-to-end: PG scan→deform→serialize into tcp_scratch→[P1: send() loop, epoll(EPOLLOUT)
+wait on EAGAIN]→kernel send copy→wire→C1 consumer recv. Copy count UNCHANGED (serialize copy + kernel send
+copy). Only the send SUBMISSION/readiness mechanism changes (no ring). On loopback (32MiB SO_SNDBUF, fast
+C1 consumer) send rarely blocks ⇒ epoll_wait rarely hit ⇒ wall unchanged. No local pessimization: send() is
+the same syscall io_uring wrapped, minus submit/CQE overhead.
+**WHAT.** Replaced tcp_send_all_iouring with tcp_send_all_epoll (non-blocking send + tcp_wait_writable =
+epoll_wait(EPOLLOUT,100ms), kqueue-structured, Linux-only impl, bounded poll(POLLOUT) degrade). Per-worker
+tcp_send_epoll_fd created in tcp_accept_conn (only for the epoll method; conn set O_NONBLOCK then), closed
+in producer_cleanup (H8). Deleted ring/tcp_iouring_ensure/tcp_send_all_iouring/PGCH_TCP_IOURING_ENTRIES/
+io_uring_queue_exit/#include<liburing.h>/Makefile -luring. Enum IOURING->EPOLL (default); GUC epoll/async;
+blocking+msg_zerocopy kept; iouring_sends->epoll_sends. Commit 8fe16dd.
+**VERIFIED.** H13 zero-residual: grep io_uring/iouring/IOURING/PGCH_USE_LIBURING in src/+Makefile* → only
+explanatory comments. Mechanism (the saved binaries): pgch_p1.so ldd liburing=0, nm io_uring syms=0, epoll
+syms=3; pgch_baseline.so ldd liburing=1, io_uring syms=4. Live LOG: method=epoll epoll_sends=458/464
+blocking_sends=0 (epoll path on the wire, not a silent fallback); method=msg_zerocopy epoll_sends=0
+zc_sends=691 zc_copied=679 (msg_zerocopy still works, errqueue + SO_EE_CODE_ZEROCOPY_COPIED intact, composes
+with the non-blocking loop). Gates: verify_offload tcp 137/137 + arrow 137/137 (P1 producer + C1 consumer),
+both correct results. **CONTINUE → P1 parity interleave (L0023) + review.**
+
+---
+
+## L0023 — P1 parity: drift-controlled interleaved A/B (epoll vs io_uring) → PARITY, no regression
+**WHAT.** Drift-controlled interleaved A/B of the PRODUCER send method: 5 rounds, each round atomically
+installs the P1 .so (epoll) then the baseline .so (io_uring) and measures the decisive subset (tcp;
+CB{2,17,33,38}, TPC-H{6,7,9,14}, N=5). Consumer = the live C1 ClickHouse (CONSTANT — isolates the producer
+change); LTO bitcode constant (P1's) across both sides (not a confound — only the send method varies); no
+PG restart (session_preload + dynamic bgworker reload the swapped on-disk .so per fresh psql).
+**RESULT (raw, across-round median [min,max], rel = epoll vs io_uring).**
+  tcp CB  Q2  bl 455[453,477]  p1 455[444,474]  +0.0%  parity
+  tcp CB  Q17 bl 507[483,516]  p1 497[483,507]  -2.0%  parity
+  tcp CB  Q33 bl 633[597,660]  p1 628[623,646]  -0.8%  parity
+  tcp CB  Q38 bl 555[538,578]  p1 550[531,568]  -0.9%  parity
+  tcp TPCH Q6  bl 1390[1374,1420] p1 1395[1379,1427] +0.4% parity
+  tcp TPCH Q7  bl 1533[1497,1568] p1 1546[1529,1572] +0.8% parity
+  tcp TPCH Q9  bl 2983[2980,2988] p1 3018[2966,3043] +1.2% parity
+  tcp TPCH Q14 bl 1332[1290,1354] p1 1339[1317,1365] +0.5% parity
+  → 8/8 PARITY, 0 regressions (rel -2.0%..+1.2%, all within max(5%, between-round sd)).
+**INTERPRETATION.** epoll == io_uring within noise on every cell, both directions. Confirms the
+pre-registered prediction (parity-by-construction: io_uring was used SYNCHRONOUSLY — submit→wait, one in
+flight — so it never overlapped anything; epoll non-blocking send + EAGAIN-wait does the same copy + wire).
+Arrow uses the identical producer send path (tcp_send_all), so the parity is wire-agnostic; tcp measured.
+**MECHANISM (already in L0022).** P1 .so: 0 liburing / 0 io_uring syms; baseline: liburing + 4 syms. Live
+LOG method=epoll epoll_sends>0 blocking_sends=0 (epoll path on the wire). H13 zero-residual.
+**RESOLVES adversarial-review B1** (the premature "Measured: parity" claim now substantiated by this
+across-round table on the committed P1 state).
+**DONE — P1 parity PROVEN (parity + io_uring-off mechanism + msg_zerocopy intact). → P1 review-fix commit +
+REPORT.**

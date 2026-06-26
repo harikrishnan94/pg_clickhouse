@@ -400,3 +400,44 @@ proven unnecessary (no parked executor exists in the socket-not-yet-in-epoll win
 epoll — rejected: the executor's outer epoll is level-triggered and the recv state machine already drains to
 EAGAIN; ET adds lost-wakeup risk for no benefit. (c) A shared per-process epoll/timer thread — rejected: more
 complex than the per-source epoll fd and reintroduces a thread.
+
+## D-HC-0302 — producer TCP send: epoll non-blocking send() replaces io_uring; liburing dependency dropped
+**Date:** 2026-06-27. **Phase 3 Branch P1.** **Context:** the TCP/Arrow producer submitted its socket send
+via io_uring (`tcp_send_all_iouring`: `io_uring_prep_send` IORING_OP_SEND, `io_uring_submit` then
+`io_uring_wait_cqe_timeout(100ms)`) — **one SQE in flight**, used **synchronously** (submit→wait), with a
+lazily-created per-worker ring (`tcp_iouring_ensure`) torn down in `producer_cleanup`. liburing was an
+optional build dep (`PGCH_USE_LIBURING` guard + Makefile `-luring`).
+**Decision.** Replace it with a **non-blocking `send()` + epoll(EPOLLOUT) readiness** loop
+(`tcp_send_all_epoll`), one send in flight: `send()` on an O_NONBLOCK conn; on EAGAIN wait for writability
+on a per-worker epoll fd (conn registered EPOLLOUT, created in `tcp_accept_conn`) with a ~100ms slice that
+re-checks `CHECK_FOR_INTERRUPTS()` + `origin_backend_dead()`. The readiness wait is behind `tcp_wait_writable`
+so a BSD **kqueue** backend is a drop-in; only the Linux epoll backend is implemented (the TU is Linux-only —
+`accept4`/`MSG_ZEROCOPY`/`linux/errqueue.h`), with a bounded `poll(POLLOUT)` degrade if the epoll fd can't be
+created (never a busy-spin). The `pg_clickhouse.tcp_send_method` enum drops `io_uring`
+(`PGCH_TCP_SEND_IOURING`→`PGCH_TCP_SEND_EPOLL`, the new default, value 1); GUC tokens `epoll`/`async`
+(was `io_uring`/`iouring`); `blocking` + `msg_zerocopy` kept. The liburing build dep is removed entirely.
+**Why (NOT a loopback speed claim).** io_uring was used **synchronously** (submit→wait, one in flight) — it
+never overlapped anything, so on loopback epoll vs io_uring is a wash (the cost is the payload copy + the
+wire, not syscall submission). The switch is justified by **simplicity** (no ring lifetime / in-flight-SQE
+teardown — `send()` returning ⇒ bytes copied ⇒ buffer reusable), **robustness** (io_uring is disabled by
+seccomp in many hardened/container deployments — the old path silently fell back to blocking there; epoll
+has no such degradation), and **portability** (no liburing). Parity vs the io_uring baseline at W=8 is measured
+by a drift-controlled interleaved A/B that swaps ONLY the producer `.so` (epoll vs io_uring), consumer fixed =
+C1; the prediction is parity-by-construction (io_uring was synchronous, so it never overlapped anything). The
+measured across-round result is recorded in METHODOLOGY-LOG L0023. Mechanism: the built `.so` links no liburing
+(`ldd`) and exports zero io_uring symbols (`nm`) vs the baseline (`liburing.so.2` + 4 io_uring syms); the epoll
+path's `epoll_sends` counter is >0 with `blocking_sends`=0 (not a silent fallback).
+**H16 — io_uring→`SEND_ZC` forfeit (recorded).** Removing liburing forfeits `IORING_OP_SEND_ZC` (the
+Makefile comment had noted liburing was kept as its substrate) — a cleaner real-NIC zero-copy send than
+`send(MSG_ZEROCOPY)`+errqueue (a single CQE completion vs a per-send `recvmsg` on MSG_ERRQUEUE). We retain
+`msg_zerocopy` (`send(MSG_ZEROCOPY)` + SO_ZEROCOPY + errqueue) as the real-NIC zero-copy-send lever; it
+composes with the P1 non-blocking/EAGAIN loop and still posts SO_EE_ORIGIN_ZEROCOPY completions
+(SO_EE_CODE_ZEROCOPY_COPIED = the loopback measured-null). **Follow-up:** re-introduce io_uring solely for
+`IORING_OP_SEND_ZC` IF it proves the dominant real-NIC zero-copy-send lever (vs MSG_ZEROCOPY's per-send
+errqueue cost) — a capable-NIC experiment, out of scope for this loopback phase.
+**Alternatives.** (a) Keep io_uring for plain SEND — rejected: it added a ring lifetime + a liburing dep for
+zero loopback benefit and a seccomp-fragility, while being synchronous (no pipelining benefit). (b) Keep
+liburing solely for SEND_ZC now — rejected: SEND_ZC's payoff is real-NIC-only and unmeasurable here; logged
+as the H16 follow-up instead of carrying the dep. (c) PG `WaitEventSet` for the readiness wait — rejected
+(H10): it cannot wait on the MSG_ZEROCOPY errqueue POLLERR and raw epoll is consistent with the existing
+raw poll() paths.
