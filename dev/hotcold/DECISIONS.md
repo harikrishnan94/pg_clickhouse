@@ -366,3 +366,37 @@ A/B baseline. (b) Debug-build-only (`chassert`) — rejected: would not let an o
 release build for an untrusted-producer deployment, and complicates the A/B measurement on the `reldeb`
 binary. (c) Vectorize the scan instead of dropping it — a future option if it is ever re-enabled by default;
 out of scope given the user's trusted-producer decision.
+
+## D-HC-0301 — consumer readiness: epoll fd {socket, timerfd} replaces the eventfd + per-async bridge thread; cancel via shutdown()
+**Date:** 2026-06-26. **Phase 3 Branch C1.** **Context:** the TCP/Arrow async consumer (`TcpStreamSource`)
+exposed one fd to the executor via `schedule()` — a per-stream readiness **eventfd** — and woke it with a
+**fresh `std::thread` spawned per async wait** (`startAsyncWakeBridge`→`asyncWakeBridgeLoop`) that `poll()`ed
+{`sock_fd`, a stop-eventfd} up to the remaining stall budget and `write()`-poked the eventfd. Under steady
+streaming that is ~one thread create/join per block, plus two eventfds per stream.
+**Decision.** `schedule()` returns a **source-owned epoll fd** aggregating {`sock_fd`
+(EPOLLIN|EPOLLRDHUP|EPOLLERR), a one-shot `timerfd` armed to the remaining stall budget}; the executor epolls
+it directly (`scheduleForEvent` default `{schedule(), EPOLLIN|EPOLLERR}`, registered **level-triggered** in
+`Epoll.cpp` — no EPOLLET). **Deleted** the bridge thread + both eventfds + `wakeReadyEvent`/`requestAsyncWakeBridgeStop`/
+`joinAsyncWakeBridge`/`startAsyncWakeBridge`/`asyncWakeBridgeLoop`. **Cancellation stays solely
+`::shutdown(sock_fd, SHUT_RDWR)`** — once async-parked the socket is in the epoll fd so shutdown fires it;
+during connect/handshake the executor is *inside* `ensureConnected` (not parked; the epoll fd does not exist
+yet) and the cancel flag is polled each connect-retry / SO_RCVTIMEO recv slice. No cancel eventfd is kept.
+**Why (not loopback speed — a resource/mechanism change).** (a) **Eliminates the per-async `std::thread`**
+create/join (≈1 per block) — the gtest proves 575 async parks spawn **0** threads (pre-C1: ~575 bridge
+threads). (b) **Simplicity** — no per-async bridge lifecycle (stop-eventfd, join, drain), one less moving part.
+(c) The **timerfd is load-bearing**, not hygiene: the single-threaded `PullingPipelineExecutor` waits
+`async_task_queue.wait(timeout=-1)` and never calls `onAsyncJobReady`, so a stalled producer is woken ONLY by
+the timerfd firing → `SHM_PRODUCER_STALL` (gtest: fires at 401ms vs a 400ms budget). `armStallTimer` floors the
+one-shot at 1ms so an all-zero `itimerspec` can never disarm the timer and hang that infinite wait.
+**Hot-spin safety (H2).** The returned fd is level-triggered, so every wake drains the timerfd
+(`drainCounterFd`) and drives recv to socket EAGAIN before re-returning `Status::Async`; EPOLLRDHUP/EPOLLERR
+are driven to a terminal EOS/throw (never re-Async). Done in BOTH the `tryGenerate` early-path
+(single-threaded) and `onAsyncJobReady` (multi-threaded). gtest asserts a BOUNDED async-park count (575 ≪
+100×n_blocks) — a spin would explode it.
+**fd accounting (honest).** Pre-C1: 2 eventfds/stream. Post-C1: 1 epoll fd + 1 timerfd/stream → net **0**
+long-lived fd delta; the real resource win is the thread elimination, not the fd count.
+**Alternatives.** (a) Keep a single cancel eventfd registered in the inner epoll (H3 escape hatch) — rejected:
+proven unnecessary (no parked executor exists in the socket-not-yet-in-epoll window). (b) Edge-triggered inner
+epoll — rejected: the executor's outer epoll is level-triggered and the recv state machine already drains to
+EAGAIN; ET adds lost-wakeup risk for no benefit. (c) A shared per-process epoll/timer thread — rejected: more
+complex than the per-source epoll fd and reintroduces a thread.

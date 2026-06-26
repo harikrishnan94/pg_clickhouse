@@ -1,0 +1,13 @@
+# Interleaved A/B parity (across-round). band = max(5%, max(sd_c1,sd_bl)/med).
+tr   bench        q |  bl_med        bl_rng |  c1_med        c1_rng |   rel%  band%  verdict
+tcp  clickbench   2 |     461 [  452,  472] |     456 [  391,  478] |  -1.1   6.4   parity   (n_c1=5,n_bl=5)
+tcp  clickbench  17 |     500 [  487,  513] |     496 [  456,  518] |  -0.8   5.0   parity   (n_c1=5,n_bl=5)
+tcp  clickbench  33 |     631 [  590,  654] |     628 [  582,  662] |  -0.5   5.0   parity   (n_c1=5,n_bl=5)
+tcp  clickbench  38 |     553 [  549,  575] |     544 [  516,  592] |  -1.6   5.0   parity   (n_c1=5,n_bl=5)
+tcp  tpch         6 |    1410 [ 1378, 1437] |    1413 [ 1389, 1524] |  +0.2   5.0   parity   (n_c1=5,n_bl=5)
+tcp  tpch         7 |    1556 [ 1536, 1568] |    1563 [ 1511, 1630] |  +0.4   5.0   parity   (n_c1=5,n_bl=5)
+tcp  tpch         9 |    3002 [ 2956, 3052] |    3003 [ 2939, 3052] |  +0.0   5.0   parity   (n_c1=5,n_bl=5)
+tcp  tpch        14 |    1360 [ 1344, 1377] |    1355 [ 1325, 1416] |  -0.4   5.0   parity   (n_c1=5,n_bl=5)
+
+## verdicts: {'parity': 8}
+## SLOWER (regression) cells: NONE
