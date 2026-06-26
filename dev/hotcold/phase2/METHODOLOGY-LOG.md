@@ -429,3 +429,52 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE. **Branch A GREEN** (correct, fixed-width parity, String bounded-regression, review
   PASS, finding #1 fixed). CONTINUE → Branch B (zero-copy Arrow adoption + ≥3 evidence-based optimization
   iterations + the copy-budget table + send-side measured-null + single-copy-recv).
+
+---
+
+### L0011 — Branch B kickoff: holistic end-to-end note + the adopt/alignment investigation  [branch B]  [iteration 0]  2026-06-26
+- **Goal / hypothesis:** Before touching code (process rule 3), map the whole dataflow change Branch B
+  makes and the binding constraint on zero-copy adoption of Arrow buffers. No perf claim yet.
+- **Holistic end-to-end note (process rule 3).** Branch B changes exactly ONE stage of the path PG-deform
+  → Arrow-serialize → io_uring-send → wire → recv-into-to-be-adopted-buffer → **DECODE** → CH-pipeline →
+  drop: the consumer DECODE flips from Branch-A *copy* (`copyArrowColumnToCH` memcpy each Arrow buffer into
+  an owned CH column) to *adopt* (the CH column ALIASES the Arrow buffer, a slice of the recv body, held
+  by a RetainToken whose deleter frees the body on last-drop). Everything else is unchanged: the recv is
+  already single-copy into the to-be-adopted buffer (Branch 0/A), the metadata-then-body framing is already
+  the single-copy-recv shape, the producer already does one userspace serialize copy. So the predicted
+  system effect is: the String/wide cells lose the consumer copy-decode layer (Branch-A Q24 +15.9% → ~tcp
+  parity), fixed-width stays at parity (it was already parity, the copy was negligible), and the residual
+  gap to SHM-adopt stays = the irreducible kernel recv copy (real-NIC north star, not closable on loopback).
+  The body buffer is now retained (not freed in buildChunk) → in-flight memory = K recv buffers/stream;
+  must prove prompt drop (RetainToken last-drop on chunk consume).
+- **What I did:** dispatched an Explore agent to map `AdoptionLayer::adopt` + the `createAdopted` factories
+  (`ColumnVector`/`ColumnString`/`ColumnDecimal`) + the alignment/SIMD-pad contract + `RetainToken`/
+  `ChargeHandle` distribution + PODArray adopted mode. No code changed.
+- **Key findings (the binding constraint):**
+  1. `createAdopted` signatures: `ColumnVector<T>::createAdopted(T* data, n, retain, charge)`;
+     `ColumnString::createAdopted(UInt8* chars, chars_size, UInt64* offsets, rows, retain, charge)`;
+     `ColumnDecimal<T>::createAdopted(T* data, n, scale, retain, charge)`. Each takes a `RetainToken`
+     (`std::shared_ptr<void>`) + a `ChargeHandle` (wrapped shared) shared across all columns of the block.
+  2. **Alignment + SIMD pad (the crux):** each adopted buffer must be at its natural alignment and have
+     `PADDING_FOR_SIMD == 64` bytes of safely-readable trailing slack. Arrow IPC bodies pad buffers to only
+     **8 bytes** (nanoarrow `_ArrowRoundUpToMultipleOf8` in the body callback). **Resolution:** the 64-byte
+     over-read is MEMORY-SAFE for every buffer because (a) `allocFrameBuffer` slacks the whole recv body by
+     64 B at the end, and (b) a mid-body buffer's +64 over-read lands in the adjacent buffer (within the
+     allocation) and SIMD masks the extra lanes → correctness-safe. 8-byte alignment satisfies every type
+     ≤ 8 bytes + the 8-byte String offsets. The ONLY exception is **Decimal128** (needs 16-byte alignment;
+     an 8-byte body offset may be 8 mod 16) → **copy fallback for Decimal128** (a documented residual), or
+     a producer-64B-alignment follow-up. The swept datasets (TPC-H Decimal64, ClickBench no-decimal) have
+     NO Decimal128, so adoption covers every exercised column; D128 fallback is correctness-preserving.
+  3. **String adopt:** `chars = value_data()`, CH `offsets = &arrow_offsets[1]` (so CH `offsets[-1]` reads
+     `arrow_offsets[0]`), MUST validate `array.offset()==0 && arrow_offsets[0]==0` (review finding #3 /
+     D-HC-0201/0207); then `validateAdoptedOffsets()`.
+  4. **RetainToken lifetime:** one token per block (deleter frees the recv body), shared across all adopted
+     columns (the bespoke `buildChunkFromPayload` is the precedent); buildChunkFromArrow must STOP freeing
+     `body_buf` and hand it to the token instead.
+- **Pre-registered Branch-B iterations (00-PRE-REGISTRATION):** B-it1 producer 1-userspace-copy; **B-it2
+  zero-copy adopt (the headline — recovers Q24)**; B-it3 send-side `IORING_OP_SEND_ZC` measured-null. Plus
+  the copy-budget table, `convertToFullColumnIfAdopted` mutate-materialize + `ColumnNullable` recurse
+  (D-HC-0206), single-copy-recv proof.
+- **Verdict:** DONE (kickoff + constraint mapped). CONTINUE → implement B-it2 (the adopt-mode decoder +
+  RetainToken retention + Decimal128 copy-fallback + String sentinel validation), gate, then measure the
+  Q24 recovery.
