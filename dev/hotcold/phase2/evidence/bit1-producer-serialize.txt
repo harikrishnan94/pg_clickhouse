@@ -1,0 +1,31 @@
+# B-it1 producer perf -- the one userspace SERIALIZE copy (sudo perf -a -F999, 8 arrow offloads)
+# Captured 2026-06-26. Confirms: the producer is DEFORM-bound (k_fill_*/str_fill_cb, heap->column-
+# buffer materialization, ~20%); the Arrow serialize is ONE cheap concat pass into the IPC body
+# (ArrowIpcEncoderEncodeRecordBatchImpl + memcpy@plt, ~0.5%), NOT a scratch-then-copy; the kernel
+# send copy is __arch_copy_from_user (~6%). So the producer's serialize copy == 1/block (the mirror
+# of bespoke tcp_serialize_block's one scratch copy). The deform (heap->column buffers) is the
+# separate, necessary columnar materialization, identical to the bespoke path.
+
+===== producer-side hot frames (DSO pg_clickhouse.so / postgres) =====
+     7.09%  postgres         pg_clickhouse.so                               [.] pgch_str_fill_cb
+     6.08%  postgres         [kernel.kallsyms]                              [k] __arch_copy_from_user
+     4.15%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_walk<short, short, (anonymous namespace)::Identity>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     3.76%  postgres         pg_clickhouse.so                               [.] (anonymous namespace)::k_fill_string(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     2.67%  postgres         pg_clickhouse.so                               [.] pgch_collect_with_visibility.constprop.0
+     2.53%  postgres         pg_clickhouse.so                               [.] columnizer_should_flush_bytes.part.0
+     1.80%  postgres         pg_clickhouse.so                               [.] pgch_stream_relation_vectorized
+     1.72%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_walk<int, int, (anonymous namespace)::Identity>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     1.45%  postgres         pg_clickhouse.so                               [.] arrow_publish_block.lto_priv.0
+     0.46%  postgres         pg_clickhouse.so                               [.] memcpy@plt
+     0.46%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_walk<long, long, (anonymous namespace)::Identity>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.35%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_walk<long, long, (anonymous namespace)::TimestampToCh>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.12%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_walk<int, unsigned short, (anonymous namespace)::DateToCh>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.10%  postgres         [kernel.kallsyms]                              [k] tcp_sendmsg_locked
+     0.07%  postgres         pg_clickhouse.so                               [.] enlargeStringInfo@plt
+     0.05%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_const<short, short, (anonymous namespace)::Identity>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.04%  postgres         pg_clickhouse.so                               [.] (anonymous namespace)::k_walk_generic(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.04%  QueryPipelineEx  [kernel.kallsyms]                              [k] __pi_memcpy_generic
+     0.03%  postgres         pg_clickhouse.so                               [.] void (anonymous namespace)::k_fill_const<long, long, (anonymous namespace)::Identity>(PgchStep const*, char**, unsigned char const**, unsigned long, unsigned long, void*, void (*)(void*, int, unsigned long, char* const*, unsigned long))
+     0.03%  postgres         pg_clickhouse.so                               [.] __aarch64_ldadd4_sync
+     0.02%  postgres         pg_clickhouse.so                               [.] ArrowIpcEncoderEncodeRecordBatchImpl
+     0.02%  QueryPipelineEx  [kernel.kallsyms]                              [k] __arch_copy_from_user

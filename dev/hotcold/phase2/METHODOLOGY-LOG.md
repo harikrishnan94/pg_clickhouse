@@ -665,3 +665,35 @@ graded deliverable. Null results that killed a hypothesis are logged too.
 - **Verdict:** DONE as iteration 4 (the pre-registered send-zc measured-null/negative, proven via
   SO_EE_CODE_ZEROCOPY_COPIED + the +7.3% wall + exact correctness). DoD send-side item satisfied. CONTINUE →
   B-it1 (producer 1-userspace-copy confirmation), then adversarial review + REPORT-branchB.md.
+
+---
+
+### L0016 — Branch B: B-it1 producer 1-userspace-copy confirmation (the copy-budget "1 required" row)  [branch B]  [iteration 1/confirm]  2026-06-26
+- **Goal:** confirm the producer's serialize stage does exactly ONE userspace copy/block (the column
+  buffers -> Arrow IPC body concat), the mirror of the bespoke tcp_serialize_block scratch copy -- not a
+  "lay into scratch then copy again". (00-PRE-REGISTRATION B-it1; copy-budget row 1.)
+- **How verified (3 converging classes):**
+  1. **Code structure:** `shm_arrow_encode_record_batch` (shm_arrow.c) sets each Arrow child buffer as a
+     ZERO-COPY VIEW onto the deform's column buffers (`bufs[1]=cols[i].value_buf`; for String it prepends
+     the leading 0 into a per-column offsets scratch then points `bufs[1]=offs`, `bufs[2]=value_buf`), then
+     `ArrowIpcEncoderEncodeSimpleRecordBatch` concatenates those views into `enc->body` in ONE pass.
+     `arrow_publish_block` sends `enc->message` (meta) then `enc->body` -- no intermediate scratch.
+  2. **Producer perf (sudo perf -a -F999, 8 arrow offloads; evidence/bit1-producer-serialize.txt):** the
+     producer is DEFORM-bound -- the columnizer fills the cache-resident column buffers
+     (`pgch_str_fill_cb` 7.1%, `k_fill_walk<short/int/long/Date/Timestamp>` + `k_fill_string` ~12% total,
+     `pgch_collect_with_visibility` 2.7%). The Arrow SERIALIZE concat is a SINGLE cheap pass:
+     `ArrowIpcEncoderEncodeRecordBatchImpl` 0.02% + `memcpy@plt` 0.46% (the nanoarrow ArrowBuffer
+     concat); `arrow_publish_block` 1.45%. There is NO second large userspace data memcpy in the publish
+     path. The producer kernel SEND copy is `__arch_copy_from_user` ~6% (the io_uring IORING_OP_SEND copy
+     of the body into the socket buffer -- a kernel copy, not a userspace one).
+  3. **Wire bytes:** `send_bytes` per worker == the serialized meta+body (one buffer sent once); no
+     double-buffering (L0014: arrow send_bytes +0.7% vs bespoke -- the two wires are near-identical size).
+- **Result/interpretation:** confirmed -- ONE userspace serialize copy/block (the concat), the mirror of
+  bespoke's scratch copy; the deform (heap row -> column buffers) is the separate, necessary columnar
+  materialization (the DEFORM phase), identical to the bespoke path and the dominant producer cost. The
+  serialize concat is NOT a hotspot (~0.5% producer CPU), which also refines L0014: the small arrow-vs-
+  bespoke producer delta is the String offsets-prepend + the per-block metadata framing, NOT the concat.
+  Branch B's "producer = 1 userspace copy" criterion (mirroring bespoke) holds. (A truly FUSED
+  deform-directly-into-the-Arrow-body -- 1 copy heap->body, skipping the column buffer -- is NOT
+  implemented and is the same as for bespoke; it is a separate future optimization, out of scope.)
+- **Verdict:** DONE (copy-budget row 1 confirmed by profile + code-structure + wire bytes).
