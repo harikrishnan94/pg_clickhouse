@@ -1,0 +1,40 @@
+Branch 0 — producer io_uring send is ON THE PATH (deterministic counter proof)
+==============================================================================
+Date: 2026-06-26. Host: AWS Graviton aarch64. pg_clickhouse + io_uring producer send.
+DB: tpch_sf10, query TPC-H Q6 (lineitem 59,986,052 rows), tcp transport, 4 producer workers
+(max_parallel_workers_per_gather=4). Instrument: per-producer send-path counter, emitted by the
+worker's "shm tcp-send" LOG when pg_clickhouse.shm_log_stream_stats=on (src/shm_worker.c). This is a
+DETERMINISTIC in-code counter — it counts exactly which send path each logical tcp_send_all() took,
+removing the noise of system-wide syscall sampling.
+
+A counter==send-path is unambiguous: io_uring_sends>0 && blocking_sends==0 proves the io_uring path
+ran (not a silent fallback to blocking on a failed ring init).
+
+--- io_uring (SET pg_clickhouse.tcp_send_method='io_uring'; the Branch-0 default) ---
+pg_clickhouse shm tcp-send: method=io_uring iouring_sends=462 blocking_sends=0 send_bytes=390395500
+pg_clickhouse shm tcp-send: method=io_uring iouring_sends=460 blocking_sends=0 send_bytes=388635958
+pg_clickhouse shm tcp-send: method=io_uring iouring_sends=462 blocking_sends=0 send_bytes=390825930
+pg_clickhouse shm tcp-send: method=io_uring iouring_sends=460 blocking_sends=0 send_bytes=390252092
+  => 4 workers, ~461 io_uring sends each, ZERO blocking, ~390 MB/worker (~1.56 GB total). io_uring ON.
+
+--- blocking (SET pg_clickhouse.tcp_send_method='blocking'; the Phase-1 baseline path) ---
+pg_clickhouse shm tcp-send: method=blocking iouring_sends=0 blocking_sends=466 send_bytes=393853744
+pg_clickhouse shm tcp-send: method=blocking iouring_sends=0 blocking_sends=456 send_bytes=385644466
+pg_clickhouse shm tcp-send: method=blocking iouring_sends=0 blocking_sends=464 send_bytes=393681658
+pg_clickhouse shm tcp-send: method=blocking iouring_sends=0 blocking_sends=458 send_bytes=386929612
+  => 4 workers, ~461 blocking sends each, ZERO io_uring. The A/B baseline is reachable on one binary
+     via SET pg_clickhouse.tcp_send_method='blocking'.
+
+Note on instrument selection (honest null): a first attempt used system-wide
+`perf stat -a -e syscalls:sys_enter_io_uring_enter,sendto` for the query window. It was INCONCLUSIVE —
+io_uring_enter ~1880 and sendto ~150 in BOTH runs — because the live ClickHouse server uses io_uring
+for its own file reads (IOUringReader), swamping the producer's ~460 sends, and system-wide counts are
+not attributable to the producer process. The per-producer counter above is the correct instrument.
+
+Also note: `PGOPTIONS="-c pg_clickhouse.tcp_send_method=blocking"` did NOT take effect (the first
+"blocking" attempt still logged method=io_uring) — a custom-GUC placeholder is not reliably converted
+for a LOAD-time enum GUC. The selector works via an explicit `SET ...` after LOAD, which is exactly
+what the sweep harness (wsweep_split.sh) emits, so the W=8 A/B is unaffected.
+
+Correctness gate (io_uring default): verify_offload.sh TRANSPORT=tcp = 137/137 PASS (/tmp/b0_verify_iouring.log),
+clean teardown (no leaked workers/sockets/fds). No new DIFF (bespoke wire unchanged).

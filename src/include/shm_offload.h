@@ -71,6 +71,21 @@ typedef enum PgchShmTransport
 extern int   pgch_shm_transport_mode;
 
 /*
+ * TCP-transport producer send submission method (Hot-Cold Phase 2, Branch 0, D-HC-0204).
+ * 'io_uring' submits each socket send via a per-worker io_uring (IORING_OP_SEND) -- the
+ * substrate for Branch B's IORING_OP_SEND_ZC; 'blocking' keeps the Phase-1 blocking send()
+ * path. Selected per query (snapshotted into the worker header so the bgworker honors it),
+ * primarily so io_uring-TCP and bespoke-blocking-TCP can be A/B-measured on one binary.
+ * Falls back to blocking automatically if the build lacks liburing or ring init fails.
+ */
+typedef enum PgchTcpSendMethod
+{
+    PGCH_TCP_SEND_BLOCKING = 0,
+    PGCH_TCP_SEND_IOURING = 1,
+} PgchTcpSendMethod;
+extern int   pgch_tcp_send_method;
+
+/*
  * Hard cap on cooperating SHM streaming workers: the final clamp on the count
  * derived from PostgreSQL's parallel-query budget. Stays comfortably below the
  * producer's MAX_PARKED_CONNS so every worker's control-socket connection can

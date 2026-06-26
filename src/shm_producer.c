@@ -21,7 +21,12 @@
 #include "utils/memutils.h"     /* MemoryContextCallback */
 
 #include "shm_producer.h"
+#include "shm_offload.h"        /* PgchTcpSendMethod */
 #include "shm_phase.h"
+
+#ifdef PGCH_USE_LIBURING
+#include <liburing.h>
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -196,7 +201,28 @@ struct ShmProducer {
     bool       tcp_handshake_sent;
     char      *tcp_scratch;
     size_t     tcp_scratch_cap;
+
+    /*
+     * Hot-Cold Phase 2, Branch 0 (D-HC-0204): TCP send submission method. `tcp_send_method`
+     * is a PgchTcpSendMethod (blocking | io_uring). When io_uring is selected AND the build
+     * has liburing, a per-worker ring is lazily created on the first send (`tcp_ring_ready`);
+     * a failed init flips `tcp_ring_failed` and the producer falls back to blocking for the
+     * rest of the stream. The ring carries one IORING_OP_SEND at a time (the producer is
+     * single-threaded per stream). This is the substrate for Branch B's IORING_OP_SEND_ZC.
+     */
+    int        tcp_send_method;
+    uint64_t   tcp_iouring_sends;   /* logical tcp_send_all calls taken via io_uring */
+    uint64_t   tcp_blocking_sends;  /* logical tcp_send_all calls taken via blocking send() */
+    uint64_t   tcp_send_bytes;      /* total bytes handed to tcp_send_all (header+schema+payloads) */
+#ifdef PGCH_USE_LIBURING
+    struct io_uring tcp_ring;
+    bool       tcp_ring_ready;
+    bool       tcp_ring_failed;
+#endif
 };
+
+/* io_uring ring depth for the producer send path (one send in flight at a time). */
+#define PGCH_TCP_IOURING_ENTRIES 8
 
 /* --------------------------------------------------------------------- */
 /* Small helpers */
@@ -433,6 +459,12 @@ producer_cleanup(ShmProducer *p)
         close(p->parked_conns[i]);
     p->n_parked = 0;
 
+#ifdef PGCH_USE_LIBURING
+    /* Exit the send ring before closing the socket: io_uring_queue_exit cancels any in-flight
+     * SQE (it references tcp_conn_fd + tcp_scratch). This runs as a memory-context reset
+     * callback, before tcp_scratch's context memory is freed, so no SQE can outlive its buffer. */
+    if (p->tcp_ring_ready) { io_uring_queue_exit(&p->tcp_ring); p->tcp_ring_ready = false; }
+#endif
     if (p->tcp_conn_fd >= 0) { close(p->tcp_conn_fd); p->tcp_conn_fd = -1; }
     if (p->listen_fd >= 0) { close(p->listen_fd); p->listen_fd = -1; }
     if (p->event_fd >= 0)  { close(p->event_fd);  p->event_fd = -1; }
@@ -462,7 +494,7 @@ producer_cleanup_callback(void *arg)
 
 /* Blocking send-all, cancellation/backend-death responsive (SO_SNDTIMEO slices -> EAGAIN). */
 static void
-tcp_send_all(ShmProducer *p, const void *buf, size_t n)
+tcp_send_all_blocking(ShmProducer *p, const void *buf, size_t n)
 {
     const char *ptr = (const char *) buf;
     while (n > 0)
@@ -491,6 +523,132 @@ tcp_send_all(ShmProducer *p, const void *buf, size_t n)
         ereport(ERROR, (errcode_for_file_access(),
                         errmsg("pg_clickhouse: TCP send to consumer failed: %m")));
     }
+}
+
+#ifdef PGCH_USE_LIBURING
+/*
+ * Hot-Cold Phase 2, Branch 0 (D-HC-0204): lazily create the per-worker io_uring ring on the
+ * first io_uring send. Returns true if the ring is usable; on init failure flips
+ * tcp_ring_failed so the producer falls back to the blocking send path for the rest of the
+ * stream (io_uring may be disabled by seccomp / a restrictive policy; that must not break the
+ * stream). The ring is torn down in producer_cleanup.
+ */
+static bool
+tcp_iouring_ensure(ShmProducer *p)
+{
+    int ret;
+
+    if (p->tcp_ring_ready)
+        return true;
+    if (p->tcp_ring_failed)
+        return false;
+
+    ret = io_uring_queue_init(PGCH_TCP_IOURING_ENTRIES, &p->tcp_ring, 0);
+    if (ret < 0)
+    {
+        /* Not fatal: fall back to blocking for the rest of the stream. */
+        ereport(LOG, (errmsg("pg_clickhouse: io_uring_queue_init failed (%d); "
+                             "TCP send falls back to blocking send()", ret)));
+        p->tcp_ring_failed = true;
+        return false;
+    }
+    p->tcp_ring_ready = true;
+    return true;
+}
+
+/*
+ * Send-all over io_uring: one IORING_OP_SEND per (remaining) buffer span, submitted and waited
+ * with a 100ms completion timeout so the loop still polls CHECK_FOR_INTERRUPTS + backend death
+ * (the io_uring analog of the blocking path's SO_SNDTIMEO slices). The kernel still copies from
+ * userspace (this is IORING_OP_SEND, not _ZC) -- Branch 0 changes only how the send is
+ * submitted, not the copy count. Partial sends resubmit the remainder; -EAGAIN/-EINTR resubmit.
+ */
+static void
+tcp_send_all_iouring(ShmProducer *p, const void *buf, size_t n)
+{
+    const char *ptr = (const char *) buf;
+
+    while (n > 0)
+    {
+        struct io_uring_sqe *sqe;
+        struct io_uring_cqe *cqe;
+        struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100L * 1000L * 1000L };
+        int res;
+        int ret;
+
+        CHECK_FOR_INTERRUPTS();
+
+        sqe = io_uring_get_sqe(&p->tcp_ring);
+        if (sqe == NULL)
+        {
+            /* SQ momentarily full (should not happen with one in-flight send); drain it. */
+            (void) io_uring_submit(&p->tcp_ring);
+            continue;
+        }
+        io_uring_prep_send(sqe, p->tcp_conn_fd, ptr, n, MSG_NOSIGNAL);
+        ret = io_uring_submit(&p->tcp_ring);
+        if (ret < 0)
+        {
+            if (ret == -EINTR || ret == -EAGAIN)
+                continue;
+            ereport(ERROR, (errmsg("pg_clickhouse: io_uring_submit (send) failed: %d", ret)));
+        }
+
+        /* Wait for the single completion, waking every 100ms to poll cancel + backend death. */
+        for (;;)
+        {
+            ret = io_uring_wait_cqe_timeout(&p->tcp_ring, &cqe, &ts);
+            if (ret == -ETIME || ret == -EINTR)
+            {
+                CHECK_FOR_INTERRUPTS();
+                if (origin_backend_dead(p))
+                    ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                           "abandoning TCP stream", p->origin_pid)));
+                continue;
+            }
+            if (ret < 0)
+                ereport(ERROR, (errmsg("pg_clickhouse: io_uring_wait_cqe (send) failed: %d", ret)));
+            break;
+        }
+
+        res = cqe->res;
+        io_uring_cqe_seen(&p->tcp_ring, cqe);
+
+        if (res > 0) { ptr += res; n -= (size_t) res; continue; }
+        if (res == -EINTR || res == -EAGAIN)
+            continue;
+        if (res == 0)
+            continue;   /* zero-length completion: retry */
+
+        /* res < 0: a real send error (errno = -res). */
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                   "abandoning TCP stream", p->origin_pid)));
+        errno = -res;
+        ereport(ERROR, (errcode_for_file_access(),
+                        errmsg("pg_clickhouse: io_uring TCP send to consumer failed: %m")));
+    }
+}
+#endif /* PGCH_USE_LIBURING */
+
+/*
+ * Send-all dispatcher: io_uring (Branch 0 default) when selected + available, else blocking.
+ * The selection is per-stream (snapshotted into the worker header from the backend GUC).
+ */
+static void
+tcp_send_all(ShmProducer *p, const void *buf, size_t n)
+{
+    p->tcp_send_bytes += n;
+#ifdef PGCH_USE_LIBURING
+    if (p->tcp_send_method == PGCH_TCP_SEND_IOURING && tcp_iouring_ensure(p))
+    {
+        p->tcp_iouring_sends++;
+        tcp_send_all_iouring(p, buf, n);
+        return;
+    }
+#endif
+    p->tcp_blocking_sends++;
+    tcp_send_all_blocking(p, buf, n);
 }
 
 /* Accept the consumer (poll loop honouring cancel + backend death), set TCP_NODELAY + a send
@@ -716,6 +874,11 @@ shm_producer_create(const char *name,
     p->tcp_scratch = NULL;
     p->tcp_scratch_cap = 0;
     p->tcp_port = 0;
+    p->tcp_send_method = PGCH_TCP_SEND_BLOCKING;   /* set by shm_producer_set_tcp_send_method */
+#ifdef PGCH_USE_LIBURING
+    p->tcp_ring_ready = false;
+    p->tcp_ring_failed = false;
+#endif
 
     if (ring_depth_k == 0 || ring_depth_k > SHM_IMPL_MAX_K)
         ereport(ERROR, (errmsg("pg_clickhouse: shm ring depth %u out of range (1..%u)",
@@ -872,6 +1035,21 @@ void
 shm_producer_set_origin_pid(ShmProducer *p, int pid)
 {
     p->origin_pid = pid;
+}
+
+void
+shm_producer_set_tcp_send_method(ShmProducer *p, int method)
+{
+    p->tcp_send_method = method;
+}
+
+void
+shm_producer_tcp_send_stats(const ShmProducer *p, uint64_t *iouring_sends,
+                            uint64_t *blocking_sends, uint64_t *send_bytes)
+{
+    if (iouring_sends)  *iouring_sends = p->tcp_iouring_sends;
+    if (blocking_sends) *blocking_sends = p->tcp_blocking_sends;
+    if (send_bytes)     *send_bytes = p->tcp_send_bytes;
 }
 
 void

@@ -54,12 +54,21 @@ bool  pgch_log_stream_stats = false;
 bool  pgch_enable_jit_deform = false;
 int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
+int   pgch_tcp_send_method = PGCH_TCP_SEND_IOURING;
 
 /* adopt/copy = SHM transport (consumer-side data path); tcp = TCP stream transport (Phase 1). */
 static const struct config_enum_entry pgch_shm_transport_options[] = {
     {"adopt", PGCH_TRANSPORT_ADOPT, false},
     {"copy",  PGCH_TRANSPORT_COPY,  false},
     {"tcp",   PGCH_TRANSPORT_TCP,   false},
+    {NULL, 0, false},
+};
+
+/* TCP producer send submission method (Branch 0): io_uring (default) or blocking. */
+static const struct config_enum_entry pgch_tcp_send_method_options[] = {
+    {"io_uring", PGCH_TCP_SEND_IOURING,  false},
+    {"iouring",  PGCH_TCP_SEND_IOURING,  true},   /* hidden alias */
+    {"blocking", PGCH_TCP_SEND_BLOCKING, false},
     {NULL, 0, false},
 };
 
@@ -1160,6 +1169,16 @@ pgch_shm_offload_init(void)
                              "and emitted as the streamed_table() transport argument.",
                              NULL, &pgch_shm_transport_mode, PGCH_TRANSPORT_ADOPT,
                              pgch_shm_transport_options, PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomEnumVariable("pg_clickhouse.tcp_send_method",
+                             "For the 'tcp' transport, how the producer submits its socket send: "
+                             "'io_uring' (default; one IORING_OP_SEND per buffer via a per-worker "
+                             "io_uring ring -- the substrate for zero-copy send) or 'blocking' (the "
+                             "Phase-1 blocking send() path). Snapshotted into the streaming-worker "
+                             "header so the background worker honors the backend session's choice; "
+                             "falls back to blocking if the build lacks liburing or ring init fails.",
+                             NULL, &pgch_tcp_send_method, PGCH_TCP_SEND_IOURING,
+                             pgch_tcp_send_method_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
      * last_query_used_clickhouse observability GUC. */

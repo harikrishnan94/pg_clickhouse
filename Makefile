@@ -41,6 +41,16 @@ ifneq ($(OS),darwin)
 	PG_LDFLAGS += -luuid -lrt
 endif
 
+# io_uring (Hot-Cold Phase 2, Branch 0): the TCP-transport producer submits its
+# socket send via io_uring (IORING_OP_SEND) instead of a blocking send() when
+# liburing is present -- the substrate for Branch B's IORING_OP_SEND_ZC. Detected
+# by the liburing dev header; absent => the producer keeps the blocking send path
+# (no hard dependency, selected at run time by pg_clickhouse.tcp_send_method).
+ifneq ($(wildcard /usr/include/liburing.h),)
+	PG_CPPFLAGS += -DPGCH_USE_LIBURING
+	PG_LDFLAGS += -luring
+endif
+
 # Suppress annoying pre-c99 warning, error on other warnings, include curl.
 PG_CFLAGS = -Wno-declaration-after-statement -Wall -Werror $(shell $(CURL_CONFIG) --cflags)
 
