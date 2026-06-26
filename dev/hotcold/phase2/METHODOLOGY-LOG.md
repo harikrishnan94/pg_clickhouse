@@ -184,3 +184,45 @@ graded deliverable. Null results that killed a hypothesis are logged too.
   Q24 headline honesty → REPORT tightened (real within-floor regression, not "noise").
 - **Verdict:** DONE. Branch 0 GREEN — implementation + measurement + review complete, committed as small
   patches. CONTINUE → Branch A (Arrow wire) is designed/decided/pre-registered; implementation pending.
+
+---
+
+### L0006 — Branch A step 1: vendor nanoarrow 0.8.0 (+ nanoarrow_ipc + flatcc), wire Makefile  [branch A]  [iteration 1]  2026-06-26
+- **Goal / hypothesis:** Land the Arrow producer dependency (D-HC-0202) as a self-contained, buildable,
+  behavior-NEUTRAL commit (no code references it yet). Predicted: build stays green; the bespoke-TCP
+  regression oracle stays 137/137 (nothing on the data path changed).
+- **What I did (files):**
+  - Vendored the upstream **apache-arrow-nanoarrow-0.8.0** single-file *bundle* (CMake `bundle.py` /
+    `-DNANOARROW_BUNDLE=ON -DNANOARROW_IPC=ON` output, staged at `/tmp/na-bundle`) into
+    `src/nanoarrow/`: `src/{nanoarrow.c, nanoarrow_ipc.c, flatcc.c}`, `include/{nanoarrow,flatcc}/…`,
+    `LICENSE.txt`, `NOTICE.txt`, `README.vendor.md` (provenance + how-regenerated). 44 files.
+  - `Makefile`: guarded block (mirrors `PGCH_USE_LIBURING`) — when
+    `src/nanoarrow/include/nanoarrow/nanoarrow_ipc.h` exists, add `-DPGCH_USE_NANOARROW
+    -I./src/nanoarrow/include` and the 3 vendored TUs to `OBJS` (they live at `src/nanoarrow/src/*.c`,
+    one level deeper than the `src/*/*.c` auto-glob, so they are NOT swept into the base extension and
+    are added explicitly). After the PGXS include: `$(NANOARROW_OBJS): CFLAGS += -w` so the third-party
+    generated code compiles without the base extension's `-Wall -Werror`; `EXTRA_CLEAN += $(NANOARROW_OBJS)`.
+- **How I did it (commands):**
+  - De-risk pre-vendor: `cd /tmp/na-bundle && gcc -c -Iinclude -O2 src/{nanoarrow,flatcc,nanoarrow_ipc}.c`
+    → all 3 compile clean (bundle is self-contained; `flatbuffers_*_reader.h` etc. are inlined into
+    `nanoarrow_ipc.c`). Confirmed `NANOARROW_VERSION "0.8.0"` and the IPC encoder API present
+    (`ArrowIpcEncoderInit / EncodeSchema / EncodeSimpleRecordBatch / FinalizeBuffer`).
+  - `make -j32 && sudo make install`.
+- **How verified (correctness gate — no perf claim for a build-wiring step):**
+  1. **Build:** clean `make -j32` → links `pg_clickhouse.so` with `src/nanoarrow/src/{nanoarrow,
+     nanoarrow_ipc,flatcc}.o` (final link line shows all three); base extension TUs still `-Wall -Werror`.
+  2. **Regression oracle:** `CH_BIN=…/reldeb/programs/clickhouse PG_DB=shmdemo TRANSPORT=tcp bash
+     test/shm/verify_offload.sh` → **PASS=137 FAIL=0, EXIT=0** (`/tmp/bA_step1_verify.log`) on the
+     live CH Branch-0 binary — i.e. the bespoke-TCP path is byte-unchanged by the vendoring.
+- **Result (RAW):** `verify_offload TRANSPORT=tcp`: `PASS=137 FAIL=0 ALL CHECKS PASSED EXIT=0`. nanoarrow
+  0.8.0 vendored, 44 files. `nm -D` shows ~106 `Arrow*` + flatcc symbols exported (the headers force
+  `__attribute__((visibility("default")))` via `NANOARROW_DLL`, overriding `-fvisibility=hidden`).
+- **Interpretation:** dependency landed, build green, no behavior change — exactly the predicted neutral
+  outcome. The exported-symbol surface is harmless for a single dlopen'd extension here (no other
+  Arrow/flatcc consumer in this PG backend) but is a productionization follow-up (namespace via
+  `-DNANOARROW_NAMESPACE` for the nanoarrow symbols; flatcc would need separate handling).
+- **Learnings:** (1) keep the vendored `.c` one level deeper than `src/*/*.c` so the base-extension glob
+  never sweeps third-party code into `-Wall -Werror`. (2) The bundle's IPC TU inlines all flatcc-generated
+  flatbuffer headers, so `-Iinclude` is the only include flag needed.
+- **Verdict:** DONE (A1 green, committed). CONTINUE → A2 (`arrow:` transport-token plumbing) + A3
+  (producer Arrow IPC serialize behind the `arrow:` token).

@@ -51,6 +51,24 @@ ifneq ($(wildcard /usr/include/liburing.h),)
 	PG_LDFLAGS += -luring
 endif
 
+# nanoarrow (Hot-Cold Phase 2, Branch A): the TCP-transport producer serialises
+# each block as an Apache Arrow IPC encapsulated message (Schema + RecordBatch)
+# via the vendored nanoarrow + nanoarrow_ipc amalgamation (src/nanoarrow/, v0.8.0)
+# so the wire speaks a standard columnar format the stock ClickHouse Arrow reader
+# can decode (decision D-HC-0202). The three vendored TUs live one level deeper
+# than the src/*/*.c auto-glob, so they are added to OBJS explicitly and compiled
+# with warnings relaxed (third-party generated code) -- the base extension stays
+# -Wall -Werror. Guarded by the vendored header (no hard dependency); the Arrow
+# producer path is #ifdef PGCH_USE_NANOARROW.
+NANOARROW_DIR = src/nanoarrow
+ifneq ($(wildcard $(NANOARROW_DIR)/include/nanoarrow/nanoarrow_ipc.h),)
+	PG_CPPFLAGS += -DPGCH_USE_NANOARROW -I./$(NANOARROW_DIR)/include
+	NANOARROW_OBJS = $(NANOARROW_DIR)/src/nanoarrow.o \
+	                 $(NANOARROW_DIR)/src/nanoarrow_ipc.o \
+	                 $(NANOARROW_DIR)/src/flatcc.o
+	OBJS += $(NANOARROW_OBJS)
+endif
+
 # Suppress annoying pre-c99 warning, error on other warnings, include curl.
 PG_CFLAGS = -Wno-declaration-after-statement -Wall -Werror $(shell $(CURL_CONFIG) --cflags)
 
@@ -64,6 +82,14 @@ EXTRA_CLEAN = sql/$(EXTENSION)--$(EXTVERSION).sql src/include/version.h compile_
 # Import PGXS.
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Compile the vendored nanoarrow/flatcc amalgamation without -Wall -Werror (it is
+# third-party generated code); keeps optimisation/PIC from the PGXS CFLAGS. The
+# -w is appended last so it wins over the base extension's -Werror.
+ifneq ($(NANOARROW_OBJS),)
+$(NANOARROW_OBJS): CFLAGS += -w
+EXTRA_CLEAN += $(NANOARROW_OBJS)
+endif
 
 # ---- Optional LLVM-JIT deform module (pg_clickhouse_jit) ----------------
 # Built ONLY when an llvm-config is found. The base extension never links LLVM;
