@@ -13,7 +13,7 @@ ETL-everything baseline) by 4–24× — the price of keeping the hot data fresh
 it. The headline win shrinks as f grows (at f=10% the *single-threaded* hot producer streaming 10M
 rows erases the advantage over full-offload). On loopback the hot transfer is **CPU-bound** and only
 *hides* under the cold scan for the slowest queries — the **network-overlap thesis is NOT proven here
-and is deferred to Unit 2 (NO RESULT)**. Cold-IO pressure: Unit 3.
+and is deferred to Unit 2 (NO RESULT)**. Cold-IO: streaming's added memory is BOUNDED (a fixed 64 MiB ring + ~tens-MB staging, ~independent of data size) — at f=10% it uses LESS total memory than native PG; no throughput penalty.
 
 ---
 
@@ -118,7 +118,27 @@ B, Postgres on box A — re-running the Unit-1 (f, W) matrix with the hot arm st
 (TCP/Arrow transport), measuring merge wall + per-arm timeline. Confirm signature: merge ≈ max(cold-CPU,
 hot-network) with the hot hidden when hot-bytes ÷ NIC-bandwidth < cold-time (small f); refute: merge ≈ cold + hot.
 **No loopback/netem/projection figure above is a real-NIC measurement.**
-## Unit 3 — cold-IO added-pressure — *(pending)*
+## Unit 3 — cold-IO added-pressure — **GREEN (concern refuted)**
+
+Andrey's concern: does streaming add memory pressure when the hot slice is read COLD from disk? Forced cold by
+shrinking `shared_buffers` 16GB→256MB (< the 0.66/6.6 GB hot tables) + `drop_caches` before each run (D-HC-0409,
+PG restored to 16GB after). Cold confirmed: EXPLAIN BUFFERS `shared read=84480` (660MB from disk, 4327ms) vs warm
+`shared hit=` (159ms, 27×); disk-bound throughput ~127–150 MB/s. Per-backend peak VmRSS, N=3:
+
+| | native PG (4 workers) | streaming (1 producer + ring) | delta (stream − native) |
+| --- | --- | --- | --- |
+| f=1% (660MB cold) | 26 + ~100 (workers) ≈ 126 MB | 108 MB RSS + **64 MiB ring** ≈ 172 MB | +46 MB |
+| f=10% (6.6GB cold) | 101 + ~400 (workers) ≈ 500 MB | **129 MB** RSS + 64 MiB ring ≈ 193 MB | **−307 MB** |
+
+- **Streaming's footprint is BOUNDED and ~independent of the hot-fraction size**: the producer RSS grows only
+  108→129 MB (+12%) for **10× more** hot data, and the SHM ring is a **fixed 64 MiB** (the NB-4 cap). Mechanism:
+  the producer columnizes one fixed `rows_per_block` (65536) block at a time and flushes to the capped ring →
+  memory is O(block + ring), not O(rows). Native PG's footprint, by contrast, GROWS with f (and parallelism):
+  ~500 MB at f=10%, so **streaming uses LESS total memory than native PG at scale**.
+- **No cold-IO throughput penalty**: both arms are disk-bound (wall ≈ identical, 4.5s / 52s); streaming's columnize
+  CPU overlaps the disk wait, so streaming throughput ≈ native when reading cold.
+- **Verdict**: the added pressure of streaming over native PG is bounded and small (often *negative* vs native's
+  parallel scan) — Andrey's concern is empirically refuted; no runaway/unbounded pressure.
 
 ---
 *(Numbers above are committed in `results/bench/{cells.tsv,baselines10m.tsv}`; reproduction in

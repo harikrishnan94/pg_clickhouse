@@ -290,3 +290,28 @@ Material claims require ≥3 independent converging sources; orientation/operati
   (small f); refute: merge ≈ cold + hot (hot-network does NOT overlap cold-CPU). BANNED here: presenting any
   loopback/netem/projection figure as the real-NIC result.
 - Verdict: NO RESULT (bounded). Angles gathered as LEADS/bounds (results/bench/nic_netem.tsv + the analytic).
+
+### L0047 — Unit-3: cold-IO added-pressure — streaming's footprint is BOUNDED & ~data-size-independent  [unit 3]  [iteration 1-3]  2026-06-28T10:40+05:30
+- Goal / hypothesis (prereg §UNIT3): when the hot slice is read COLD from disk, streaming adds only a BOUNDED
+  increment (columnar staging + the fixed 64 MiB SHM ring) over native PG's scan footprint — NOT runaway.
+- Holistic note: the streamed path is cross-process (PG producer columnizes → SHM ring → CH consumer). The
+  producer processes in fixed rows_per_block (65536) blocks and flushes to a capped ring, so its memory is
+  O(block + ring), independent of total rows — the whole-system footprint should not grow with the hot fraction.
+- What I did: 13_coldio.sh — shrank shared_buffers 16GB→256MB + restart (so the 0.66/6.6 GB hot tables can't be
+  cached), drop_caches before each run; per (f∈{p01,p10}, arm∈{native PG scan, clickhouse_stream_relation drained
+  by a CH consumer}) measured per-backend peak VmRSS (+ PG parallel workers), wall, ring size; N=3. Restored 16GB.
+- How verified (≥3 sources for the cold condition + the delta): (i) shared_buffers=256MB < table size; (ii)
+  drop_caches each run; (iii) EXPLAIN(ANALYZE,BUFFERS) post-hoc: cold `shared read=84480` (660MB from disk, 4327ms)
+  vs warm `shared hit=84480` (159ms, 27×) — confirms real disk reads (the /proc/<backend>/io=0 is because PG18
+  reads via io_worker processes, not the backend — caveat); (iv) disk-bound throughput ~127-150 MB/s both arms.
+- Result (results/bench/coldio.tsv): STREAMING producer RSS 108 MB (p01) → 129 MB (p10) — +12% for 10× more hot
+  data; SHM ring FIXED 64 MiB at both f ⇒ streaming footprint ≈ 172-193 MB, ~INDEPENDENT of fraction size. NATIVE
+  PG (4 parallel workers) total 126 MB (p01) → ~500 MB (p10) — grows with f. DELTA (stream − native total): +46 MB
+  at f=1%; −307 MB at f=10% (streaming uses LESS). Per-process: streaming adds ~80 MB staging + 64 MiB ring (~145
+  MB) over a single native backend (26-101 MB). THROUGHPUT: wall stream ≈ native (4.5s p01 / ~52s p10) — both
+  disk-bound, streaming's columnize CPU overlaps the disk wait → NO cold-IO throughput penalty.
+- Interpretation: prereg CONFIRMED — streaming's added memory is BOUNDED (dominated by the fixed 64 MiB ring +
+  ~tens-MB staging), ~constant in data size, and at scale LESS than native PG's parallel footprint. Andrey's
+  concern (streaming balloons memory when reading cold from disk) is empirically REFUTED: the cross-process
+  footprint does not grow with the hot fraction; no runaway/unbounded pressure. No cold-IO throughput penalty.
+- Verdict: DONE — streaming adds bounded, small (often negative-vs-native) memory pressure; proven, not assumed.

@@ -119,3 +119,12 @@ Continues the `dev/hotcold/DECISIONS.md` series (last id there: D-HC-0303). Temp
   Unit-1 matrix over the real NIC.
 - Risks/tradeoffs: the analytic uses all-105-col hot-bytes (conservative); netem-on-loopback rate is unreliable (caveat).
 - Revisit trigger: a 2nd instance / real NIC becomes available.
+
+### D-HC-0409 — Unit-3 shrank PG shared_buffers (16GB→256MB) + restart to force cold-from-disk; RESTORED — 2026-06-28  [HIGH-IMPACT]
+- Context: §UNIT3 requires the hot slice read COLD from disk; shared_buffers=16GB caches the 0.66/6.6 GB hot tables.
+- Options: (a) churn shared_buffers to evict (unreliable); (b) shrink shared_buffers + restart (the task's method).
+- Criteria: real disk reads; reversible; restore the host PG.
+- Chosen: (b). ALTER SYSTEM shared_buffers='256MB' + pg_ctlcluster 18 main restart; EXIT-trap restores 16GB + restart.
+- Evidence: post-run `show shared_buffers` = 16GB (restored, verified); cold reads confirmed (EXPLAIN BUFFERS read=84480).
+- Risks/tradeoffs: invasive (2 restarts of the shared host PG; no production load). Trap ensures restore even on error.
+- Revisit trigger: any future cold-IO run must re-confirm shared_buffers is restored to 16GB afterward.
