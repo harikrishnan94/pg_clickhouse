@@ -19,17 +19,32 @@ the socket before freeing frames (H8). **K=1 ≡ P1 single-in-flight exactly** (
 
 ## Acceptance criteria
 - **Correct.** `verify_offload TRANSPORT=tcp` 137/137 and `TRANSPORT=arrow` 137/137 (no DIFF, clean
-  teardown); a 60M-row lineitem stream at K=1/2/8 (epoll) and K=2/8 (msg_zerocopy) all match native; the
-  async-zerocopy reactor completes (`zc_sends>0`) with no hang/UAF. K=1 stays single-in-flight.
+  teardown; committed `evidence/p2-correctness.txt` — NB-3); a 60M-row lineitem stream at K=1/2/8 ×
+  {epoll, msg_zerocopy} all match native (`59986052|1799465265420123`); the async-zerocopy reactor
+  completes (`zc_sends>0`) with no hang/UAF. K=1 stays single-in-flight. **Partial-send RESUME verified
+  (H9/NB-2):** with `tcp_sndbuf_bytes=4096` every ≥64 KiB data frame is fragmented into ~16+ `sendmsg`
+  calls (driving the `f->sent>0` resume path); K=2 epoll AND msg_zerocopy both == native on the full 60M-row
+  stream. (The producer is a PG bgworker, not gtest-able here; the PROMPT's isolated forced-1-byte +
+  multi-block-EOS gtests are covered end-to-end this way — a noted residual limitation, not an isolated
+  gtest.) **Frame-pool memory capped for all methods (NB-4):** `tcp_reactor_init` bounds the per-stream pool
+  to 128 MiB (was uncapped on the default epoll path for String schemas); zerocopy keeps the tighter 8 MiB
+  RLIMIT cap; K clamped + logged.
 - **One send on the socket at a time** (byte-stream order): the reactor issues one `sendmsg` at a time in
   FIFO order; "K in flight" = K frames sent-awaiting-completion concurrently, NOT concurrent socket sends.
 - **Coalesced sendmsg** (H9): one 2-iovec `sendmsg` per data frame (was two sends).
 - **Overlap proven (the binding evidence).** ≥3 converging classes:
   1. **K-sweep wall** — bare loopback NULL (pre-registered); netem-rate/-delay NULL (root-caused, below);
      **injected-per-frame-latency microbench (the PROMPT-sanctioned complementary instrument): K>1 recovers
-     throughput** — K=4 fully hides a 20 ms/frame latency (2554→949 ms, **2.7×**), K=8 hides 40 ms/frame
-     (4855→952 ms, **5.1×**); the **knee scales with the latency** (20 ms→K=4, 40 ms→K=8), the latency
-     analog of "the K knee moves with BDP" (H11).
+     throughput** — (epoll) K=4 fully hides a 20 ms/frame latency (2554→949 ms, **2.7×**), K=8 hides
+     40 ms/frame (4855→952 ms, **5.1×**); the **knee scales with the latency** (20 ms→K=4, 40 ms→K=8), the
+     latency analog of "the K knee moves with BDP" (H11). **Direct msg_zerocopy proof (NB-1, the literal
+     pin):** the same microbench at 20 ms/frame with `METHOD=msg_zerocopy` — K=1 2587 → **K=2 1400 (1.85×)
+     → K=4 1025 (2.52×)** ms (n=6/level, spread <1 %; `evidence/p2-injdelay-knee.txt`,
+     `results/p2_kbench_injdelay20ms_zc/walls.tsv`) — so K>1 raises **zerocopy** throughput on the zerocopy
+     reclaim path, not by analogy. *(Best-case upper bound — NB-8: the microbench imposes no byte-rate floor,
+     so K hides 100 % of per-frame latency down to the ~944 ms pure-deform floor; a real rate-limited NIC
+     cannot hide latency below its serialization-rate floor, so these multipliers are deform-floored upper
+     bounds, not expected real-NIC speedups.)*
   2. **Mechanism counter** — `overlap_frames`: K=1 → 0, K=8 → 228/worker (deform/serialize of later blocks
      ran ahead of the in-flight send; the H1 overlap, structural).
   3. **Two-cursor pipeline** — the microbench win only appeared after the single-cursor→two-cursor fix
@@ -68,10 +83,12 @@ reported honestly.
 - **H1** (K-deep frame pool IS the deform-overlap; no cz->bufs double-buffer): SATISFIED — frames serialize
   out of cz->bufs; `overlap_frames`>0 shows deform(N+1) ran ahead.
 - **H4/H6/H7** (async MSG_ZEROCOPY, K>1 raises zerocopy throughput): the async completion is implemented +
-  proven (the K-deep pin pipelines under injected latency); on loopback zerocopy K is null (deferred-copy,
-  host-intrinsic) — the microbench is the binding proof per the PROMPT's complementary-instrument clause;
-  the flat loopback zerocopy curve is NOT a deferral bug (rebutted: `overlap_frames`>0 + the injected-delay
-  win prove the drain is deferred and K frames pipeline).
+  proven **directly on the zerocopy reclaim path** — `METHOD=msg_zerocopy` injected-latency microbench:
+  K=2 1.85×, K=4 2.52× (NB-1 resolution; `evidence/p2-injdelay-knee.txt`). On loopback the *netem* zerocopy
+  K-curve is null (deferred-copy, host-intrinsic — netem cannot ACK-gate the loopback completion); the
+  injected-latency microbench is the instrument that models real-NIC completion gating, and on it the
+  zerocopy path pipelines (flat netem-zc is NOT a deferral bug: `overlap_frames`>0 + the injected-delay win
+  prove the drain is deferred and K frames pipeline).
 - **H5** (EOS-before-close drain): SATISFIED. **H8** (no leaked fd / no UAF): SATISFIED (socket closed
   before frames freed). **H9** (coalesced sendmsg): SATISFIED. **H14** (K=1 ≡ P1): SATISFIED.
 - **H2/H10** (no hot-spin / bounded waits): the reactor waits are bounded (`tcp_wait_writable` 100ms slice,

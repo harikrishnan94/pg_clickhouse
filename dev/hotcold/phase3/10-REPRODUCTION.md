@@ -56,3 +56,42 @@ python3 dev/hotcold/phase3/agg_interleave.py dev/hotcold/phase3/results/interlea
 ```
 Each round restarts CH from each binary and measures the decisive subset, so C1 and baseline samples are
 adjacent in time. Verdict band = max(5%, observed between-round sd). C1 result: 8/8 PARITY.
+
+## P1 parity (producer epoll vs io_uring)
+Same interleaved A/B but swapping only the producer `.so` (no PG restart — `session_preload_libraries` +
+the dynamic bgworker reload the on-disk `.so`; the consumer stays the live C1 CH):
+```
+# save both .so aside (epoll P1 .so, io_uring baseline .so), then:
+bash dev/hotcold/phase3/p1_interleave_ab.sh <p1.so> <baseline.so>
+python3 dev/hotcold/phase3/agg_interleave.py dev/hotcold/phase3/results/p1_interleave p1
+```
+io_uring-off mechanism: `ldd`/`nm` on the built `.so` (0 liburing / 0 io_uring symbols vs baseline 1+4);
+`grep -nE 'io_uring|iouring|IOURING|PGCH_USE_LIBURING' src/ Makefile*` → only comments. Result: 8/8 PARITY.
+
+## P2 K-sweep + netem + injected-latency microbench
+GUCs (set per query via the wsweep `EXTRA_SET` hook, or directly):
+`pg_clickhouse.tcp_send_inflight_blocks` (K, default 2), `pg_clickhouse.tcp_sndbuf_bytes` (per-socket
+SO_SNDBUF; 0=32 MiB), `pg_clickhouse.tcp_send_delay_us` (injected per-frame in-flight latency; 0=off).
+```
+# bare-loopback K-sweep (interleaved K across rounds; assert lo=noqueue first, H12):
+REGIME=bare METHOD=epoll ROUNDS=2 KLIST="1 2 4 8" N=5 CBQ="2 17 33" TPQ="6 9" \
+    bash dev/hotcold/phase3/p2_ksweep.sh
+python3 dev/hotcold/phase3/agg_ksweep.py dev/hotcold/phase3/results/p2_ksweep_bare
+
+# netem regime (H11/H12): netem on lo + a PER-SOCKET SO_SNDBUF (NOT global wmem_max — clamping that
+# small starves netlink/tc, see L0026). ALWAYS trap-removes the qdisc.
+DELAY=50us RATE=3gbit SNDBUF=65536 TAG=netem3g METHOD=epoll ROUNDS=2 KLIST="1 2 4 8" \
+    bash dev/hotcold/phase3/p2_netem_ksweep.sh         # full wsweep variant
+# lean offload-only timer (no native/oracle — ~10 min) for the netem + microbench K-sweeps:
+DELAY=500us RATE=10gbit SNDBUF=0 TAG=netem10gd500zc METHOD=msg_zerocopy KLIST="1 2 4" ROUNDS=3 N=3 \
+    QFILES="99" bash dev/hotcold/phase3/p2_netem_kbench.sh
+
+# the BINDING overlap proof — injected per-frame latency (no netem; the delay IS the latency):
+DELAYUS=20000 TAG=injdelay20ms METHOD=epoll KLIST="1 2 4 8" ROUNDS=2 N=3 SNDBUF=0 QFILES="99" \
+    bash dev/hotcold/phase3/p2_kbench.sh
+python3 dev/hotcold/phase3/agg_kbench.py dev/hotcold/phase3/results/p2_kbench_injdelay20ms/walls.tsv
+```
+`dev/tpch/queries/99.sql` = the all-fixed, no-filter, transfer-bound test query (4 decimals + count over
+lineitem) used so frames are tightly sized (zerocopy K>1 fits the 8 MiB RLIMIT_MEMLOCK). The overlap
+mechanism counter is in the producer LOG: `... K=<eff> pumps=<n> overlap_frames=<n>` (shm_log_stream_stats
+on). Results: bare/netem NULL; injected-latency K=4 hides 20 ms/frame (2.7×), K=8 hides 40 ms (5.1×).

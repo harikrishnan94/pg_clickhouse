@@ -481,3 +481,14 @@ behind completions so K never pipelined (caught by the injected-delay microbench
 (d) A background sender thread (to keep the link saturated during deform on loopback) — rejected: out of
 scope (the producer is single-threaded by design); it is the only way K would help loopback, logged as a
 possible future direction.
+**Review: GREEN** (4 independent angles — correctness/fidelity/perf-honesty/holism — zero blocking findings;
+`evidence/ADVERSARIAL-REVIEW-P2.md`). The apparent flat-`msg_zerocopy`-curve FAIL is resolved by the PROMPT's
+complementary-instrument clause AND now by a **direct** zerocopy injected-latency K-sweep (NB-1): K=2 1.85×,
+K=4 2.52× at 20 ms/frame on the zerocopy reclaim path (not by analogy). Post-review resolutions: NB-1
+(direct zerocopy proof), NB-2 (forced-partial-send RESUME verified end-to-end at SO_SNDBUF=4096, both methods
+== native — the producer is a PG bgworker, not isolated-gtest-able; noted limitation), NB-3 (committed
+`evidence/p2-correctness.txt`), NB-4 (`fa7e455` — 128 MiB per-stream pool cap for ALL methods, not just
+zerocopy; was uncapped on the default epoll path for String schemas), NB-7 (superseded R=2 false-win marked),
+NB-8 (multipliers qualified as deform-floored best-case upper bounds). NB-5/6/9/10 tracked for the hardening
+pass (dead 64 MiB `tcp_scratch` alloc; macro-vs-runtime `rows_per_block` coupling that fails closed;
+uncaptured `zc_copied>0` datum; comment-only `zc_seq`/handshake-drain notes) — none a correctness defect.

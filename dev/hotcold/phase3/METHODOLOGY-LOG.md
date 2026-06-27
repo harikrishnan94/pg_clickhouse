@@ -335,3 +335,39 @@ zerocopy is a fast deferred copy, so the real-NIC completion latency that K hide
 netem cannot reproduce it. The win is the real-NIC expectation; the loopback null is pre-registered + honest.
 ≥3 iterations logged (it1 bare null L0025, it2 netem-rate null L0027, it3 zerocopy bug-fix + injected-delay
 win + knee-scaling L0026/L0028/L0029). DONE.
+
+---
+
+## L0030 — P2 adversarial-review resolution: direct zerocopy K-sweep + forced-partial-send (NB-1/2/3/4/7/8)
+P2 review returned PASS (GREEN), 0 blocking, 10 non-blocking follow-ups. Resolutions (2026-06-27):
+**NB-1 (the central pin) — RESOLVED by a DIRECT msg_zerocopy measurement.** The binding overlap proof had
+been run with METHOD=epoll. Re-ran the injected-per-frame-latency microbench at 20 ms/frame with
+METHOD=msg_zerocopy (Q99 transfer-bound, ROUNDS=2 x N=3, live C1 consumer):
+  K=1 2587 / K=2 1400 (1.85x, -45.9%) / K=4 1025 (2.52x, -60.4%) ms; n=6/level, per-level spread <1%
+  (K1 2582-2595, K2 1398-1407, K4 1019-1031), monotonic.
+This is K>1 directly raising msg_zerocopy throughput on the zerocopy RECLAIM path — closes the literal
+PROMPT pin "a flat msg_zerocopy K-curve is a FAIL" (this is the opposite of flat). evidence/p2-injdelay-knee.txt,
+results/p2_kbench_injdelay20ms_zc/walls.tsv. (The loopback NETEM-zc curve stays flat = host-intrinsic
+deferred copy, as pre-registered; the injected-latency instrument is the one that models real-NIC completion
+gating, and the zerocopy path pipelines on it.) The delay gates RECLAIM not SEND and is applied identically
+per-K, so it is non-circular (same fairness argument the reviewer independently re-verified for the epoll run).
+**NB-2 — addressed end-to-end (producer is a PG bgworker, not gtest-able here).** Forced-partial-send check:
+tcp_sndbuf_bytes=4096 fragments every >=64KiB data frame into ~16+ sendmsg calls, driving the f->sent>0
+RESUME path; K=2 epoll AND msg_zerocopy both == native (59986052|1799465265420123, MATCH) on the full
+60M-row lineitem stream. EOS-drain (H5) runs on every such stream. Stronger than the isolated gtests (real
+data + forced fragmentation + W=8) but NOT the PROMPT's literal isolated gtest — noted residual limitation.
+**NB-3 — RESOLVED.** Committed evidence/p2-correctness.txt (verify_offload tcp 137/137 + arrow 137/137 +
+K=1/2/8 x {epoll,zc}==native + the forced-partial-send checks). Byte-stream integrity now falsifiable from
+committed evidence, matching the C1/P1 bar.
+**NB-4 — RESOLVED (code, fa7e455).** tcp_reactor_init now caps the per-stream frame pool to 128 MiB for ALL
+methods (was uncapped on the default epoll path for String schemas, up to ~32 GiB at K=64); zerocopy keeps
+the tighter 8 MiB RLIMIT; K clamped + logged. verify_offload 137/137 + K-native pass on the capped binary.
+**NB-7 — RESOLVED.** Added in-file SUPERSEDED header to evidence/p2-ksweep-netem3g-r2.txt (retracted R=2
+false-win), pointing at the corrected R=3 NULL.
+**NB-8 — RESOLVED (doc).** REPORT-P2 qualifies 2.7x/5.1x and 1.85x/2.52x as deform-floored best-case upper
+bounds (microbench has no byte-rate floor; a real rate-limited NIC cannot hide latency below its
+serialization floor) — not expected real-NIC speedups.
+**NB-5/6/9/10 — tracked for hardening** (NB-5 dead 64MiB tcp_scratch alloc; NB-6 macro-vs-runtime
+rows_per_block coupling, fails closed via the overflow ereport; NB-9 capture zc_copied>0 for the netem-zc
+run; NB-10 stale zc_seq / handshake-drain comments). None a correctness defect; left out of the closing
+patch to keep it minimal + correctness-green. lo verified noqueue before all bare measurements (H12). DONE.
