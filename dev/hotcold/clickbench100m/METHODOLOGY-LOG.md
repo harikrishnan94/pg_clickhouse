@@ -162,3 +162,26 @@ Material claims require ≥3 independent converging sources; orientation/operati
 - Interpretation: A1 prediction CONFIRMED; the cast now matches the validated offload/native-PG semantics. The bridge
   (iii in A8) is now PROVEN, not assumed. Re-running the full oracle to confirm all 126 cells stay green by construction.
 - Verdict: CONTINUE → re-run 05_oracle.sh + 07_verify_topn.sh.
+
+### L0041 — Unit-1 iter-1: TIER-1 sweep (42 elig × 3f × W=8, N=5) — overlap REFUTED for fast queries  [unit 1]  [iteration 1]  2026-06-28T05:00+05:30
+- Goal / hypothesis (prereg §UNIT1): merge_ch ≈ pure-CH-100M for heavy queries (cold ≫ hot); confirm overlap via CH query_duration.
+- Holistic note: the merge is one CH execution (PG producer ⟷ SHM ring ⟷ CH consumer); on loopback the hot
+  transfer is CPU-bound (PG scan+columnize, single producer) and competes with the CH cold scan for the same
+  shared-cap CPU — so "hidden" requires cold's wall to dominate the hot stream's wall.
+- What I did: 06_bench.sh, all 42 eligible × {p01,p05,p10} × W=8, N=5; overlap_ch=(cold_ch+hot_ch)/merge_ch,
+  hidden_frac, HIDDEN/ADD verdict (noise band max(5%,sd)). CH-internal query_duration_ms (bash wall carries POC
+  producer-launch overhead, excluded). Pilot (1a, N=2-3) found 3 harness bugs (mms newline, $()-global loss,
+  load-gate) — fixed before this run (1b).
+- How verified (≥3 sources): (i) CH query_duration median+sd over N=5; (ii) EXPLAIN PIPELINE (arms concurrent:
+  PollableShmSource + MergeTreeSelect×8 → one Union→Aggregating×16); (iii) producer finishes mid-merge-window
+  (overlaps temporally); (iv) cold_ch distribution (median 308ms, 15/42 <100ms, only 7/42 ≥1s).
+- Result (results/bench/cells.tsv): merge_ch/cold_ch geomean 4.19×(f1%) / 13.2×(5%) / 24.4×(10%); HIDDEN 1/42 at
+  f=1% (q29 regex, cold=8626ms), 0/42 at f=5%/10%. The single-threaded hot producer streams ~2.6M rows/s
+  (1M→~380ms, 5M→~1900ms, 10M→~3860ms); since most ClickBench cold scans are <500ms in CH, the hot stream is the
+  long pole and is NOT hidden. Overlap (ratio→1) ONLY for the slow-cold tail (q29 8.6s; q19/q9-class ~1-2s).
+- Interpretation: the pre-registered "merge ≈ pure-CH for heavy" is REFUTED for the ClickBench workload — refined
+  to: HIDDEN iff cold_ch ≫ hot_stream_time, which on loopback (single-threaded, CPU-bound hot) holds only for the
+  slowest queries. TWO levers: (a) parallelize the hot producer (D-HC-0405 revisit) → faster hot stream → more
+  queries hide; (b) a real network where hot=network (different resource) overlaps cold-CPU for free (Unit 2).
+  merge-vs-pure-CH is the OVERHEAD comparison; the VALUE comparison is merge-vs-native-PG (pending baselines).
+- Verdict: CONTINUE → (iter2) parallel-hot optimization + native-PG/full-offload baselines; (iter3) W-sweep + synthesis.
