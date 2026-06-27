@@ -1179,6 +1179,22 @@ tcp_reactor_init(ShmProducer *p)
             k = kmax;
         }
     }
+    /* Memory cap for ALL methods (adversarial review P2 NB-4): bound the per-stream frame pool to
+     * PGCH_P2_POOL_BUDGET so a String-schema query (frame_cap == the data-region fallback, ~64 MiB) at a
+     * high K cannot blow up memory (K x 64 MiB x W streams). For an all-fixed schema (~MB frames) this
+     * never bites at any reasonable K. */
+    {
+        size_t pool_budget = (size_t) 128 * 1024 * 1024;
+        int kmax_mem = frame_cap > 0 ? (int) (pool_budget / frame_cap) : k;
+        if (kmax_mem < 1) kmax_mem = 1;
+        if (k > kmax_mem)
+        {
+            ereport(LOG, (errmsg("pg_clickhouse: P2 capping run-ahead K=%d -> %d "
+                                 "(K x frame %zu must stay under the %zu-byte per-stream pool budget)",
+                                 k, kmax_mem, frame_cap, pool_budget)));
+            k = kmax_mem;
+        }
+    }
     p->send_k = k;
     /* Allocate in the producer's owner context (stable for the stream lifetime): tcp_reactor_init runs
      * lazily at the first publish, which may be inside a transient per-block context. */
