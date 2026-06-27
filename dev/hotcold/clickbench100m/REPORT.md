@@ -71,6 +71,12 @@ and is deferred to Unit 2 (NO RESULT)**. Cold-IO pressure: Unit 3.
   parallel-hot gives no benefit (the hot stream is already small). [Subset of 8 queries; the clean TIER-1
   single-hot is the baseline — the in-session single-hot was cache-inflated, root-caused.]
 
+
+- **W-dependence** (W∈{1,2,4,8}, iter-3): cold_ch scales ~linearly with the cap (q29 70s→8.6s, W1→W8) while the
+  single-threaded hot_ch is ~constant; W=1 is a CPU-starvation point (producer+consumer share one core → merge >
+  cold+hot), not evidence against overlap (review C3). At high W the fixed hot stream is relatively more dominant
+  (cold faster) — reinforcing the parallel-hot lever.
+
 **DISCLAIMER (the §7 tension, binding).** These are **loopback** results: they prove the **compute
 thesis** (vectorized CH over streamed PG rows + the cold bulk beats native PG). They do **NOT** prove
 the **network-overlap thesis** (hot transfer hidden under cold processing on a real ~3 GB/s wire),

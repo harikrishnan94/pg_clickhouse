@@ -223,3 +223,17 @@ Material claims require ≥3 independent converging sources; orientation/operati
 - Interpretation: confirms the single-threaded producer (D-HC-0405) was the dominant large-f limiter; parallelizing
   it recovers most of the loss and restores the full-offload win at f=10%. Lever applies at large f, not small f.
 - Verdict: CONTINUE → iter-3 W-sweep (W-dependence + W=1 starvation) + Unit-1 synthesis/review.
+
+### L0044 — Unit-1 iter-3: W-sweep (W∈{1,2,4,8}, 4 queries × p01) — W-dependence + W=1 starvation  [unit 1]  [iteration 3]  2026-06-28T07:10+05:30
+- Goal: characterize the merge vs the shared CPU cap; confirm review C3 (W=1 = CPU-starvation, not anti-thesis).
+- What I did: 06_bench.sh W_LIST="1 2 4 8" FRACS=p01 QLIST="8 13 18 29" N=5 (results/bench/wsweep_cells.tsv).
+- How verified: CH query_duration median+sd per (W,q); overlap_ch/hidden/verdict.
+- Result: cold_ch scales ~linearly with cores (q29: W1=70057ms → W2=34508 → W4=17177 → W8=8624; ~8× W1→W8).
+  hot_ch ~constant across W (~380-1250ms; single-threaded producer gets 1 core regardless). At W=1
+  overlap_ch≈0.54 (merge > cold+hot: producer+consumer time-share ONE core → serialization), confirming W=1 is a
+  CPU-starvation artifact (C3) — label, not evidence against overlap. At W≥2 the slow-cold q29 shows
+  overlap_ch≈0.97-0.98 (hot hidden under the long cold scan). As W grows the (fixed) single hot stream becomes
+  RELATIVELY more dominant (cold faster, hot constant) → the parallel-hot lever (L0043) matters more at high W.
+- Data-quality note: q18 W=8 cell logged cold_ch=0.0 (a query_log capture race; TIER1 has the correct
+  q18 p01 cold_ch=1497ms) — flagged unreliable, immaterial to the W-trend.
+- Verdict: DONE (Unit-1 ≥3 iterations: 1=sweep, 2=baselines+parallel-hot, 3=W-sweep). → Unit-1 §12 review.
