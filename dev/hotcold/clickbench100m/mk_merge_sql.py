@@ -105,13 +105,21 @@ def main():
     if mode == "pure":
         repl = "(SELECT " + ", ".join(pcols) + " FROM clickbench.hits_dt64)"
     else:
-        # modes: "p01"/"p05"/"p10" (merge) ; "p01:hot" (hot arm only, for the overlap counterfactual)
-        hotonly = mode.endswith(":hot")
-        ftag = mode.split(":")[0]                 # p01
+        # modes: "p01"/"p05"/"p10" (merge); "p01:hot" (hot arm only, overlap counterfactual);
+        #        "p01:parP" (P-way PARALLEL hot: P disjoint sub-tables/rings unioned — iter-2 optimization);
+        #        "p01:parP:hot" (parallel hot arm only).
+        parts = mode.split(":")
+        ftag = parts[0]                           # p01
         f = ftag[1:]                              # 01
+        par = next((int(p[3:]) for p in parts if p.startswith("par")), 1)
+        hotonly = "hot" in parts
         env = load_boundaries()
-        hot = ("SELECT " + ", ".join(pcols) +
-               f" FROM streamed_table('pgch_hot_{ftag}', '{full_hot_schema(cols)}')")
+        sch = full_hot_schema(cols)
+        if par > 1:
+            arms = [f"SELECT {', '.join(pcols)} FROM streamed_table('pgch_hot_{ftag}_{w}', '{sch}')" for w in range(par)]
+            hot = "(" + " UNION ALL ".join(f"({a})" for a in arms) + ")"
+        else:
+            hot = f"(SELECT {', '.join(pcols)} FROM streamed_table('pgch_hot_{ftag}', '{sch}'))"
         if hotonly:
             repl = f"({hot})"
         else:

@@ -185,3 +185,22 @@ Material claims require ≥3 independent converging sources; orientation/operati
   queries hide; (b) a real network where hot=network (different resource) overlaps cold-CPU for free (Unit 2).
   merge-vs-pure-CH is the OVERHEAD comparison; the VALUE comparison is merge-vs-native-PG (pending baselines).
 - Verdict: CONTINUE → (iter2) parallel-hot optimization + native-PG/full-offload baselines; (iter3) W-sweep + synthesis.
+
+### L0042 — Unit-1 iter-2a: baselines (native-PG-10M, full-offload-10M) + headline vs projected 100M  [unit 1]  [iteration 2]  2026-06-28T05:40+05:30
+- Goal: establish the VALUE comparison merge-vs-native-PG and merge-vs-full-offload (native-PG-100M /
+  full-offload-100M infeasible to measure — D-HC-0401 — so 10M MEASURED ×10 LINEAR PROJECTION, labeled).
+- What I did: 08_baselines.sh — 42 eligible queries × {native-PG (offload off), full-offload (offload on)} over
+  pg.hits (10M), N=5, same cgroup cap W=8. Joined with the 100M merge sweep (cells.tsv) in analyze.
+- How verified (sources): (i) full-offload vs native @10M geomean 2.89× (41/42 faster) — re-confirms the prior
+  wsweep finding (independent corroboration); (ii) merge wall-100M measured; (iii) projection ×10 (scan/agg ~linear).
+- Result: native-PG-10M geomean 1191ms (median 827, max 14409); full-offload-10M geomean 412ms (median 382).
+  Headline (merge MEASURED@100M vs PROJECTED@100M baselines):
+    f=1%:  merge 763ms | vs native-PG 15.6× faster (42/42) | vs full-offload 5.40× (42/42) | vs pure-CH 4.2× SLOWER
+    f=5%:  merge 2387ms| vs native-PG  5.0× (42/42)         | vs full-offload 1.72× (40/42) | vs pure-CH 13.2× SLOWER
+    f=10%: merge 4415ms| vs native-PG  2.7× (42/42)         | vs full-offload 0.93× (11/42) | vs pure-CH 24.4× SLOWER
+- Interpretation: hot/cold-merge WINS decisively vs native-PG (no-CH) and full-offload (stream-all) at small f;
+  the win erodes at f=10% because the SINGLE-THREADED hot producer streaming 10M (~3.9s) ≈ full-offload streaming
+  100M in parallel. vs pure-CH it is slower (the price of fresh-hot-in-PG, no ETL/staleness). The single-threaded
+  producer (D-HC-0405) is the dominant limiter at large f → parallel-hot optimization (iter-2b). Projection ×10 is
+  order-of-magnitude (labeled, never presented as measured 100M).
+- Verdict: CONTINUE → iter-2b parallel-hot; iter-3 W-sweep + synthesis.
