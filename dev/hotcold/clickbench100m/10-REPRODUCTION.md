@@ -87,3 +87,22 @@ and a teardown leak check. Results: `results/oracle/summary.tsv`.
 ## Eligible query set
 42/43 ClickBench queries (templates/q{2..43}.ch.sql). Q1 (`SELECT COUNT(*)`) is INELIGIBLE — it references no
 column, so the planner declines offload (no streamed_table); same intentional decline as the full-offload study (D0010).
+
+## Unit 1 — benchmark + baselines (reproduce the headline)
+```
+# 100M sweep: per (f,W,q) median-of-N pure_cold / hot_only / merge (CH query_duration_ms). rm cells first.
+rm -f dev/hotcold/clickbench100m/results/bench/cells.tsv
+N=5 W_LIST=8 FRACS="p01 p05 p10" bash dev/hotcold/clickbench100m/06_bench.sh
+# baselines @10M (native-PG offload-off, full-offload offload-on) for the ×10 projection
+N=5 W=8 bash dev/hotcold/clickbench100m/08_baselines.sh
+# parallel-hot (iter-2b): P disjoint hot sub-tables -> P rings -> one merged query
+P=8 FRACS=p10 QLIST="13 22 8 38 17 18 33 29" N=5 bash dev/hotcold/clickbench100m/09_parallel_hot.sh
+# cold-arm-only reference (iter-4, review C1): the merge's cold arm in isolation (tuple filter)
+N=5 W=8 FRACS="p01 p10" bash dev/hotcold/clickbench100m/10_coldarm.sh
+# W-sweep (iter-3): W-dependence + W=1 starvation
+CELLS=results/bench/wsweep_cells.tsv W_LIST="1 2 4 8" FRACS=p01 QLIST="8 13 18 29" N=5 bash dev/hotcold/clickbench100m/06_bench.sh
+# headline aggregation
+python3 dev/hotcold/clickbench100m/analyze_bench.py        # merge_ch/cold_ch geomeans, HIDDEN/ADD, regime
+```
+Cleanup the parallel-hot residue when done: `clickbench.hits_hot_p{01,10}_{0..7}` (CH) and `pg.hits_hot_p{01,10}_{0..7}` (PG).
+Env knobs: `N` (warm runs), `W_LIST`/`W` (cgroup cap = cores; CH max_threads=W), `FRACS`, `QLIST`, `P` (parallel-hot), `CELLS` (output path).

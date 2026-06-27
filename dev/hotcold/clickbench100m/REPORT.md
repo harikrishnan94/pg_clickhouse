@@ -38,7 +38,7 @@ and is deferred to Unit 2 (NO RESULT)**. Cold-IO pressure: Unit 3.
   the hot arm, masked in the eligible set by row placement. **Fixed** (`toDateTime64(toString(col),
   'UTC')`) and re-verified 3 ways (row value, a 10M native-PG bridge, a hot-reaching minute histogram).
 
-## Unit 1 — benchmark + overlap mechanism — **(in progress)**
+## Unit 1 — benchmark + overlap mechanism — **GREEN**
 
 **Measured (W=8, N=5, shared cgroup cap; overlap via CH `query_duration_ms`):**
 
@@ -49,21 +49,30 @@ and is deferred to Unit 2 (NO RESULT)**. Cold-IO pressure: Unit 3.
 | **vs full-offload-100M** (×10 projection) | **5.4× faster** (42/42) | 1.72× (40/42) | 0.93× (11/42) |
 | vs pure-CH-100M (measured) | 4.2× slower | 13.2× slower | 24.4× slower |
 
+(The ×10 projection is **conservative**: native-PG-100M would scale super-linearly — high-cardinality GROUP BY spills more at 100M, and a 100M PG heap exceeds RAM → IO-bound — so the real native-PG-100M is *slower* than ×10, i.e. the 15.6× is an under-claim. merge & pure-CH are measured at 100M.)
+
 - **The win** is vs the honest no-CH alternatives: hot/cold-merge runs the analytic query at ClickHouse
   speed over the cold bulk while streaming only the recent f% from PG — far faster than native-PG over
   100M (CH vectorization) and than streaming all 100M (transfer saved). Strongest at small f.
-- **The cost** is vs pure-CH-100M (everything pre-ETLed to CH): merge is 4–24× slower because (a) CH
-  scans 100M extremely fast (cold_ch median **308 ms**; 15/42 queries <100 ms) and (b) the
-  **single-threaded** hot producer streams ~2.6M rows/s. So the hot stream is the long pole for the
-  many fast queries; it only *hides* under the cold scan for the slow-cold tail (q17/18/19/29/33/34/35,
-  cold≥~1 s) at f=1% (overhead 5–19%). This is the price of fresh-hot-in-PG vs stale ETL.
-- **Mechanism** (≥2 independent instruments): `EXPLAIN PIPELINE` shows the hot (`PollableShmSource`) and
-  cold (`MergeTreeSelect×8`) arms feed one `Union→AggregatingTransform×16` *concurrently*, and the
-  producer finishes mid-merge-window — so the arms *do* overlap temporally; but under the shared CPU
-  cap the hot transfer (CPU-bound: PG scan+columnize) competes with the cold scan, so it is hidden only
-  in the cold long-pole's slack. CH `query_duration_ms` (median+sd, N=5) is the fair merge-execution
-  metric (the bash wall additionally carries a POC producer-launch overhead a persistent producer
-  would not pay).
+- **The cost** is vs pure-CH-100M (everything pre-ETLed to CH): merge is 4–24× slower (geomean), the price
+  of fresh-hot-in-PG vs stale ETL. Two components, BOTH measured: (a) pure-CH is projection-optimized
+  (cold_ch median 308 ms; q-with-few-cols answered in tens of ms via the sparse index), whereas the merge's
+  cold arm must read the 5 recency-boundary columns over 100M to evaluate `tuple<B(f)` — a real cost
+  (e.g. q3 cold-arm 200 ms vs pure-CH 28 ms) that is a *fixable* POC artifact (D-HC-0404: materialize a
+  partition column or per-f cold table); and (b) the single-threaded hot producer (~2.6M rows/s; the f=10%
+  limiter, recovered by parallel-hot below). vs the no-CH alternatives (native-PG / full-offload) the merge
+  WINS — that is the relevant comparison when the hot data is NOT pre-ETLed.
+- **Mechanism — overlap IS shown** (cache-controlled, ≥2 independent instruments; the headline metric is CH
+  `query_duration_ms`, median+sd N=5 — the bash wall additionally carries a POC producer-launch overhead, but
+  merge_wall−merge_ch ≈ 0 since the producer runs concurrently). Measured against the merge's *actual cold arm*
+  (NOT pure-CH — that mistake, review C1, inverted an earlier reading): **merge_ch ≈ max(cold-arm, hot)**, not
+  the sum — the smaller arm is hidden under the larger. Of 16 cache-controlled cells, **11 HIDDEN** (overlap_ratio
+  = (cold-arm+hot)/merge = 1.03–1.49): e.g. p01 q3 cold-arm 200 + hot 384 → merge 402 (cold hidden); p01 q33
+  cold-arm 4286 + hot 404 → merge 4364 (hot hidden); p10 q3 cold-arm 196 + hot 4833 → merge 4813 (cold hidden).
+  Independent instrument B: the producer active-window ≈ the merge window (to ~1%) in every cell → concurrent,
+  not drain-first. The merge degrades to **additive only when BOTH arms are large and CPU-comparable** (5/16,
+  e.g. p10 q33 cold-arm 4096 ≈ hot 4563 → merge 8472 ≈ serial) — the loopback shared-CPU contention limit (§7:
+  on loopback hot=CPU competes with cold=CPU; a real wire where hot=network would overlap cold-CPU for free).
 - **Single-threaded producer** is the dominant limiter at large f (D-HC-0405). **Parallelizing it (P=8 hot
   producers → P rings, iter-2b) recovers the large-f win**: at f=10% the merge is 2.64× faster than single-hot
   (geomean over 8 representative queries; up to 6× for fast queries), lifting merge to **9.3× vs native-PG-100M**
@@ -88,4 +97,4 @@ The network thesis is Unit 2, which returns **NO RESULT** for the true cross-box
 
 ---
 *(Numbers above are committed in `results/bench/{cells.tsv,baselines10m.tsv}`; reproduction in
-`10-REPRODUCTION.md`; every claim's sources in the evidence matrix, methodology log L0031–L0042.)*
+`10-REPRODUCTION.md`; every claim's sources in the evidence matrix, methodology log L0031–L0045.)*

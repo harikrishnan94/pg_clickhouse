@@ -108,3 +108,59 @@ is the closing cross-unit deliverable (written after Units 1–3).
   explicit actions (C2 is BLOCKING for **Unit-1** green — the 2nd overlap instrument must be real).
 - No open blocking CORRECTNESS finding after the A1 fix. Unit 0 is GREEN once the post-fix full oracle + top-N
   verification confirm (112 exact + 14 proven-benign expected to hold by construction).
+
+---
+
+## UNIT 1 — review round 1 (5 agents: A correctness/fairness, C perf-mechanism, E holism, B+D simplicity/conventions)
+
+### ACCEPTED
+
+**[BLOCKING → FIX IN PROGRESS] C1/E (overlap verdict used the WRONG cold reference).** The HIDDEN/ADD verdict
+and overlap_ch used pure-CH-100M (`hits_dt64`, projection-optimized, no filter) as the cold reference. But the
+merge's actual cold arm is `hits_100m WHERE tuple<B(f)` — it reads the 5 boundary-tuple columns over 100M and
+loses CH's projection short-circuit, so it costs MUCH more than pure-CH for narrow queries (Agent C measured q3
+cold-arm 202 ms / 2673 MB vs pure-CH 28 ms / 194 MB; merge_ch 402 ≈ hot 385 → the 202 ms cold arm IS hidden under
+the hot stream = OVERLAP, mislabeled "ADD"). Sources (≥3): per-query cold-arm read_bytes/duration vs pure-CH;
+cells.tsv merge read_mb matches the isolated cold-arm (not pure-CH); EXPLAIN indexes=1 (pure-CH short-circuit the
+cold arm can't use). CONSEQUENCE: the mechanism conclusion "CH too fast for the hot stream to hide" is partly an
+artifact; the arms DO overlap. RESOLUTION (iter-4, L0045): measure cold-arm-only (mk_merge `:cold`, 10_coldarm.sh)
+and recompute overlap = merge vs max(cold-arm, hot); the tuple-filter inflation is a separate FIXABLE cost (D-HC-0404).
+
+**[BLOCKING → FIX] C2 (≥2 independent overlap instruments not met).** The quantitative overlap rested on one
+`query_duration_ms` family (and that family was mis-referenced, C1); the EXPLAIN PIPELINE second "instrument" is
+structural-only (necessarily concurrent for any UNION→aggregate) and no per-cell artifact was captured.
+RESOLUTION: the corrected wall-decomposition (merge vs cold-arm + hot, iter-4) + a captured producer-finishes-
+mid-window timing artifact (independent: producer-side, can fail differently by showing the producer drains-first
+= serial) are the two instruments.
+
+**[should-fix → DONE] A4 — state the ×10 projection DIRECTION.** Agent A proved the projection is CONSERVATIVE:
+native-PG-100M would be super-linear (high-cardinality GROUP BY spills more at 100M; 10M→100M CH scaling 16–17×
+vs the ×10 used) and IO-bound (100M PG heap > RAM), so ×10 UNDER-states native-PG-100M → the 15.6× is an
+under-claim. REPORT now says so.
+**[should-fix → DONE] A5 — wall-vs-CH label.** merge_wall ≈ merge_ch (median Δ 0–1 ms; producer launches
+concurrently), so the choice is immaterial; REPORT labels the headline metric explicitly.
+**[should-fix → DONE] A6/E2 — parallel-hot apples-to-apples + core-stealing.** REPORT used the LESS-favorable
+clean-TIER1 single-hot baseline (2.64×, not the cache-inflated in-session 3.44× — the opposite of cherry-picking);
+the 8q single-hot vs full-offload is also 0.93× (subset representative). E2: under the W=8 cap the 8 producers +
+CH oversubscribe cores (cold arm inflated 1.1–63× inside the parallel merge) — disclosed as a core-budget tradeoff.
+**[should-fix → DONE] E4 — distinguish generic CH-beats-PG from the overlap-specific win.** REPORT now separates
+"merge ≫ native-PG via CH vectorization" (generic, all 42) from "hot transfer hidden under cold" (the thesis,
+slow-cold tail / corrected by C1).
+**[should-fix → DONE] E5 — disclose + clean the parallel-hot sub-tables** (12 tables, ~9 GB on an 80%-full host).
+**[should-fix → DONE] BD1 — add a Unit-1 reproduction section** to 10-REPRODUCTION.md (06/08/09/10 + analyze).
+**[minor → DONE] BD2 — fix the L0031–L0042 citation → L0031–L0045.**
+**[minor, carry] BD3 — log_comment LIKE-prefix vs the repo's exact-equality convention** (unique ns suffix makes
+it safe; latent). BD6 — cells.tsv append not idempotent (rm before re-run — documented in repro). D1/BD7 —
+bench-common.sh non-reuse (accepted POC deviation, the merge needs a standalone producer the helper doesn't model).
+
+### REJECTED
+- E1 ("5.4× vs full-offload is an asymmetric/inconsistent projection") — PARTIALLY REJECTED: full-offload streams
+  100M from PG (transfer-bound) vs cold_ch scans CH's own MergeTree (columnar) — these are legitimately different
+  resources, not an inconsistency; full-offload-10M is parallel (W=8) and ×10 is ~linear/transfer-bound (defensible).
+  The label "projected" is present. The narrower honest claim (single-hot merge streams 1M vs full-offload streams
+  100M) stands. Kept as a LEAD note in the report.
+
+### BOTTOM LINE — Unit 1: **SHIP (green): headline sound + OVERLAP CONFIRMED after C1/C2 fix (iter-4, L0045: cache-controlled, merge≈max(cold-arm,hot), 11/16 HIDDEN, producer-window≈merge-window).**
+The headline VALUE win (merge ≫ native-PG, conservatively projected; correct/offloading at every cell; losses
+included) is SOUND (Agent A PASS, Agent C C3 PASS). The OVERLAP-mechanism framing was flawed (wrong cold reference)
+and is re-measured in iter-4 before Unit 1 is marked green.

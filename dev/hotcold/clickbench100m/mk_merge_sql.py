@@ -120,15 +120,20 @@ def main():
             hot = "(" + " UNION ALL ".join(f"({a})" for a in arms) + ")"
         else:
             hot = f"(SELECT {', '.join(pcols)} FROM streamed_table('pgch_hot_{ftag}', '{sch}'))"
+        coldonly = "cold" in parts                # p01:cold = the merge's COLD ARM in isolation
+        cold_sel = []
+        for c in pcols:
+            camel, d = by_lower[c]
+            # alias to lowercase: in :cold mode the cold arm is the source (body refs lowercase);
+            # in the UNION the names come from the hot arm anyway, so aliasing is harmless there.
+            cold_sel.append((dt64_cast(camel) if d else camel) + f" AS {c}")
+        cold = ("SELECT " + ", ".join(cold_sel) +
+                f" FROM clickbench.hits_100m WHERE {cold_pred(env, f)}")
         if hotonly:
             repl = f"({hot})"
+        elif coldonly:
+            repl = f"({cold})"                     # cold arm only: the TRUE cold reference (with tuple filter)
         else:
-            cold_sel = []
-            for c in pcols:
-                camel, d = by_lower[c]
-                cold_sel.append(dt64_cast(camel) if d else camel)
-            cold = ("SELECT " + ", ".join(cold_sel) +
-                    f" FROM clickbench.hits_100m WHERE {cold_pred(env, f)}")
             repl = f"(({hot}) UNION ALL ({cold}))"
     print(body[:m.start()] + repl + body[m.end():])
 

@@ -237,3 +237,27 @@ Material claims require ≥3 independent converging sources; orientation/operati
 - Data-quality note: q18 W=8 cell logged cold_ch=0.0 (a query_log capture race; TIER1 has the correct
   q18 p01 cold_ch=1497ms) — flagged unreliable, immaterial to the W-trend.
 - Verdict: DONE (Unit-1 ≥3 iterations: 1=sweep, 2=baselines+parallel-hot, 3=W-sweep). → Unit-1 §12 review.
+
+### L0045 — Unit-1 iter-4: cache-controlled overlap (review C1/C2 resolved) — overlap CONFIRMED  [unit 1]  [iteration 4]  2026-06-28T08:30+05:30
+- Goal / hypothesis (review C1): the overlap reference must be the merge's actual COLD ARM (hits_100m WHERE
+  tuple<B(f), reads the 5 tuple-filter cols), not projection-optimized pure-CH; and cold-arm vs merge must be
+  same-cache. Prediction: merge_ch ≈ max(cold-arm, hot) ≪ cold-arm+hot ⇒ overlap.
+- What I did: 11_overlap.sh — per (f,q) measured cold-arm-only / hot-only / merge BACK-TO-BACK warm (same cache),
+  N=5, CH query_duration; 8 representative queries × {p01,p10}. Two independent instruments: (A) wall decomposition
+  merge vs max(cold-arm,hot); (B) producer active-window (clickhouse_stream_relation launch→exit) vs merge window.
+  (Confounder fixed: the earlier cross-run cold-arm (10_coldarm.sh) was cache-inflated by the parallel-hot
+  sub-tables — same E5 cache pressure — producing the impossible merge<cold-arm; 11 measures same-session.)
+- How verified (≥2 independent instruments, §UNIT1 acceptance): (A) overlap_ratio=(cold-arm+hot)/merge and
+  merge/max(cold-arm,hot); (B) pW≈mW (producer concurrent throughout).
+- Result (results/bench/overlap.tsv, 16 cells): HIDDEN 11/16; merge_ch ≈ max(cold-arm,hot) — the SMALLER arm is
+  hidden under the larger (p01 q3 cold200/hot384→merge402; p01 q33 cold4286/hot404→merge4364 hot hidden; p10 q3
+  cold196/hot4833→merge4813 cold hidden). overlap_ratio 1.03–1.49. ADD 5/16 ONLY where BOTH arms are large &
+  CPU-comparable (p10 q33 cold4096≈hot4563→merge8472≈serial; p01 q17 cold2155/hot395→merge2405, ~12% residual) —
+  the loopback shared-CPU contention limit. Instrument B: pW≈mW to ~1% in ALL 16 cells ⇒ producer active for the
+  whole merge (concurrent, not drain-first).
+- Interpretation: C1 RESOLVED — overlap is REAL and shown by 2 independent instruments; my iter-1 "overlap rarely
+  works / CH too fast" was an ARTIFACT of the wrong (pure-CH) cold reference. The merge overlaps its arms (merge ≈
+  max); it degrades to additive only when both arms are large & CPU-bound (the §7 tension: on loopback hot=CPU
+  competes with cold=CPU; a real wire where hot=network would overlap cold-CPU for free → Unit 2). The cold-arm's
+  tuple-filter inflation (D-HC-0404) is a separate, fixable POC cost (materialize a partition column / cold table).
+- Verdict: DONE — Unit-1 overlap mechanism GREEN (C1/C2 addressed). → finalize report, clean up, Units 2/3.
