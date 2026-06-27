@@ -1,0 +1,1 @@
+SELECT searchphrase, min(url), min(title), count(*), count(DISTINCT userid) FROM (SELECT * FROM streamed_table('/pgch_1389095_1_1_0', 'title String, userid Int64, url String, searchphrase String')) WHERE ((title LIKE '%Google%')) AND ((url NOT LIKE '%.google.%')) AND ((searchphrase <> '')) GROUP BY searchphrase ORDER BY count(*) DESC NULLS FIRST LIMIT 10

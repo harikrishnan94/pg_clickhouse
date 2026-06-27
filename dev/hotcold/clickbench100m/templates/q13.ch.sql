@@ -1,0 +1,1 @@
+SELECT searchphrase, count(*) FROM (SELECT * FROM streamed_table('/pgch_979773_1_1_0', 'searchphrase String')) WHERE ((searchphrase <> '')) GROUP BY searchphrase ORDER BY count(*) DESC NULLS FIRST LIMIT 10

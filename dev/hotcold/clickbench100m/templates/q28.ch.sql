@@ -1,0 +1,1 @@
+SELECT counterid, avg(lengthUTF8(url)), count(*) FROM (SELECT * FROM streamed_table('/pgch_1672195_1_1_0', 'counterid Int32, url String')) WHERE ((url <> '')) GROUP BY counterid HAVING ((count(*) > 100000)) ORDER BY avg(lengthUTF8(url)) DESC NULLS FIRST LIMIT 25

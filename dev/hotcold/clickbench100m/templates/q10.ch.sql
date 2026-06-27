@@ -1,0 +1,1 @@
+SELECT regionid, sum(advengineid), count(*), avg(resolutionwidth), count(DISTINCT userid) FROM (SELECT * FROM streamed_table('/pgch_842934_1_1_0', 'regionid Int32, userid Int64, resolutionwidth Int16, advengineid Int16')) GROUP BY regionid ORDER BY count(*) DESC NULLS FIRST LIMIT 10

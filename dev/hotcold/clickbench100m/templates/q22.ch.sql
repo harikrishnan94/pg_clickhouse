@@ -1,0 +1,1 @@
+SELECT searchphrase, min(url), count(*) FROM (SELECT * FROM streamed_table('/pgch_1343139_1_1_0', 'url String, searchphrase String')) WHERE ((url LIKE '%google%')) AND ((searchphrase <> '')) GROUP BY searchphrase ORDER BY count(*) DESC NULLS FIRST LIMIT 10

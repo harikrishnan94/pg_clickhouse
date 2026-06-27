@@ -1,0 +1,1 @@
+SELECT regionid, count(DISTINCT userid) FROM (SELECT * FROM streamed_table('/pgch_802901_1_1_0', 'regionid Int32, userid Int64')) GROUP BY regionid ORDER BY count(DISTINCT userid) DESC NULLS FIRST LIMIT 10

@@ -1,0 +1,1 @@
+SELECT mobilephonemodel, count(DISTINCT userid) FROM (SELECT * FROM streamed_table('/pgch_886804_1_1_0', 'userid Int64, mobilephonemodel String')) WHERE ((mobilephonemodel <> '')) GROUP BY mobilephonemodel ORDER BY count(DISTINCT userid) DESC NULLS FIRST LIMIT 10

@@ -1,0 +1,1 @@
+SELECT watchid, clientip, count(*), sum(isrefresh), avg(resolutionwidth) FROM (SELECT * FROM streamed_table('/pgch_1851046_1_1_0', 'watchid Int64, clientip Int32, isrefresh Int16, resolutionwidth Int16')) GROUP BY watchid, clientip ORDER BY count(*) DESC NULLS FIRST LIMIT 10

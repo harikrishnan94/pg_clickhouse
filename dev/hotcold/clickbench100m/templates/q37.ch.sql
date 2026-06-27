@@ -1,0 +1,1 @@
+SELECT url, count(*) FROM (SELECT * FROM streamed_table('/pgch_1974554_1_1_0', 'eventdate Date, counterid Int32, url String, isrefresh Int16, dontcounthits Int16')) WHERE ((eventdate >= '2013-07-01')) AND ((eventdate <= '2013-07-31')) AND ((url <> '')) AND ((counterid = 62)) AND ((dontcounthits = 0)) AND ((isrefresh = 0)) GROUP BY url ORDER BY count(*) DESC NULLS FIRST LIMIT 10

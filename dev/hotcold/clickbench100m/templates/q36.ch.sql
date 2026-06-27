@@ -1,0 +1,1 @@
+SELECT clientip, (clientip - 1), (clientip - 2), (clientip - 3), count(*) FROM (SELECT * FROM streamed_table('/pgch_1941312_1_1_0', 'clientip Int32')) GROUP BY clientip, ((clientip - 1)), ((clientip - 2)), ((clientip - 3)) ORDER BY count(*) DESC NULLS FIRST LIMIT 10

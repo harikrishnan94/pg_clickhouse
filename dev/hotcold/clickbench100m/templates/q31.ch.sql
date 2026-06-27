@@ -1,0 +1,1 @@
+SELECT searchengineid, clientip, count(*), sum(isrefresh), avg(resolutionwidth) FROM (SELECT * FROM streamed_table('/pgch_1759331_1_1_0', 'clientip Int32, isrefresh Int16, resolutionwidth Int16, searchengineid Int16, searchphrase String')) WHERE ((searchphrase <> '')) GROUP BY searchengineid, clientip ORDER BY count(*) DESC NULLS FIRST LIMIT 10

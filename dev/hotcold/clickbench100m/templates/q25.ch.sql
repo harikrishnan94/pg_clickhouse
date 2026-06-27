@@ -1,0 +1,1 @@
+SELECT eventtime, searchphrase FROM (SELECT * FROM streamed_table('/pgch_1536045_1_1_0', 'eventtime DateTime64(6, ''UTC''), searchphrase String')) WHERE ((searchphrase <> '')) ORDER BY eventtime ASC NULLS LAST LIMIT 10

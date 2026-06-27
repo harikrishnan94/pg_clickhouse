@@ -1,0 +1,1 @@
+SELECT userid, toMinute(eventtime), searchphrase, count(*) FROM (SELECT * FROM streamed_table('/pgch_1224996_1_1_0', 'eventtime DateTime64(6, ''UTC''), userid Int64, searchphrase String')) GROUP BY userid, (toMinute(eventtime)), searchphrase ORDER BY count(*) DESC NULLS FIRST LIMIT 10
