@@ -441,3 +441,43 @@ liburing solely for SEND_ZC now — rejected: SEND_ZC's payoff is real-NIC-only 
 as the H16 follow-up instead of carrying the dep. (c) PG `WaitEventSet` for the readiness wait — rejected
 (H10): it cannot wait on the MSG_ZEROCOPY errqueue POLLERR and raw epoll is consistent with the existing
 raw poll() paths.
+
+## D-HC-0303 — P2 pipelined sender: K-deep frame pool (GUC, default 2), two-cursor reactor, coalesced sendmsg
+**Date:** 2026-06-27. **Phase 3 Branch P2.** **Context:** the TCP/Arrow producer published BLOCKING
+(serialize a block + send it, the scan/deform loop waiting for the send). **Decision.** A non-blocking
+pipelined send reactor: a K-deep frame-buffer pool (GUC `pg_clickhouse.tcp_send_inflight_blocks`, default
+**2**, ≥1) lets the producer serialize up to K blocks ahead of the socket send; the columnizer's publish
+serializes block N into a free frame (the snapshot copy out of cz->bufs — H1, NOT double-buffering cz->bufs)
+and returns, so deform(N+1) proceeds. **Two-cursor reactor:** a SEND cursor (the first not-fully-sent frame)
+advances independently of the RECLAIM cursor (send_drain) — frames are sent back-to-back in FIFO order (ONE
+sendmsg at a time = byte-stream order; "one send on the socket at a time"), up to K sit IN FLIGHT awaiting
+completion concurrently, reclaim is lazy. The per-block header+payload are coalesced into ONE `sendmsg`
+2-iovec (was two `send`s — H9), partial-send-resumable. Async MSG_ZEROCOPY completion (H4/H6/H7): the
+steady-path drain is removed; each frame is tagged with its zc seq and reclaimed only when reaped; the
+acquire path blocks on a SPECIFIC frame's seq only when its buffer is needed. Frames are sized to the TIGHT
+per-block max (`tcp_frame_capacity`: all-fixed schema → exact ~MB; any String column → the data-region
+fallback), so K×frame fits RLIMIT_MEMLOCK (8 MiB) for K>1 on the zerocopy path (the 64 MiB buffer alloc had
+forced K=1). EOS is flushed after the last data frame before `eos_published` (H5); `producer_cleanup` closes
+the socket before freeing the pooled frames (H8). **K=1 ≡ P1 single-in-flight exactly** (H14, no special
+case). msg_zerocopy + the new epoll path both get O_NONBLOCK + a send-epoll-fd.
+**Default K = 2 — justification.** On bare loopback AND under netem (rate + delay), K>1 is a measured NULL
+vs K=1 for both epoll and zerocopy (drift-controlled lean K-sweeps): (a) the copying send frees the frame on
+`send()`, so K is redundant with the kernel SO_SNDBUF on a single-threaded producer; (b) loopback
+MSG_ZEROCOPY is a fast deferred copy (the measured-null), so the real-NIC completion latency K would hide
+does not manifest, and netem cannot reproduce it. K helps ONLY when send/completion-latency exists — PROVEN
+by an injected-per-frame-latency microbench (the PROMPT-sanctioned complementary instrument): K=4 hides a
+20 ms/frame latency (2.7×), K=8 hides 40 ms (5.1×), and the knee scales with the latency. So K=2 is cheap
+insurance for a real NIC at ~0 measured loopback cost; an operator on a capable NIC raises it. **The
+columnizer staging (cz->bufs) is NOT double-buffered** (H1: that would defer the serialize copy = a
+copy-budget change, out of scope).
+**H16 / real-NIC.** The loopback null is honest and pre-registered; the throughput win is a real-NIC
+expectation (where zerocopy completions are hardware/ACK-gated like the injected delay). Follow-up: validate
+the K knee on a capable NIC; re-introduce io_uring `IORING_OP_SEND_ZC` only if it proves the dominant
+real-NIC lever (D-HC-0302 H16).
+**Alternatives.** (a) Single-cursor reactor (reclaim-gates-send) — rejected: a bug that serialized sends
+behind completions so K never pipelined (caught by the injected-delay microbench staying flat until fixed).
+(b) Frames sized to the 64 MiB data region — rejected: forced zerocopy K=1 (RLIMIT) + wasted (K-1)×60 MiB.
+(c) Default K=1 — rejected: forgoes the real-NIC pipelining for no loopback saving; K=2 is ~free here.
+(d) A background sender thread (to keep the link saturated during deform on loopback) — rejected: out of
+scope (the producer is single-threaded by design); it is the only way K would help loopback, logged as a
+possible future direction.

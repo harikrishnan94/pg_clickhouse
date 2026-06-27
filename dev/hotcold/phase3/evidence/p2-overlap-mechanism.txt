@@ -1,0 +1,5 @@
+P2 overlap mechanism (netem delay 50us rate 3gbit, per-socket SO_SNDBUF=64KB, TPC-H Q6, log_stream_stats):
+  K=1: overlap_frames=0 (all workers; pumps~3200)   -> single-in-flight, NO overlap (serialized)
+  K=8: overlap_frames=228-229 (all workers; pumps~3150) -> ~228 frames/worker enqueued while an earlier
+       frame was still in flight = deform/serialize(N+1) ran ahead of send(N). This IS the H1 overlap.
+Contrast with bare loopback (it1): K>1 ~= K=1 (NULL) because there is no send latency to hide.

@@ -1,0 +1,5 @@
+# Lean P2 K-bench (dev/hotcold/phase3/results/p2_kbench_netem10gd500zc_fixed/walls.tsv). median wall_ms, rel% vs K=1. n=samples.
+q         | K=1  med   rel% | K=2  med   rel% | K=4  med   rel%
+tpch99    |    1911  +0.0 (n6) |    1902  -0.4 (n6) |    1909  -0.1 (n6)
+
+# K>1 FASTER (negative rel beyond noise) = the overlap win; for msg_zerocopy a flat curve is the H4 FAIL.

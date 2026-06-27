@@ -1,0 +1,10 @@
+# P2 K-sweep (dev/hotcold/phase3/results/p2_ksweep_bare). rel% vs K=1 (same binary). band=max(5%, across-round sd/med).
+bench        q | K=1 med [rng]      rel% | K=2 med [rng]      rel% | K=4 med [rng]      rel% | K=8 med [rng]      rel%
+clickbench   2 |    462[460,464]  +0.0  |    478[454,502]  +3.5  |    466[454,477]  +0.8  |    476[465,486]  +2.9 
+clickbench  17 |    516[494,538]  +0.0  |    516[492,541]  +0.1  |    506[490,522]  -1.9  |    516[514,518]  +0.0 
+clickbench  33 |    650[625,674]  +0.0  |    658[628,688]  +1.3  |    650[622,678]  +0.1  |    668[662,674]  +2.8 
+tpch         6 |   1446[1438,1453]  +0.0  |   1502[1499,1506]  +3.9  |   1470[1446,1494]  +1.7  |   1462[1447,1476]  +1.1 
+tpch         9 |   3146[3137,3156]  +0.0  |   3170[3168,3172]  +0.7  |   3157[3156,3158]  +0.3  |   3174[3154,3194]  +0.9 
+
+## per-K vs K=1 (cells beyond noise): {2: '0faster/0slower', 4: '0faster/0slower', 8: '0faster/0slower'}
+## (bare loopback: expect ~all parity = the pre-registered NULL; netem rate: expect K>1 FASTER)

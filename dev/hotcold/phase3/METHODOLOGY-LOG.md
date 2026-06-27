@@ -180,3 +180,158 @@ LOG method=epoll epoll_sends>0 blocking_sends=0 (epoll path on the wire). H13 ze
 across-round table on the committed P1 state).
 **DONE — P1 parity PROVEN (parity + io_uring-off mechanism + msg_zerocopy intact). → P1 review-fix commit +
 REPORT.**
+
+---
+
+## L0024 — P2 design + iteration-1 pre-registration (bare-loopback NULL)
+**Holistic note (end-to-end).** P1 publish is BLOCKING: scan/deform(N) → publish(N) [serialize cz->bufs →
+frame + send, blocks until kernel accepts all bytes] → deform(N+1). The snapshot boundary (verified
+shm_offload.c:590-596: columnizer resets cz->bufs immediately after shm_producer_publish returns) is the
+serialize copy. P2 makes publish NON-BLOCKING: serialize block N into a FREE pooled frame (the snapshot,
+synchronous), hand the frame to a send reactor, RETURN so deform(N+1) refills cz->bufs while frame N drains
+through the kernel→wire. Copy count UNCHANGED (1 serialize + 1 kernel send copy); we do NOT double-buffer
+cz->bufs (H1). On bare loopback the kernel drains instantly (32MiB SO_SNDBUF, fast C1 consumer) ⇒ nothing to
+overlap ⇒ NULL. Under netem rate the kernel buffer fills, send EAGAINs, and the K-deep pool lets deform run
+K blocks ahead of the slow drain ⇒ throughput recovery (the binding proof, it2/it3).
+**DESIGN (send reactor, ShmProducer).** K-deep frame pool (GUC pg_clickhouse.tcp_send_inflight_blocks,
+default 2, ≥1); EXACTLY ONE frame SENDING at a time (byte-stream order) via a FIFO of READY frames. Each
+frame = a coalesced 2-entry iovec {header/meta, payload/body} + total_len + sent-offset (partial-send
+resumable, H9) + zc_seq + state{FREE,READY,SENDING[,ZC_PENDING]}. Bespoke: frame owns a tcp_scratch-sized
+serialize buffer (tcp_serialize_block writes into it) + the TcpBlockHeader inline; ONE sendmsg of {bh,
+payload} (was two send()s). Arrow: K encoders (encode into encoder[i] body/message; frame iovec = {message,
+body}); reclaim encoder[i] when its frame's send completes. Per publish (non-blocking): pump the in-flight
+send (advance, non-blocking) → acquire a FREE frame (if all K busy, pump + epoll_wait(EPOLLOUT) until one
+frees — the backpressure point) → serialize/encode block into it → enqueue READY → pump → return. K=1 ⇒
+pool of 1 ⇒ acquire waits for the single frame to drain ⇒ exactly P1 single-in-flight (H14, no special
+case). EOS (H5): enqueue EOS after the last data frame, then reactor_drain_all (pump until ALL frames+EOS
+fully written to kernel + zc reaped) before eos_published. Cleanup (H8): drain/reap zc seqs before freeing
+pooled frames + closing tcp_conn_fd; close the send epoll fd. Async MSG_ZEROCOPY (H4/H6/H7): defer
+tcp_zc_drain_until from the steady path; tag each frame with its zc seq; reclaim a frame only when its
+completion is reaped (tcp_zc_reap); block on a specific frame's seq only when that exact buffer is needed
+and none free; bound K×max_frame ≤ RLIMIT_MEMLOCK (8 MiB) — cap K + log if exceeded.
+**ITERATION 1 — pre-registration.** Regime: BARE loopback (lo=noqueue, H12), W=8, tcp. Predicted magnitude:
+**NULL / parity** of the K-sweep (K∈{1,2,4,8}) — K>1 ≈ K=1 within noise (no send latency to hide; producer
+scan/deform-bound or consumer recv-bound). K=1 MUST equal P1. Correctness: verify_offload tcp+arrow 137/137,
+no new DIFF; byte-stream integrity (partial sends, EOS order, cancel/death mid-send). Instruments: K-sweep
+end-to-end wall (drift-controlled), producer phase split (overlap-honest), gtest byte-integrity. This is the
+honest pre-registered null that confirms the loopback reality; it2 (netem rate) is the binding overlap proof.
+**CONTINUE — implement the reactor, gate, then it1 measure.**
+
+---
+
+## L0025 — P2 iteration 1: bare-loopback K-sweep → NULL (pre-registered, confirmed)
+**WHAT.** K-sweep (run-ahead K∈{1,2,4,8}, set per-query via the GUC, interleaved across R=2 rounds for drift
+control — same P2 binary, consumer = live C1; tcp; W=8; CB{2,17,33}+TPC-H{6,9}; lo=noqueue asserted).
+**Harness bug caught + fixed first:** the loop var `K` collided with the wsweep's own `K` (instrumented-run
+count) env, routing every K-level to the same OUT dir; renamed the run-ahead loop var to `KV` (the wsweep
+keeps `K=1`). Verified distinct k1/k2 dirs in a smoke test, re-ran.
+**RESULT (across-round median, rel% vs K=1).**
+  CB Q2  K1 462 / K2 +3.5 / K4 +0.8 / K8 +2.9     CB Q17 K1 516 / K2 +0.1 / K4 -1.9 / K8 +0.0
+  CB Q33 K1 650 / K2 +1.3 / K4 +0.1 / K8 +2.8      TPCH Q6 K1 1446 / K2 +3.9 / K4 +1.7 / K8 +1.1
+  TPCH Q9 K1 3146 / K2 +0.7 / K4 +0.3 / K8 +0.9
+  → 0 cells faster, 0 slower beyond noise (all |rel| ≤ band). **NULL / parity.**
+**INTERPRETATION.** On bare loopback K>1 ≈ K=1 — the pre-registered honest NULL. Reasons (pre-reg): (a) the
+32 MiB SO_SNDBUF already buffers the cross-process pipeline; (b) `send` returns immediately when the buffer
+has room ⇒ no send latency to hide when the producer is scan/deform-bound, and when the socket fills the
+consumer is recv-bound where producer overlap can't raise throughput. K=1 ≡ P1 confirmed (the K=1 column is
+the single-in-flight baseline; correctness already = native at K=1/2/8). This NULL is a valid logged
+iteration; the binding overlap proof is the netem regime (it2, L0026).
+**DONE (it1). CONTINUE → it2 (netem rate, SO_SNDBUF≈BDP).**
+
+---
+
+## L0026 — P2 it2 (netem rate): the SO_SNDBUF×BDP hinge + a sysctl trap (corrected)
+**it2 attempt A (SO_SNDBUF=2MB via wmem_max=1MB, rate 3gbit delay 50us).** Queries ARE heavily rate-bound
+(TPC-H Q6 1446→4380ms 3×, Q9 3146→6935ms 2.2×, CB Q17 516→798ms), but the K-curve is FLAT (K2/4/8 all
+parity vs K1). DIAGNOSIS (H11 exactly): the 2MB socket buffer DWARFS the link BDP (3gbit×50us = 18.75KB), so
+K=1 already runs far ahead via the kernel buffer; K-in-flight (userspace) adds nothing. SO_SNDBUF must be
+≈ BDP (well under one frame) for K to gate. Kept as evidence (p2-ksweep-netem3g-sndbuf2M-inert.txt).
+**it2 attempt B (clamp wmem_max=16384 to force SO_SNDBUF≈BDP) — TRAP, aborted.** net.core.wmem_max is
+GLOBAL: clamping it to 16 KB starved NETLINK sockets → `tc`/`ss` failed ("No buffer space available"), netem
+did not install, the run was garbage. Restored wmem_max/rmem_max=64MiB; lo=noqueue; CH+PG verified alive.
+**FIX.** Add a PER-SOCKET producer SO_SNDBUF GUC (pg_clickhouse.tcp_sndbuf_bytes) so the experiment can
+shrink the producer's send buffer toward the BDP WITHOUT touching the global wmem_max (netlink safe). Re-run
+it2 with netem rate + a small per-socket SO_SNDBUF. CONTINUE.
+
+---
+
+## L0027 — P2 it2 (netem epoll) = NULL, root-caused; the K-win lives on the zerocopy path (→ it3)
+**WHAT.** Re-ran the netem3g K-sweep (delay 50us rate 3gbit, per-socket SO_SNDBUF=64KB) at R=3 (R=2 was
+too few samples) for a stable K=1 baseline. METHOD=epoll. Also captured the overlap mechanism directly.
+**RESULT (R=3 medians, rel% vs K=1).** CB17 K1 969 / K2 +2.7 / K4 +5.3 / K8 +11.5(slower);
+TPCH Q6 K1 4636 / K2 -0.6 / K4 -0.2 / K8 +0.5; TPCH Q9 K1 7409 / K2 -0.2 / K4 +0.5 / K8 +0.6.
+→ FLAT (K>1 ≈ K=1; high-K slightly SLOWER from pool/pump overhead). The earlier R=2 "K>1 ~2x faster" was
+an ARTIFACT of K=1's noisy slow tail (2 samples spanned 3378–11698 ms); the R=3 K=1 is stable+slow and K>1
+does not beat it. Re-running caught a false win — recorded honestly.
+**MECHANISM (decisive, deterministic — p2-overlap-mechanism.txt).** Same regime, TPC-H Q6, log_stream_stats:
+K=1 overlap_frames=0 (all workers); K=8 overlap_frames=228–229 (all workers). So the structural overlap DOES
+happen at K>1 (deform/serialize ran ahead ~228×/worker) — but it does NOT recover throughput for the
+COPYING (epoll) send.
+**ROOT-CAUSE (the key architectural insight).** For the copying send, `send()` frees the frame as soon as
+the bytes are copied to the kernel SO_SNDBUF, so K=1 never blocks on buffer REUSE (only on the buffer being
+full). The producer is single-threaded and pumps only at publish boundaries, so the link is fed at most one
+pump's worth per deform-period regardless of K — a large SO_SNDBUF lets K=1 run ahead (K redundant), a small
+one throttles BOTH K=1 and K>1 (the kernel is the only background drainer; no background sender thread). So
+the K-deep USERSPACE pool is redundant with the kernel SO_SNDBUF for the copying send ⇒ epoll-netem NULL.
+**The lever is MSG_ZEROCOPY (H4, matches Goal pt 3 "K matters most on the zero-copy path"):** there the
+frame buffer is PINNED until the kernel reaps the completion, so K=1 MUST drain-per-frame (block) before
+reusing the single buffer (≡ P1), while K>1 serializes into other buffers and pipelines. Under netem (slow
+reap) K>1 should beat K=1. → it3 tests this (a flat zerocopy K-curve would be the FAIL per H4).
+**DONE (it2: epoll-netem NULL, honest + root-caused). CONTINUE → it3 (msg_zerocopy netem).**
+
+---
+
+## L0028 — P2: a single-pointer reactor BUG (sends serialized behind completions) found+fixed; THE OVERLAP WIN
+**WHAT (debugging chain).** The netem-rate (epoll+zerocopy) and the first injected-delay K-sweeps were all
+FLAT even at valid K>1. Root-caused TWO bugs the correctness tests missed (correctness is K-independent):
+ (1) frames sized to the 64 MiB data_region → zerocopy RLIMIT cap forced K=1 (fixed: tcp_frame_capacity
+     sizes to the tight per-block max; all-fixed schema ⇒ ~1.5 MB ⇒ K up to 5 under the 8 MiB RLIMIT);
+ (2) msg_zerocopy socket not O_NONBLOCK + no send-epoll-fd ⇒ poll-spin (fixed: O_NONBLOCK+epoll for zc too);
+ (3) **the load-bearing one** — the reactor used ONE FIFO cursor (send_drain) for BOTH sending and
+     reclaiming: after the head frame was fully sent, pump tried to reclaim it and, if it couldn't (zerocopy
+     completion / injected latency not yet elapsed), STOPPED — so the next frame was not SENT until the
+     head's completion arrived. That serialized sends behind completions, so K frames could be
+     deform-serialized ahead (overlap_frames>0) but only ONE was ever in flight ⇒ K never pipelined.
+**FIX.** Two-cursor reactor: reactor_send_pos() = the first not-fully-sent occupied frame (the send cursor),
+advanced independently of send_drain (the reclaim cursor). Frames are sent back-to-back in FIFO order (one
+sendmsg at a time = byte-stream order preserved); up to K frames sit IN FLIGHT (sent, awaiting completion)
+concurrently; reclaim is lazy (frees completed frames from send_drain). verify_offload tcp 137/137 +
+K=1/2/8=native preserved.
+**RESULT — injected per-frame latency microbench (PROMPT-sanctioned complementary instrument; Q99 all-fixed,
+no netem, the injected delay IS the send/completion latency; R=2 N=3).**
+  delay=20ms/frame:  K=1 2554ms / K=2 1378 (-46%) / K=4 949 (-63%, 2.7x) / K=8 947 (-63%, knee).
+  K=4 fully HIDES the 20 ms/frame latency, recovering to ~947 ms ≈ the no-delay baseline (944 ms). Clean,
+  large, monotonic K-curve with a knee at K=4 (where K x per-block-work >= the latency).
+**INTERPRETATION.** This is the BINDING overlap proof: the K-deep pipeline RECOVERS THROUGHPUT when send/
+completion-latency exists — K hides the latency by keeping K frames in flight concurrently. It directly
+PROVES the design works (and the two-pointer fix was essential). It also vindicates the loopback/netem
+NULLS (it1/it2/it3): those have NO real send-latency to hide (loopback MSG_ZEROCOPY is a fast deferred copy
+— the measured-null; the kernel SO_SNDBUF already pipelines the copying send), so K is correctly null there,
+while the mechanism delivers the moment a real send-latency is present (the real-NIC expectation).
+**CONTINUE → knee-moves-with-latency confirmation + re-run netem zerocopy on the fixed reactor.**
+
+---
+
+## L0029 — P2 knee-scaling + netem-on-fixed-reactor (host-intrinsic null confirmed)
+**Knee scales with latency (the BDP/latency-pipelining signature).** Injected-delay microbench, Q99 all-fixed:
+  delay=20ms: K1 2554 / K2 1378(-46%) / K4 949(-63%) / K8 947  → knee K=4
+  delay=40ms: K1 4855 / K2 2518(-48%) / K4 1360(-72%) / K8 952(-80%, 5.1x) → knee K=8
+Doubling the per-frame latency doubles the K needed to hide it (K4→K8); at the knee the wall recovers to the
+~947 ms no-delay baseline. K_knee ∝ latency / per-block-work — exactly the H11 "knee moves with BDP" analog
+(here the latency analog). evidence/p2-injdelay-knee.txt.
+**netem zerocopy on the FIXED reactor = still FLAT** (delay 500us rate 10gbit, Q99: K1 1911 / K2 -0.4% /
+K4 -0.1%). This is the decisive control: the two-pointer reactor DOES pipeline (the injected-delay microbench
+proves it), so the netem zerocopy flatness is NOT a reactor bug — it is HOST-INTRINSIC: on loopback
+MSG_ZEROCOPY performs a fast deferred COPY (SO_EE_CODE_ZEROCOPY_COPIED, the phase-2 measured-null), so the
+completion is NOT gated by the netem packet delay → K=1 never stalls on completions → flat. netem can delay
+the data path but cannot make the loopback zerocopy completion hardware/ACK-gated. evidence/
+p2-kbench-netem-zc-fixed.txt. lo restored to noqueue, wmem_max=64MiB (H12).
+**P2 VERDICT.** The K-deep pipeline is correctly implemented (two-cursor send-ahead, K-in-flight, coalesced
+sendmsg, async-zerocopy-completion, tight frames, K=1≡P1, EOS/cleanup) and DEMONSTRABLY recovers throughput
+when send/completion-latency exists (injected-delay microbench: 2.7x@20ms/K4, 5.1x@40ms/K8, knee scales with
+latency). On THIS loopback host it is an honest NULL across bare + netem-rate + netem-delay for both epoll
+and zerocopy — root-caused: (a) the kernel SO_SNDBUF already pipelines the copying send; (b) loopback
+zerocopy is a fast deferred copy, so the real-NIC completion latency that K hides does not manifest, and
+netem cannot reproduce it. The win is the real-NIC expectation; the loopback null is pre-registered + honest.
+≥3 iterations logged (it1 bare null L0025, it2 netem-rate null L0027, it3 zerocopy bug-fix + injected-delay
+win + knee-scaling L0026/L0028/L0029). DONE.
