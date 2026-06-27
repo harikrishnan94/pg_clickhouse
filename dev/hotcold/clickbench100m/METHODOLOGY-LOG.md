@@ -204,3 +204,22 @@ Material claims require ≥3 independent converging sources; orientation/operati
   producer (D-HC-0405) is the dominant limiter at large f → parallel-hot optimization (iter-2b). Projection ×10 is
   order-of-magnitude (labeled, never presented as measured 100M).
 - Verdict: CONTINUE → iter-2b parallel-hot; iter-3 W-sweep + synthesis.
+
+### L0043 — Unit-1 iter-2b: PARALLEL hot producer (P=8) recovers the f=10% win  [unit 1]  [iteration 2]  2026-06-28T06:30+05:30
+- Goal / hypothesis (D-HC-0405 revisit): the single-threaded hot producer is the f=10% bottleneck;
+  P concurrent producers streaming P disjoint hot sub-tables into P rings (mk_merge p10:parP) should cut merge_ch.
+- What I did: 09_parallel_hot.sh — split clickbench.hits_hot_p10 into 8 disjoint parts (cityHash64%8, sum==10M
+  verified), COPY to PG; benched 8 representative queries (cold 11ms..8.6s), single-hot vs parallel-hot(P=8), N=5,
+  W=8 cap, CH query_duration median.
+- How verified / CONFOUNDER (§9.4): the 09 in-session single-hot was ~1.3s INFLATED vs the clean TIER1 single-hot
+  (the 8 new sub-tables, ~7GB in PG, evicted cache → single-hot reads colder). Root-caused; used the CLEAN TIER1
+  single-hot merge_ch as the fair baseline. Sources: TIER1 cells.tsv (clean single), parallel_hot.tsv (parallel),
+  baselines10m.tsv (projection).
+- Result (parallel-hot vs CLEAN single-hot @f=10%, 8q): geomean 2.64× faster (q38 6.1×, q22 5.6×, q8 5.5×, q13 3.2×,
+  q18 1.7×, q33 1.5×, q17 1.4×, q29 1.1× — biggest for fast queries where the single hot stream dominated). vs
+  PROJECTED baselines: parallel-hot merge geomean 9.3× vs native-PG-100M (single-hot was 2.7×) and 2.45× vs
+  full-offload-100M (single-hot was 0.93× — the f=10% win is RESTORED). p01 P=4 (smoke): NO benefit (0.986×) — at
+  small f the hot is already small/fixed-overhead-bound and P producers add launch + core contention.
+- Interpretation: confirms the single-threaded producer (D-HC-0405) was the dominant large-f limiter; parallelizing
+  it recovers most of the loss and restores the full-offload win at f=10%. Lever applies at large f, not small f.
+- Verdict: CONTINUE → iter-3 W-sweep (W-dependence + W=1 starvation) + Unit-1 synthesis/review.
