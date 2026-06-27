@@ -129,3 +129,36 @@ Material claims require ≥3 independent converging sources; orientation/operati
   errors. Unit-0 correctness floor is satisfied: every eligible query × fraction == pure-CH-100M within the
   documented fidelity bounds (F3 avg→Float64 surfaces as cmp class 'approx' on q4; top-N tiebreak on the 6 queries).
 - Verdict: DONE (Unit-0 correctness GREEN, pending adversarial review). → D-HC-0407.
+
+### L0039 — Adversarial review (5 isolated agents A–E)  [unit 0]  [iteration 2]  2026-06-28T02:30+05:30
+- Goal: §12 full fan-out review of Unit-0 before green. 5 isolated subagents (A correctness/B simplicity/
+  C perf-mechanism/D conventions/E holism), read-only, no producers/no-rerun/no-mutation.
+- Result (blocking + notable): A1 (BLOCKING correctness) — hot arm streams PG wall-clock as DateTime64('UTC')
+  but cold/pure used toDateTime64(EventTime,'UTC') which RELABELS the CH instant (server TZ Asia/Kolkata, −5:30),
+  so hot vs cold disagree by 5:30 for the same row; masked in the 5 eligible timestamp queries by incidental row
+  placement. C1 (perf, Unit-1) cold-arm filter reads 4 extra tuple cols (narrow-query read-bytes inflation) —
+  attribute via read_bytes, don't blame overlap. C2 (mechanism, Unit-1) the pre-registered phase-split STALL
+  instrument CANNOT fire on the standalone-producer path (out_stats=NULL, worker-only elog) → replace with a real
+  2nd instrument before Unit 1. C3 W=1 = CPU-starvation artifact (label it). C4 high-card GROUP BY spills (flag).
+  B1 (should-fix) socket-poll name bug in 06/07 (benign via slack). A5/A6/B2 oracle robustness nits. D1
+  bench-common.sh not reused; D2 methodology format (REJECTED — matches task §10). E2 origin_pid liveness guard
+  disabled on this path (harness mitigates). E4 the "~19GiB" figure is really ~26.4GiB configured + a sibling-study
+  global OOM occurred — correct the figure; Unit 3 must measure.
+- Verdict: CONTINUE → fix A1 (blocking) + B1/A5/A6/B2; carry C1/C2/C3/C4/E2/E4 to Unit 1/3; reject D2.
+
+### L0040 — A1 fix: cold/pure timestamp cast preserves the server-TZ wall-clock (matches hot + native-PG)  [unit 0]  [iteration 3]  2026-06-28T02:45+05:30
+- Goal / hypothesis: making cold/pure use toDateTime64(toString(EventTime),6,'UTC')) (wall-clock digits relabeled
+  UTC) aligns all three arms (hot streamed, cold, pure-CH) to native-PG ClickBench semantics → merge==pure-CH for
+  timestamp queries by construction.
+- What I did: mk_merge_sql.py dt64_cast() now wraps toString() (applied to hits_dt64 view + cold arm); recreated
+  the view; also fixed B1 (socket poll name 06/07), A5 (empty-result guard), A6 (leak-predicate parens), removed
+  the B2 dead loop.
+- How verified (≥3 independent sources): (i) single-row check — hits_dt64.eventtime for WatchID 9223361798749042077
+  = 2013-08-01 01:01:07 == hits_100m raw display == PG hot heap (was 2013-07-31 19:31:07 before); (ii) 10M FIDELITY
+  BRIDGE — native-PG `extract(minute) GROUP BY ... LIMIT 5` over pg.hits == pure-CH(fixed) `toMinute` over the 10M
+  dt64 view, IDENTICAL top-5 (37/169142, 39/167957, 28/167836, 32/167816, 41/167740); (iii) HOT-REACHING probe —
+  recent-minute histogram (buckets to 2013-08-01 01:29:00, hot rows) pure-CH == merge p01, byte-identical, producer
+  streamed 1,000,000.
+- Interpretation: A1 prediction CONFIRMED; the cast now matches the validated offload/native-PG semantics. The bridge
+  (iii in A8) is now PROVEN, not assumed. Re-running the full oracle to confirm all 126 cells stay green by construction.
+- Verdict: CONTINUE → re-run 05_oracle.sh + 07_verify_topn.sh.

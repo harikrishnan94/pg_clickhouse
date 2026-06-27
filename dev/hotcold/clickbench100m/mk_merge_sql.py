@@ -75,10 +75,19 @@ def projected_cols(schema_str):
         parts.append(cur)
     return [p.split()[0] for p in parts if p.strip()]
 
+# Cold-arm timestamp normalization (A1 fix, see METHODOLOGY-LOG L0040 / ADVERSARIAL-REVIEW).
+# CH server TZ is Asia/Kolkata; hits_100m.EventTime is a DateTime INSTANT. The hot arm streams the
+# PG naive wall-clock (e.g. '2013-08-01 01:01:07') as DateTime64(6,'UTC') — matching native-PG
+# ClickBench semantics. toDateTime64(EventTime,'UTC') would instead RELABEL the instant (−5:30),
+# disagreeing with the hot arm and native PG. toDateTime64(toString(EventTime),'UTC') reproduces the
+# server-TZ wall-clock digits as a UTC DateTime64 — identical to the streamed hot value.
+def dt64_cast(camel):
+    return f"toDateTime64(toString({camel}), 6, 'UTC')"
+
 def hits_dt64_ddl(cols):
     proj = []
     for (_, camel, lo, bt, d) in cols:
-        proj.append(f"toDateTime64({camel}, 6, 'UTC') AS {lo}" if d else f"{camel} AS {lo}")
+        proj.append(f"{dt64_cast(camel)} AS {lo}" if d else f"{camel} AS {lo}")
     return ("CREATE OR REPLACE VIEW clickbench.hits_dt64 AS\nSELECT " +
             ",\n       ".join(proj) + "\nFROM clickbench.hits_100m")
 
@@ -109,7 +118,7 @@ def main():
             cold_sel = []
             for c in pcols:
                 camel, d = by_lower[c]
-                cold_sel.append(f"toDateTime64({camel}, 6, 'UTC')" if d else camel)
+                cold_sel.append(dt64_cast(camel) if d else camel)
             cold = ("SELECT " + ", ".join(cold_sel) +
                     f" FROM clickbench.hits_100m WHERE {cold_pred(env, f)}")
             repl = f"(({hot}) UNION ALL ({cold}))"

@@ -47,7 +47,7 @@ SQL
   for f in p01 p05 p10; do
     rm -f "/tmp/tb_prod_${f}.out"
     ( $PSQLU -tA -c "LOAD 'pg_clickhouse'; SET search_path=pg,public; SET statement_timeout='240s'; SELECT clickhouse_stream_relation('pg.hits_hot_${f}'::regclass,'pgch_hot_${f}',65536);" >"/tmp/tb_prod_${f}.out" 2>&1 ) & pp=$!
-    for i in $(seq 1 300); do [ -S "/tmp/clickhouse_shm_pgch_${f}.sock" ] && break; sleep 0.03; done
+    for i in $(seq 1 300); do [ -S "/tmp/clickhouse_shm_pgch_hot_${f}.sock" ] && break; sleep 0.03; done
     python3 "$HERE/mk_merge_sql.py" "$OUT/tmpl/q${q}.ch.sql" "$f" | ch > "$OUT/merge/q${q}_${f}.out" 2>&1
     grep -q 'Exception' "$OUT/merge/q${q}_${f}.out" && $PSQLU -tAc "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE '%clickhouse_stream_relation%' AND pid<>pg_backend_pid();" >/dev/null 2>&1
     wait $pp 2>/dev/null

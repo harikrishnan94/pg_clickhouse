@@ -27,9 +27,6 @@ ch()  { curl -s "127.0.0.1:${CH_PORT}/?${SETTINGS}" --data-binary @- ; }
 chc() { curl -s "127.0.0.1:${CH_PORT}/" --data-binary @- ; }   # control (no settings)
 
 echo "== partition exactness per fraction =="
-for f in $FRACS; do
-  python3 "$HERE/mk_merge_sql.py" "$HERE/templates/q5.ch.sql" "$f" >/dev/null 2>&1 || true
-done
 # exactness uses the boundary predicate directly (independent of the templates)
 python3 - "$HERE" "$FRACS" <<'PY'
 import sys,os,subprocess
@@ -84,9 +81,14 @@ run_one() {  # $1=f  $2=q
   done
   blk="${blk:-0}"
   local cls; cls=$(python3 "$CMP" "$OUT/pure/q${q}.out" "$OUT/merge/${f}_q${q}.out" 1e-6 2>/dev/null | cut -d'|' -f1); cls="${cls:-ERR}"
+  # A5 guard: an empty pure OR merge output (or one containing a CH Exception) is NEVER a PASS,
+  # even though cmp scores two empty files as 'exact|0|0'.
+  local nonempty=1
+  { [ -s "$OUT/pure/q${q}.out" ] && [ -s "$OUT/merge/${f}_q${q}.out" ]; } || nonempty=0
+  grep -qi 'Exception' "$OUT/pure/q${q}.out" "$OUT/merge/${f}_q${q}.out" 2>/dev/null && nonempty=0
   local verdict="FAIL"
   case "$cls" in exact|float|approx)
-     [ "$rows" = "${NF[$f]}" ] && [ "${blk:-0}" -ge 1 ] 2>/dev/null && verdict="PASS" ;;
+     [ "$nonempty" = 1 ] && [ "$rows" = "${NF[$f]}" ] && [ "${blk:-0}" -ge 1 ] 2>/dev/null && verdict="PASS" ;;
   esac
   echo -e "${f}\t${q}\t${cls}\t${rows}\t${NF[$f]}\t${blk}\t${verdict}" >> "$SUM"
   echo "  [$f q$q] class=$cls rows=$rows/${NF[$f]} blk=$blk -> $verdict"
@@ -100,7 +102,7 @@ done
 echo "== teardown leak check =="
 echo "  /dev/shm/pgch_*: $(ls /dev/shm/ 2>/dev/null | grep -c pgch || true)"
 echo "  control sockets: $(ls /tmp/clickhouse_shm_pgch* 2>/dev/null | wc -l)"
-echo "  shm-stream backends: $($PSQLU -tAc "select count(*) from pg_stat_activity where backend_type ilike '%clickhouse%' or query ilike '%clickhouse_stream_relation%' and pid<>pg_backend_pid();" 2>/dev/null)"
+echo "  shm-stream backends: $($PSQLU -tAc "select count(*) from pg_stat_activity where (backend_type ilike '%clickhouse%' or query ilike '%clickhouse_stream_relation%') and pid<>pg_backend_pid();" 2>/dev/null)"
 echo "== summary =="
 awk -F'\t' 'NR>1{c[$7]++} END{for(k in c) printf "  %s: %d\n",k,c[k]}' "$SUM"
 echo "  (full: $SUM)"

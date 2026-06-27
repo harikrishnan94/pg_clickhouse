@@ -188,4 +188,17 @@ An effect counts only if relative diff > max(5%, 1 sample stdev of the cell); wi
 "within noise" explicitly (§1, §9.4). G1–G4 convergence gates reuse the `dev/wsweep-report` definitions.
 
 ## Amendments (append-only)
-- (none yet)
+- **AM1 (2026-06-28) — split mechanism SUPERSEDED.** §2 above describes the split via a persisted `hc_row_id`
+  rank column in a rebuilt `hits_idx` table. That design OOM'd at the CH ~live-memory ceiling (global window sort
+  of 100M×105 cols) and is SUPERSEDED by the exact recency-boundary predicate on the proven-unique 5-tuple
+  (EventTime,WatchID,UserID,CounterID,EventDate): hot(f)=`tuple>=B(f)`, cold(f)=`tuple<B(f)`. See D-HC-0403/0404,
+  METHODOLOGY-LOG L0034, boundaries.env. `hits_100m` is left canonical (fair pure-CH baseline); no rank table.
+  10-REPRODUCTION.md reflects the boundary design.
+- **AM2 (2026-06-28) — Unit-0 timezone fix (A1).** The cold arm and the pure-CH `hits_dt64` view normalize the 3
+  DateTime columns via `toDateTime64(toString(col),6,'UTC')` (server-TZ wall-clock relabeled UTC), matching the
+  streamed hot arm AND native-PG ClickBench semantics. (An earlier `toDateTime64(col,'UTC')` relabeled the CH
+  instant, −5:30 off — adversarial-review finding A1, fixed in L0040; bridge proven against native-PG at 10M.)
+- **AM3 (2026-06-28) — Unit-1 overlap instrument (C2).** The pre-registered "producer phase-split STALL" 2nd
+  instrument does NOT fire on the standalone `clickhouse_stream_relation` path (worker-only / out_stats=NULL).
+  Unit 1 substitutes the producer active-window vs merge-window (and/or /proc producer CPU) as the independent 2nd
+  instrument alongside wall decomposition + CH query_duration_ms. See evidence/ADVERSARIAL-REVIEW.md C2.

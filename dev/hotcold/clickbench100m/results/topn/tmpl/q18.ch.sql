@@ -1,1 +1,1 @@
-SELECT userid, searchphrase, count(*) FROM (SELECT * FROM streamed_table('/pgch_2376714_1_1_0', 'userid Int64, searchphrase String')) GROUP BY userid, searchphrase ORDER BY count(*) DESC NULLS FIRST, userid ASC NULLS LAST, searchphrase ASC NULLS LAST LIMIT 10
+SELECT userid, searchphrase, count(*) FROM (SELECT * FROM streamed_table('/pgch_2826957_1_1_0', 'userid Int64, searchphrase String')) GROUP BY userid, searchphrase ORDER BY count(*) DESC NULLS FIRST, userid ASC NULLS LAST, searchphrase ASC NULLS LAST LIMIT 10

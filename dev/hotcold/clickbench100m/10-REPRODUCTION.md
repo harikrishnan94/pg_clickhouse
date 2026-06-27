@@ -12,8 +12,11 @@ Exact environment, versions, GUCs, ports, load recipe, and the merge template. M
   Instance RUN_ID=`tpchcb`, HTTP `:21002`, TCP `:21003`. Resolve the LIVE pid:
   `CHPID=$(ss -ltnp | grep ':21002 ' | grep -oP 'pid=\K[0-9]+' | head -1)`  (manifest CH_PID is stale — D0013).
   FDW server `ch_bench` (PG db `clickbench`) → `127.0.0.1:21002 dbname=clickbench`.
-  CH live total-memory ceiling ≈ 19 GiB (PG holds 16 GiB shared_buffers); 100M sorts/aggregations REQUIRE
-  external spill (`max_bytes_before_external_group_by`, `max_bytes_before_external_sort`).
+  CH `max_server_memory_usage` ≈ 26.4 GiB (0.9 ratio); `MemoryResidentMax` has reached ~22 GiB. The ~19 GiB seen
+  during data-prep was a transient throttle (stale cgroup + memory-tracker-to-free-RAM), NOT the ceiling. With PG
+  pinning 16 GiB shared_buffers on a 61 GiB host, the whole-system envelope (16 + 26.4 = 42.4 GiB of ceilings) is
+  tight — a global OOM has occurred on this host in a sibling study — so 100M sorts/aggregations REQUIRE external
+  spill (`max_bytes_before_external_group_by`, `max_bytes_before_external_sort`); Unit 3 measures real memory.
 - cgroup: the CH server was found in a stale sweep cgroup `/pgch_rep_tpch` (cpu.max "800000 100000" = 8 cores);
   uncapped for data prep (`echo max | sudo tee /sys/fs/cgroup/pgch_rep_tpch/cpu.max`). Unit-1 re-establishes the
   shared cpu cap (PG tree + CH) fresh per cell (wsweep_split.sh convention).
