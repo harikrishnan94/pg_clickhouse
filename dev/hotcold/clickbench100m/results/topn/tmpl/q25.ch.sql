@@ -1,0 +1,1 @@
+SELECT watchid, eventtime, searchphrase FROM (SELECT * FROM streamed_table('/pgch_2553101_1_1_0', 'watchid Int64, eventtime DateTime64(6, ''UTC''), searchphrase String')) WHERE ((searchphrase <> '')) ORDER BY eventtime ASC NULLS LAST, searchphrase ASC NULLS LAST, watchid ASC NULLS LAST LIMIT 10
