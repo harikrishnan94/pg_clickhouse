@@ -106,3 +106,21 @@ python3 dev/hotcold/clickbench100m/analyze_bench.py        # merge_ch/cold_ch ge
 ```
 Cleanup the parallel-hot residue when done: `clickbench.hits_hot_p{01,10}_{0..7}` (CH) and `pg.hits_hot_p{01,10}_{0..7}` (PG).
 Env knobs: `N` (warm runs), `W_LIST`/`W` (cgroup cap = cores; CH max_threads=W), `FRACS`, `QLIST`, `P` (parallel-hot), `CELLS` (output path).
+
+## Unit 2 — NIC bound (NO RESULT + bounds)
+```
+# (a) analytic: hot-bytes (CH uncompressed, all 105 cols) ÷ assumed bandwidth vs measured cold-arm (overlap.tsv)
+#     hot-bytes: SELECT sum(data_uncompressed_bytes) FROM system.parts WHERE table='hits_hot_p<f>' AND active
+# (b) netem-shaped TCP hot transfer (lo netem rate 3gbit delay 50us; bare vs shaped); reuses phase3 mechanism:
+N=3 FRACS="p01 p10" K=4 bash dev/hotcold/clickbench100m/12_nic_netem.sh   # -> results/bench/nic_netem.tsv
+# (c) cite dev/hotcold/phase3/REPORT-P2.md (tcp_send_delay_us K-deep latency-hiding).
+# True cross-box = NO RESULT (D-HC-0408). NOTE: 'rate 3gbit' = 0.375 GB/s (3 Gbit), 8x below the 3 GB/s analytic.
+```
+
+## Unit 3 — cold-IO added-pressure
+```
+# HIGH-IMPACT (D-HC-0409): shrinks shared_buffers 16GB->256MB + restart, RESTORES 16GB on EXIT (trap). Verify after:
+N=3 FRACS="p01 p10" bash dev/hotcold/clickbench100m/13_coldio.sh   # -> results/bench/coldio.tsv
+sudo -u postgres psql -tAc "show shared_buffers;"                  # MUST be 16GB afterwards
+# cold-read confirmation (restart PG to empty SB, then drop_caches, EXPLAIN BUFFERS): evidence/coldio_cold_confirmation.txt
+```

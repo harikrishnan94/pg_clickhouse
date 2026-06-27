@@ -164,3 +164,43 @@ bench-common.sh non-reuse (accepted POC deviation, the merge needs a standalone 
 The headline VALUE win (merge ≫ native-PG, conservatively projected; correct/offloading at every cell; losses
 included) is SOUND (Agent A PASS, Agent C C3 PASS). The OVERLAP-mechanism framing was flawed (wrong cold reference)
 and is re-measured in iter-4 before Unit 1 is marked green.
+
+---
+
+## FINAL REVIEW (before delivery) — Units 2 & 3 + overall (3 isolated agents: A correctness/honesty, C perf/mechanism, E+D holism/DoD)
+This is the §12 "once more before final delivery" review AND serves as the per-unit review of record for Units 2 & 3.
+
+### Verified SOUND (adversarial claims that did NOT hold)
+- Headline M1 (15.6×/5.4× @f1%, 11/16 HIDDEN, parallel-hot 2.64×) reproduces EXACTLY from the committed TSVs
+  (Agents A9, C8, ED2 independently recomputed). Unit-0 correctness floor intact; host clean; shared_buffers
+  RESTORED to 16GB (A10). The §7/§9.6 "no loopback-as-NIC" ban is HONORED — Unit-2 NO RESULT is genuine, settling
+  experiment concrete (A1). §7 tension consistent across units (C8/ED1). Subsets disclosed, NULL-results logged,
+  evidence matrix complete, L/D continuity clean (ED6/7/9). No-throughput-penalty (U3) is the best-supported claim (C5).
+
+### ACCEPTED → FIXED (should-fix, no blocking)
+- **A6/C6 (Unit 3, the main one): the "streaming uses LESS memory than native" comparison was rigged** — native ran
+  4 parallel workers and Linux VmRSS counts shared_buffers pages per-worker (over-count), and the CH consumer RSS
+  was excluded. FIXED: REPORT now DROPS the "uses less than native" claim, keeps only the sound bounded-footprint +
+  no-throughput-penalty claims; the native column carries the over-count caveat.
+- **C2/C3 (Unit 2): netem corroboration conflated bandwidths/column-sets** — it ran at 0.375 GB/s (3 Gbit, 8× below
+  the 3 GB/s analytic) on a 2-col probe, so it validates bytes/bandwidth LINEARITY, not the all-105 @ 3 GB/s
+  projection. FIXED: REPORT clarifies the two angles are at different bandwidths/columns and together only BOUND.
+- **A5 (Unit 3): cold-confirmation was prose-only.** FIXED: persisted to evidence/coldio_cold_confirmation.txt
+  (COLD read=84480 4288ms vs WARM hit 161ms, 27×; PG restored 16GB).
+- **A7/C7 (Unit 3): "data-size-independent" overstated a +19% creep.** FIXED: reworded to "bounded & sub-linear
+  (+19% RSS for 10× data); fixed 64 MiB ring".
+- **A2/A3/ED3 (Unit 2): analytic ms implied 2.7–3.0 GB/s; netem "492≈427" conflated wall vs transfer.** FIXED:
+  analytic ms at clean 3 GB/s (195/980/2005); netem stated as the +148ms rate-limit delta over the bare baseline.
+- **ED6/ED8: stale L-range footer + missing U2/U3 repro subsections.** FIXED (footer→L0047; 10-REPRODUCTION U2/U3 added).
+- **ED4: no standalone U2/U3 review round.** RESOLVED: this final review is recorded as the U2/U3 review of record.
+
+### REJECTED / not-promoted
+- C4 (Unit-2 cold-arm differs ~2× between overlap.tsv warm and coldarm.tsv cache-inflated) — the warm same-session
+  cold-arm (overlap.tsv) is the correct reference (L0045); the Unit-2 conclusion (small-f plausible, large-f no) is
+  stable either way. Noted, not a defect.
+- C1 (Unit-2 "fits under cold ⇒ overlap plausible" is a necessary-condition, not proof) — agreed and already
+  labeled a bound/LEAD; the headline is NO RESULT. Not promoted.
+
+### BOTTOM LINE — overall: **SHIP.** No open blocking correctness or honesty defect after the fixes. U0/U1 GREEN
+(reviewed); U2 NO RESULT (honest, bounded, settling experiment named); U3 GREEN (concern refuted — bounded
+streaming footprint, no throughput penalty; the native-comparison over-claim removed). DoD met (U2/U3 reviewed here).

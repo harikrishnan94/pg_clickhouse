@@ -13,7 +13,7 @@ ETL-everything baseline) by 4–24× — the price of keeping the hot data fresh
 it. The headline win shrinks as f grows (at f=10% the *single-threaded* hot producer streaming 10M
 rows erases the advantage over full-offload). On loopback the hot transfer is **CPU-bound** and only
 *hides* under the cold scan for the slowest queries — the **network-overlap thesis is NOT proven here
-and is deferred to Unit 2 (NO RESULT)**. Cold-IO: streaming's added memory is BOUNDED (a fixed 64 MiB ring + ~tens-MB staging, ~independent of data size) — at f=10% it uses LESS total memory than native PG; no throughput penalty.
+and is deferred to Unit 2 (NO RESULT)**. Cold-IO: streaming's added memory is BOUNDED (a fixed 64 MiB ring + ~tens-MB staging, ~independent of data size) — bounded and sub-linear (+19% RSS for 10× data), and no throughput penalty when cold.
 
 ---
 
@@ -100,15 +100,18 @@ Crucially, on loopback the hot transfer is CPU-bound and competes with the cold 
 wire makes the hot transfer NETWORK-bound (a *different* resource from cold-CPU), which is what could overlap for
 free. Three converging BOUNDS (LEADS, not the headline):
 - **(a) Analytic.** Hot-stream bytes (uncompressed, all 105 cols) = 0.58 / 2.74 / 5.60 GB for f=1/5/10%. At
-  **3 GB/s (~24 Gbit)** the hot transfer = 195 / 1000 / 2005 ms; vs the measured cold-arm (median ~400 ms): at
+  **3 GB/s (~24 Gbit)** the hot transfer = 195 / 980 / 2005 ms; vs the measured cold-arm (median ~400 ms): at
   **f=1% the hot transfer FITS under the cold scan** (195 ms < cold for 5/8 cold-heavy queries) → network overlap
   *plausible*; at **f=10% it does NOT** (2005 ms > most cold scans). Column projection (real deployments stream only
   referenced columns, not all 105) shrinks hot-bytes 10–30× for narrow queries → fits far better; the all-105
   figure is conservative.
-- **(b) netem.** A `tc netem rate 3gbit` (0.375 GB/s) shaped TCP run of the hot arm corroborated the
-  bytes/bandwidth model (narrow 2-col p10: bare 344 ms → 492 ms ≈ 160 MB ÷ 0.375 GB/s = 427 ms). CAVEAT: netem
-  rate-limiting on `lo` is unreliable and a `count(*)` probe prunes its projection — i.e. **loopback cannot
-  faithfully emulate a real NIC**, which itself argues the true answer needs a real wire.
+- **(b) netem.** A `tc netem rate 3gbit` run shaped `lo` to **0.375 GB/s = 3 Gbit/s** (8× SLOWER than the 3 GB/s
+  ≈ 24 Gbit analytic in (a) — a different, slower regime) and the valid probe streamed only **2 columns**. It
+  corroborates the bytes÷bandwidth *linearity* (the rate-limit added bare 344 ms → 492 ms, i.e. ~148 ms ≈ the
+  160 MB ÷ 0.375 GB/s the model predicts beyond the bare baseline), NOT the all-105-col @ 3 GB/s projection in (a).
+  CAVEAT: netem rate-limiting on `lo` is unreliable and a `count(*)` probe prunes its projection — i.e. **loopback
+  cannot faithfully emulate a real NIC**, which itself argues the true answer needs a real wire. (a) and (b) are at
+  different bandwidths/column-sets; together they BOUND, neither is a real-NIC number.
 - **(c) Latency (cited).** The phase-3 `tcp_send_delay_us` microbench proved K-deep pipelining HIDES per-frame
   latency (K=4 hides ~20 ms, K=8 ~40 ms), so a cloud RTT is hideable with K≥4 — **bandwidth, not latency, is the
   binding constraint** (angle a).
@@ -125,24 +128,29 @@ shrinking `shared_buffers` 16GB→256MB (< the 0.66/6.6 GB hot tables) + `drop_c
 PG restored to 16GB after). Cold confirmed: EXPLAIN BUFFERS `shared read=84480` (660MB from disk, 4327ms) vs warm
 `shared hit=` (159ms, 27×); disk-bound throughput ~127–150 MB/s. Per-backend peak VmRSS, N=3:
 
-| | native PG (4 workers) | streaming (1 producer + ring) | delta (stream − native) |
+| | native PG (4 workers) | streaming (1 producer + ring) | stream-specific add (ring+staging) |
 | --- | --- | --- | --- |
-| f=1% (660MB cold) | 26 + ~100 (workers) ≈ 126 MB | 108 MB RSS + **64 MiB ring** ≈ 172 MB | +46 MB |
-| f=10% (6.6GB cold) | 101 + ~400 (workers) ≈ 500 MB | **129 MB** RSS + 64 MiB ring ≈ 193 MB | **−307 MB** |
+| f=1% (660MB cold) | 26 + ~100 (4 workers, shmem over-counted) MB | 108 MB RSS + **64 MiB ring** | ~tens-MB staging + 64 MiB ring |
+| f=10% (6.6GB cold) | 101 + ~400 (4 workers, shmem over-counted) MB | **129 MB** RSS + 64 MiB ring | same (bounded; +19% RSS for 10× data) |
 
-- **Streaming's footprint is BOUNDED and ~independent of the hot-fraction size**: the producer RSS grows only
-  108→129 MB (+12%) for **10× more** hot data, and the SHM ring is a **fixed 64 MiB** (the NB-4 cap). Mechanism:
-  the producer columnizes one fixed `rows_per_block` (65536) block at a time and flushes to the capped ring →
-  memory is O(block + ring), not O(rows). Native PG's footprint, by contrast, GROWS with f (and parallelism):
-  ~500 MB at f=10%, so **streaming uses LESS total memory than native PG at scale**.
-- **No cold-IO throughput penalty**: both arms are disk-bound (wall ≈ identical, 4.5s / 52s); streaming's columnize
-  CPU overlaps the disk wait, so streaming throughput ≈ native when reading cold.
-- **Verdict**: the added pressure of streaming over native PG is bounded and small (often *negative* vs native's
-  parallel scan) — Andrey's concern is empirically refuted; no runaway/unbounded pressure.
+- **Streaming's footprint is BOUNDED and sub-linear in the hot-fraction size** — the headline result: the producer
+  RSS grows only 108→129 MB (**+19% for 10× more** hot data; sub-linear), and the SHM ring is a **fixed 64 MiB**
+  (the NB-4 cap). Mechanism: the producer columnizes one fixed `rows_per_block` (65536) block at a time and flushes
+  to the capped ring → memory is O(block + ring), NOT O(rows). So the streaming-SPECIFIC added memory over a plain
+  scan is bounded (~tens-MB staging + the fixed 64 MiB ring) and does not balloon as the hot fraction grows.
+- **No cold-IO throughput penalty**: both arms are disk-bound (wall ≈ identical, 4.5s / 52s, ~127–150 MB/s);
+  streaming's columnize CPU overlaps the disk wait, so streaming throughput ≈ native when reading cold.
+- **Caveat on the table's native column** (review C6/A6): the native total at f=10% (~500 MB) is its **4 parallel
+  workers** and Linux `VmRSS` counts the shared `shared_buffers` pages per-worker (a partial over-count); it is NOT
+  apples-to-apples with the single-producer stream, so we do NOT claim "streaming uses less than native." The sound,
+  load-bearing claim is the **bounded, data-size-sub-linear streaming footprint** above.
+- **Verdict**: streaming adds a BOUNDED, small increment (fixed 64 MiB ring + ~tens-MB staging) that does NOT grow
+  with the hot fraction, and no throughput penalty when cold — Andrey's concern is empirically refuted; no
+  runaway/unbounded pressure.
 
 ---
 *(Numbers above are committed in `results/bench/{cells.tsv,baselines10m.tsv}`; reproduction in
-`10-REPRODUCTION.md`; every claim's sources in the evidence matrix, methodology log L0031–L0045.)*
+`10-REPRODUCTION.md`; every claim's sources in the evidence matrix, methodology log L0031–L0047.)*
 
 ---
 
@@ -157,7 +165,7 @@ PG restored to 16GB after). Cold confirmed: EXPLAIN BUFFERS `shared read=84480` 
 | M1-overlap | merge_ch ≈ max(cold-arm,hot); 11/16 HIDDEN (overlap real) | overlap.tsv (cache-controlled, N=5) | producer-window≈merge-window all cells (instrument B) | EXPLAIN PIPELINE arms concurrent | YES | C1 fixed (cold-arm not pure-CH ref); same-cache | GREEN |
 | M1-parhot | parallel-hot (P=8) 2.64× faster @f10%, restores full-offload win | parallel_hot.tsv (N=5) | clean-TIER1 single-hot baseline (cells.tsv) | vs-baselines recompute | YES | cache-confounder root-caused (used clean baseline) | GREEN |
 | M2-nic | NO RESULT for true cross-box; hot fits under cold @3GB/s f1% (bound) | analytic hot-bytes÷3GB/s vs cold-arm | netem corroborates bytes/bw (narrow 492≈427ms) | phase3 K-deep latency-hiding (cited) | n/a (bound) | netem-on-lo unreliable (caveat); NO RESULT honest | NO RESULT (bounded) |
-| M3-coldio | streaming memory BOUNDED (~64MiB ring + staging), data-size-indep | coldio.tsv RSS 108→129MB (+12% for 10× data) | ring fixed 64MiB both f | delta vs native (+46MB/−307MB) | YES | cold confirmed EXPLAIN BUFFERS read=84480 vs warm hit | GREEN |
-| M3-cold | the hot pages were read COLD from disk | shared_buffers=256MB < table | drop_caches each run | EXPLAIN BUFFERS shared read=84480 (vs warm hit, 27×) | YES | /proc/<backend>/io=0 = PG18 io-worker reads (caveat) | GREEN |
+| M3-coldio | streaming memory BOUNDED & sub-linear (~64MiB fixed ring + staging) | coldio.tsv RSS 108→129MB (+19% for 10× data) | ring fixed 64MiB both f | no throughput penalty (wall stream≈native, disk-bound) | YES | native-RSS comparison NOT used (4-worker shmem over-count, C6); bounded-footprint is the claim | GREEN |
+| M3-cold | the hot pages were read COLD from disk | shared_buffers=256MB < table | drop_caches each run | EXPLAIN BUFFERS read=84480 vs warm hit, 27× (evidence/coldio_cold_confirmation.txt) | YES | disk-bound throughput 127-150MB/s; /proc/io=0 is PG18 io-worker reads (caveat) | GREEN |
 
 (MATERIAL claims settle on ≥3 independent converging sources per §9.1; the NIC headline is NO RESULT per §9.7.)

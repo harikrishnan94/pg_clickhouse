@@ -1,0 +1,20 @@
+# Unit-3 cold-read confirmation — pg.hits_hot_p01 (661MB), captured 2026-06-28T05:21:23+05:30
+# Method: PG restarted (shared_buffers=16GB, but EMPTY after restart) + sync;drop_caches => the table is in neither PG SB nor OS cache => first scan reads from DISK.
+
+## COLD (first scan after restart + drop_caches):
+ Aggregate (actual time=4286.552..4286.553 rows=1.00 loops=1)
+   Buffers: shared read=84480
+   ->  Seq Scan on hits_hot_p01 (actual time=2.661..4237.433 rows=1000000.00 loops=1)
+         Buffers: shared read=84480
+   Buffers: shared hit=13 read=6
+ Execution Time: 4288.107 ms
+
+## WARM (immediate re-run, now in SB):
+ Aggregate (actual time=161.544..161.545 rows=1.00 loops=1)
+   Buffers: shared hit=84480
+   ->  Seq Scan on hits_hot_p01 (actual time=0.011..112.489 rows=1000000.00 loops=1)
+         Buffers: shared hit=84480
+   Buffers: shared hit=19
+ Execution Time: 161.589 ms
+
+# 84480 blocks x 8KiB = 660 MB = full table; cold 'read=' vs warm 'hit=' confirms the 13_coldio.sh runs (shared_buffers=256MB<table + drop_caches) were genuinely disk-cold.
