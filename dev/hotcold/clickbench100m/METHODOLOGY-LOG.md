@@ -261,3 +261,32 @@ Material claims require ≥3 independent converging sources; orientation/operati
   competes with cold=CPU; a real wire where hot=network would overlap cold-CPU for free → Unit 2). The cold-arm's
   tuple-filter inflation (D-HC-0404) is a separate, fixable POC cost (materialize a partition column / cold table).
 - Verdict: DONE — Unit-1 overlap mechanism GREEN (C1/C2 addressed). → finalize report, clean up, Units 2/3.
+
+### L0046 — Unit-2: NIC bound via 3 angles → NO RESULT for the true cross-box headline  [unit 2]  [iteration 1-3]  2026-06-28T09:30+05:30
+- Goal / hypothesis (prereg §UNIT2): on a real ~3 GB/s wire the hot transfer overlaps and is hidden under CH cold
+  processing (hot=network, cold=CPU — DIFFERENT resources, so overlap-to-FREE, unlike loopback where both are CPU).
+  Cannot be measured cross-box on a single-NIC host → bound it; NO RESULT for the true headline.
+- Angle (a) ANALYTIC: hot-bytes(f) (uncompressed columnar, all 105 cols, what the producer sends) = 0.58/2.74/5.60
+  GB for f=1/5/10%. hot-transfer = bytes/bandwidth vs the MEASURED cold-arm time (overlap.tsv). At 3 GB/s
+  (~24 Gbit): f=1% hot=195ms < cold-arm median 407ms → hot FITS under cold for 5/8 cold-heavy queries (network
+  overlap PLAUSIBLE at small f); f=10% hot=2005ms > most cold scans → does NOT fit (hot dominates even at 3 GB/s).
+  At 10 GbE (1.25 GB/s) f=1% hot=467ms ~ cold; at 1 GbE hot dominates always. Column projection (real deployment
+  streams only referenced cols, not all 105) would shrink hot-bytes 10–30× for narrow queries → fits far better;
+  the all-105 figure is conservative.
+- Angle (b) NETEM (12_nic_netem.sh, lo netem rate 3gbit delay 50us, TCP transport): the SHM merge can't be
+  netem-shaped (SHM≠network), so measured the HOT ARM over the bespoke TCP transport. The narrow (2-col) probe
+  DID show the rate effect: p10 bare 344ms → netem-3gbit 492ms ≈ the 160MB÷0.375GB/s the analytic predicts —
+  corroborating the bytes/bandwidth model. CAVEAT (documented phase3 netem-on-loopback limit): the wide
+  (SELECT*-count) probe pruned its projection (count needs no columns) so it did not stream all 105 cols (275ms,
+  not a 5.6GB transfer); and netem rate-limiting on lo is unreliable in general. Loopback CANNOT faithfully emulate
+  a real NIC — itself evidence the true answer needs a real wire.
+- Angle (c) CITE phase3 (dev/hotcold/phase3/REPORT-P2.md): the tcp_send_delay_us microbench proved K-deep
+  pipelining HIDES per-frame latency (K=4 hides ~20 ms/frame ≈2.7×, K=8 ~40 ms ≈5.1×) — so the RTT/latency
+  component of a real wire is hideable with K≥4; bandwidth (angle a) is the binding constraint, not latency.
+- NO RESULT (§9.7): the true cross-box merge throughput/overlap over a real NIC is NOT established here. Settling
+  source: a 2nd same-VPC/placement-group instance (CH on box B, PG on box A), re-run the Unit-1 (f,W) matrix with
+  the hot arm streamed over the real NIC (TCP/Arrow transport), measuring merge wall + per-arm timeline. Expected
+  confirm signature: merge ≈ max(cold-CPU, hot-network-transfer) with hot hidden when hot-bytes/NIC-BW < cold-time
+  (small f); refute: merge ≈ cold + hot (hot-network does NOT overlap cold-CPU). BANNED here: presenting any
+  loopback/netem/projection figure as the real-NIC result.
+- Verdict: NO RESULT (bounded). Angles gathered as LEADS/bounds (results/bench/nic_netem.tsv + the analytic).

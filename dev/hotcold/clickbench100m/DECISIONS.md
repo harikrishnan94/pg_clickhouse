@@ -109,3 +109,13 @@ Continues the `dev/hotcold/DECISIONS.md` series (last id there: D-HC-0303). Temp
 - Risks / tradeoffs: the headline benchmark for these 6 queries should note the LIMIT result is tie-ambiguous in
   both pure-CH and merge (a property of the query, not the offload).
 - Revisit trigger: any top-N query whose tiebroken comparison is NOT exact → that would be a real merge bug.
+
+### D-HC-0408 — Unit-2 real-NIC headline returned as NO RESULT (single-NIC host) — 2026-06-28
+- Context: §5/§7 network-overlap thesis (~3 GB/s wire). Host has ONE VPC NIC (loopback-only PG↔CH); no 2nd box.
+- Options: (a) fabricate a cross-box number (BANNED); (b) NO RESULT + converging bounds (analytic + netem + phase3 cite).
+- Criteria: §9.7 honesty; no loopback/netem/projection presented as a real-NIC measurement.
+- Chosen: (b). NO RESULT for the true cross-box headline; 3 bounding angles (L0046).
+- Evidence (or NO RESULT + settling): NO RESULT. Settling = 2nd same-VPC instance (CH on B, PG on A), re-run the
+  Unit-1 matrix over the real NIC.
+- Risks/tradeoffs: the analytic uses all-105-col hot-bytes (conservative); netem-on-loopback rate is unreliable (caveat).
+- Revisit trigger: a 2nd instance / real NIC becomes available.

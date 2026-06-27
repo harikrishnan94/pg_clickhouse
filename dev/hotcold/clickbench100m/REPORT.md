@@ -92,7 +92,32 @@ the **network-overlap thesis** (hot transfer hidden under cold processing on a r
 because on loopback the hot transfer is CPU-bound and competes with the cold scan for the same CPU.
 The network thesis is Unit 2, which returns **NO RESULT** for the true cross-box headline.
 
-## Unit 2 — real-wire (NIC) bound — *(pending; expected NO RESULT + bounds)*
+## Unit 2 — real-wire (NIC) bound — **NO RESULT (bounded)**
+
+The host has ONE VPC NIC (loopback-only PG↔CH), so the network-overlap thesis (hot transfer hidden under CH cold
+processing on a real ~3 GB/s wire) **cannot be measured cross-box** — returned as **NO RESULT** (D-HC-0408).
+Crucially, on loopback the hot transfer is CPU-bound and competes with the cold scan (Unit 1's §7 limit); a real
+wire makes the hot transfer NETWORK-bound (a *different* resource from cold-CPU), which is what could overlap for
+free. Three converging BOUNDS (LEADS, not the headline):
+- **(a) Analytic.** Hot-stream bytes (uncompressed, all 105 cols) = 0.58 / 2.74 / 5.60 GB for f=1/5/10%. At
+  **3 GB/s (~24 Gbit)** the hot transfer = 195 / 1000 / 2005 ms; vs the measured cold-arm (median ~400 ms): at
+  **f=1% the hot transfer FITS under the cold scan** (195 ms < cold for 5/8 cold-heavy queries) → network overlap
+  *plausible*; at **f=10% it does NOT** (2005 ms > most cold scans). Column projection (real deployments stream only
+  referenced columns, not all 105) shrinks hot-bytes 10–30× for narrow queries → fits far better; the all-105
+  figure is conservative.
+- **(b) netem.** A `tc netem rate 3gbit` (0.375 GB/s) shaped TCP run of the hot arm corroborated the
+  bytes/bandwidth model (narrow 2-col p10: bare 344 ms → 492 ms ≈ 160 MB ÷ 0.375 GB/s = 427 ms). CAVEAT: netem
+  rate-limiting on `lo` is unreliable and a `count(*)` probe prunes its projection — i.e. **loopback cannot
+  faithfully emulate a real NIC**, which itself argues the true answer needs a real wire.
+- **(c) Latency (cited).** The phase-3 `tcp_send_delay_us` microbench proved K-deep pipelining HIDES per-frame
+  latency (K=4 hides ~20 ms, K=8 ~40 ms), so a cloud RTT is hideable with K≥4 — **bandwidth, not latency, is the
+  binding constraint** (angle a).
+
+**Settling experiment (names the source per §9.7):** a 2nd same-VPC / placement-group instance — ClickHouse on box
+B, Postgres on box A — re-running the Unit-1 (f, W) matrix with the hot arm streamed over the real NIC
+(TCP/Arrow transport), measuring merge wall + per-arm timeline. Confirm signature: merge ≈ max(cold-CPU,
+hot-network) with the hot hidden when hot-bytes ÷ NIC-bandwidth < cold-time (small f); refute: merge ≈ cold + hot.
+**No loopback/netem/projection figure above is a real-NIC measurement.**
 ## Unit 3 — cold-IO added-pressure — *(pending)*
 
 ---
