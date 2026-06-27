@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>            /* Phase 3 P2 microbench: clock_gettime/nanosleep for injected send-latency */
 #include <unistd.h>
 #include <sys/epoll.h>       /* Phase 3 P1: producer-side EPOLLOUT readiness wait for non-blocking send */
 #include <sys/eventfd.h>
@@ -223,6 +224,8 @@ struct ShmProducer {
      */
     int        send_k;
     int        send_k_configured;   /* the GUC value before any RLIMIT_MEMLOCK cap (for logging) */
+    int        tcp_sndbuf_bytes;    /* P2 experiment: per-socket SO_SNDBUF override (0 = default 32 MiB) */
+    int        tcp_send_delay_us;   /* P2 microbench: injected per-frame in-flight latency, us (0 = off) */
     struct SendFrame *send_frames;  /* [send_k]; NULL until tcp_reactor_init */
     int        send_count;          /* occupied frames (READY/SENDING/ZC_PENDING), 0..send_k */
     int        send_drain;          /* index of the oldest occupied frame (the send head) */
@@ -850,8 +853,14 @@ tcp_accept_conn(ShmProducer *p)
      * slots; without it producer-send and consumer-process serialize. Capped by net.core.wmem_max
      * (raised to match the SHM 64 MiB data region; see 10-REPRODUCTION). */
     {
-        int sndbuf = 32 * 1024 * 1024;
+        int sndbuf = (p->tcp_sndbuf_bytes > 0) ? p->tcp_sndbuf_bytes : 32 * 1024 * 1024;
+        socklen_t slen = sizeof(sndbuf);
+        int eff = 0;
         (void) setsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        if (p->tcp_sndbuf_bytes > 0 &&
+            getsockopt(p->tcp_conn_fd, SOL_SOCKET, SO_SNDBUF, &eff, &slen) == 0)
+            ereport(LOG, (errmsg("pg_clickhouse: P2 producer SO_SNDBUF requested=%d effective=%d "
+                                 "(experiment knob; default is 32 MiB)", sndbuf, eff)));
     }
     /* Branch B (B-it4): enable SO_ZEROCOPY so send(MSG_ZEROCOPY) attempts a zero-copy send and posts
      * an SO_EE_ORIGIN_ZEROCOPY completion to the errqueue. Only when that send method is selected (it
@@ -866,12 +875,13 @@ tcp_accept_conn(ShmProducer *p)
             ereport(LOG, (errmsg("pg_clickhouse: SO_ZEROCOPY unavailable (%m); MSG_ZEROCOPY send "
                                  "falls back to a plain copying send")));
     }
-    /* Branch P1: for the epoll non-blocking send path, switch the connection to O_NONBLOCK and build a
-     * per-worker epoll fd watching the conn fd for EPOLLOUT (the send loop waits on it under
-     * backpressure). The blocking/msg_zerocopy methods keep the socket blocking + SO_SNDTIMEO (unchanged).
+    /* Branch P1/P2: for the epoll AND msg_zerocopy paths, switch the connection to O_NONBLOCK and build a
+     * per-worker epoll fd watching the conn fd for EPOLLOUT (the pipelined reactor waits on it under
+     * backpressure — non-blocking sends are required for K-deep run-ahead, incl. the zerocopy path whose
+     * frames are reaped asynchronously). Only the 'blocking' method keeps the blocking socket + SO_SNDTIMEO.
      * On any failure we leave tcp_send_epoll_fd = -1; tcp_wait_writable then degrades to a bounded
      * poll(POLLOUT), so a missing epoll fd never busy-spins. */
-    if (p->tcp_send_method == PGCH_TCP_SEND_EPOLL)
+    if (p->tcp_send_method == PGCH_TCP_SEND_EPOLL || p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY)
     {
         int flags = fcntl(p->tcp_conn_fd, F_GETFL, 0);
         if (flags < 0 || fcntl(p->tcp_conn_fd, F_SETFL, flags | O_NONBLOCK) < 0)
@@ -1102,29 +1112,70 @@ typedef struct SendFrame
     size_t         scratch_cap;
     bool           zc_pending;  /* fully sent via MSG_ZEROCOPY; buffer pinned until the seq is reaped  */
     uint32_t       zc_seq;      /* last zerocopy seq this frame's send(s) consumed                    */
+    int64_t        ready_at_ns; /* P2 microbench: monotonic ns before which this sent frame may not be    */
+                                /* reclaimed (sent_time + tcp_send_delay_us); 0 when no delay injected    */
 } SendFrame;
+
+/* Monotonic now in nanoseconds (P2 injected-latency microbench). */
+static int64_t
+monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* Tight per-frame size: the max serialized footprint of ONE block (rows_per_block rows) for THIS schema,
+ * capped at tcp_scratch_cap. For an all-fixed-width schema this is exact and small (~MB); a String column's
+ * chars are variable, so any String column makes the frame fall back to tcp_scratch_cap (the safe upper
+ * bound = the whole data region). Sizing frames to the real block instead of the 64 MiB data region saves
+ * (K-1) x ~60 MiB per stream AND — critically — lets the zerocopy RLIMIT_MEMLOCK cap (K x frame <= 8 MiB)
+ * admit K>1 for all-fixed schemas (otherwise K x 64 MiB forces K=1 for every query). */
+static size_t
+tcp_frame_capacity(const ShmProducer *p)
+{
+    size_t rows_pb = PGCH_SHM_ROWS_PER_BLOCK;
+    size_t cur = align_up((size_t) p->n_columns * sizeof(ShmColumnDescriptor), 8);
+    int i;
+
+    for (i = 0; i < p->n_columns; i++)
+    {
+        ShmWireType wire = p->schema[i].wire;
+        size_t elem;
+
+        if (wire == SHM_WIRE_STRING)
+            return p->tcp_scratch_cap;   /* variable chars: fall back to the safe upper bound */
+        elem = shm_wire_fixed_width_size(wire);
+        cur = align_up(cur, elem > 8 ? elem : 8) + rows_pb * elem + SHM_PADDING_FOR_SIMD;
+    }
+    cur += 4096;   /* small slack for the header + alignment rounding */
+    return (cur < p->tcp_scratch_cap) ? cur : p->tcp_scratch_cap;
+}
 
 /* Lazily size + allocate the K-deep frame pool at the first publish (after the scratch cap is known). */
 static void
 tcp_reactor_init(ShmProducer *p)
 {
     int k, i;
+    size_t frame_cap;
 
     if (p->send_frames != NULL)
         return;
     k = p->send_k_configured >= 1 ? p->send_k_configured : 1;
+    frame_cap = tcp_frame_capacity(p);
     /* H4: bound K x max_frame <= RLIMIT_MEMLOCK (8 MiB here) on the zerocopy path so the pinned-pages
-     * accounting limit is not exceeded; the per-send ENOBUFS+drain is the runtime backstop. */
-    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY && p->tcp_scratch_cap > 0)
+     * accounting limit is not exceeded (max_frame = the tight per-block size, NOT the 64 MiB buffer alloc;
+     * the pinned pages are the SENT block bytes); the per-send ENOBUFS+drain is the runtime backstop. */
+    if (p->tcp_send_method == PGCH_TCP_SEND_MSG_ZEROCOPY && frame_cap > 0)
     {
         size_t budget = (size_t) 8 * 1024 * 1024;
-        int kmax = (int) (budget / p->tcp_scratch_cap);
+        int kmax = (int) (budget / frame_cap);
         if (kmax < 1) kmax = 1;
         if (k > kmax)
         {
             ereport(LOG, (errmsg("pg_clickhouse: P2 capping run-ahead K=%d -> %d for msg_zerocopy "
                                  "(K x frame %zu must stay under RLIMIT_MEMLOCK 8 MiB)",
-                                 k, kmax, p->tcp_scratch_cap)));
+                                 k, kmax, frame_cap)));
             k = kmax;
         }
     }
@@ -1134,14 +1185,14 @@ tcp_reactor_init(ShmProducer *p)
     p->send_frames = (SendFrame *) MemoryContextAllocZero(p->owner_cxt, sizeof(SendFrame) * (size_t) k);
     for (i = 0; i < k; i++)
     {
-        p->send_frames[i].scratch = (char *) MemoryContextAlloc(p->owner_cxt, p->tcp_scratch_cap);
-        p->send_frames[i].scratch_cap = p->tcp_scratch_cap;
+        p->send_frames[i].scratch = (char *) MemoryContextAlloc(p->owner_cxt, frame_cap);
+        p->send_frames[i].scratch_cap = frame_cap;
     }
     p->send_count = 0;
     p->send_drain = 0;
-    ereport(DEBUG1, (errmsg("pg_clickhouse: P2 send reactor K=%d (configured %d), frame=%zu bytes, "
-                            "pool=%zu bytes", k, p->send_k_configured, p->tcp_scratch_cap,
-                            (size_t) k * p->tcp_scratch_cap)));
+    ereport(LOG, (errmsg("pg_clickhouse: P2 send reactor K=%d (configured %d) method=%d frame=%zu bytes "
+                         "pool=%zu bytes", k, p->send_k_configured, p->tcp_send_method, frame_cap,
+                         (size_t) k * frame_cap)));
 }
 
 /* One non-blocking sendmsg of the head frame's REMAINING iovec (from frame->sent). Returns 1 = head fully
@@ -1149,9 +1200,9 @@ tcp_reactor_init(ShmProducer *p)
  * on a hard error / backend death. For msg_zerocopy each successful sendmsg consumes a zc seq (tagged on
  * the frame) and reaps completions; the frame stays pinned (reclaimed only when the seq is acked). */
 static int
-reactor_send_head_once(ShmProducer *p)
+reactor_send_one(ShmProducer *p, int idx)
 {
-    SendFrame *f = &p->send_frames[p->send_drain];
+    SendFrame *f = &p->send_frames[idx];
     struct msghdr msg;
     struct iovec  iov[2];
     int     ni = 0, i;
@@ -1196,6 +1247,10 @@ reactor_send_head_once(ShmProducer *p)
                 if (f->is_eos) { /* EOS frame fully sent */ }
                 p->tcp_epoll_sends++;   /* a logical frame send completed via the non-blocking path */
             }
+            /* P2 microbench: this frame is "in flight" for tcp_send_delay_us after its send completes,
+             * emulating real-NIC send/completion latency the loopback deferred-copy cannot reproduce. */
+            f->ready_at_ns = (p->tcp_send_delay_us > 0)
+                ? monotonic_ns() + (int64_t) p->tcp_send_delay_us * 1000LL : 0;
             return 1;
         }
         return 0;   /* partial progress */
@@ -1236,6 +1291,8 @@ reactor_reclaim(ShmProducer *p)
                 break;                          /* still pinned by the kernel */
             f->zc_pending = false;
         }
+        if (f->ready_at_ns != 0 && monotonic_ns() < f->ready_at_ns)
+            break;                              /* P2 microbench: still within the injected in-flight latency */
         p->send_drain = (p->send_drain + 1) % p->send_k;
         p->send_count--;
         n++;
@@ -1243,33 +1300,84 @@ reactor_reclaim(ShmProducer *p)
     return n;
 }
 
-/* Non-blocking pump: advance the single in-flight (head) send as far as it goes, reclaiming completed
- * frames, until it WOULDBLOCK or the pool is empty. The kernel then drains the accepted bytes to the wire
- * while the caller returns to scan/deform the next block. */
+/* The send position: the first occupied frame (scanning FIFO from send_drain) that is not yet fully sent.
+ * Returns -1 if every occupied frame is fully sent (all in flight awaiting completion). send_count is <= K
+ * so the scan is trivially cheap. This decouples the SEND cursor from the RECLAIM cursor (send_drain): a
+ * frame is sent as soon as the prior one is fully handed to the kernel, WITHOUT waiting for the prior
+ * frame's completion (zerocopy reap / injected latency) — so up to K frames are in flight (sent, awaiting
+ * completion) concurrently. Byte-stream order is preserved (frames sent in FIFO order; one sendmsg at a
+ * time on the single-threaded producer). */
+static int
+reactor_send_pos(ShmProducer *p)
+{
+    int i;
+    for (i = 0; i < p->send_count; i++)
+    {
+        int idx = (p->send_drain + i) % p->send_k;
+        if (p->send_frames[idx].sent < p->send_frames[idx].total_len)
+            return idx;
+    }
+    return -1;
+}
+
+/* Non-blocking pump: reclaim completed frames from the drain head, then SEND the next not-fully-sent frame
+ * as far as the socket accepts, advancing the send cursor across frames (send-ahead) until WOULDBLOCK or
+ * every queued frame is fully sent. The kernel drains the accepted bytes to the wire — and, on the
+ * zerocopy / injected-latency path, up to K frames sit in flight awaiting completion — while the caller
+ * returns to scan/deform the next block. */
 static void
 reactor_pump(ShmProducer *p)
 {
     p->send_pump_calls++;
-    while (p->send_count > 0)
+    for (;;)
     {
-        SendFrame *f = &p->send_frames[p->send_drain];
-        int r;
+        int pos, r;
 
-        if (f->sent >= f->total_len)
-        {
-            if (reactor_reclaim(p) == 0)
-                break;                          /* head fully sent but zc-pinned; can't advance further now */
-            continue;
-        }
-        r = reactor_send_head_once(p);
+        reactor_reclaim(p);                     /* free any completed in-flight frames (advances send_drain) */
+        pos = reactor_send_pos(p);
+        if (pos < 0)
+            break;                              /* nothing left to send (all occupied frames fully sent) */
+        r = reactor_send_one(p, pos);
         if (r < 0)
-            break;                              /* WOULDBLOCK */
-        /* r==0 (partial) or 1 (complete): loop (reclaim/continue at top) */
+            break;                              /* WOULDBLOCK — socket buffer full */
+        /* r==0 (partial) or 1 (this frame fully sent): loop to send the next frame */
     }
 }
 
+/* P2 microbench: sleep (interrupt-checked, 5ms slices) until the head frame's injected in-flight latency
+ * elapses, so reactor_reclaim can then free it. Avoids spinning tcp_wait_writable on an already-sent head. */
+static void
+reactor_wait_delay(ShmProducer *p, SendFrame *head)
+{
+    while (head->ready_at_ns != 0)
+    {
+        int64_t rem = head->ready_at_ns - monotonic_ns();
+        struct timespec ts;
+
+        if (rem <= 0)
+            return;
+        CHECK_FOR_INTERRUPTS();
+        if (origin_backend_dead(p))
+            ereport(ERROR, (errmsg("pg_clickhouse: originating backend (pid %d) exited; "
+                                   "abandoning TCP stream", p->origin_pid)));
+        if (rem > 5000000LL) rem = 5000000LL;   /* 5ms slice to stay interrupt-responsive */
+        ts.tv_sec = rem / 1000000000LL;
+        ts.tv_nsec = rem % 1000000000LL;
+        (void) nanosleep(&ts, NULL);
+    }
+}
+
+/* True if the head frame is fully sent (+ zc reaped) but still within its injected in-flight latency. */
+static inline bool
+reactor_head_delay_pending(ShmProducer *p)
+{
+    SendFrame *head = &p->send_frames[p->send_drain];
+    return head->sent >= head->total_len && !head->zc_pending
+        && head->ready_at_ns != 0 && monotonic_ns() < head->ready_at_ns;
+}
+
 /* Acquire a FREE fill-slot frame, pumping the in-flight send and (if all K are occupied) waiting on
- * writability / a zerocopy completion until one frees. This wait is the producer's backpressure point. */
+ * writability / a zerocopy completion / the injected latency until one frees. The producer backpressure point. */
 static SendFrame *
 reactor_acquire(ShmProducer *p)
 {
@@ -1285,6 +1393,8 @@ reactor_acquire(ShmProducer *p)
 
             if (head->sent >= head->total_len && head->zc_pending)
                 tcp_zc_drain_until(p, head->zc_seq);   /* H4: block on THIS frame's seq only (its buffer is needed) */
+            else if (reactor_head_delay_pending(p))
+                reactor_wait_delay(p, head);           /* P2 microbench: wait out injected in-flight latency */
             else
             {
                 if (origin_backend_dead(p))
@@ -1297,6 +1407,7 @@ reactor_acquire(ShmProducer *p)
     f = &p->send_frames[(p->send_drain + p->send_count) % p->send_k];
     f->sent = 0;
     f->zc_pending = false;
+    f->ready_at_ns = 0;
     f->n_iov = 0;
     f->total_len = 0;
     f->is_eos = false;
@@ -1318,6 +1429,8 @@ reactor_drain_all(ShmProducer *p)
 
             if (head->sent >= head->total_len && head->zc_pending)
                 tcp_zc_drain_until(p, head->zc_seq);
+            else if (reactor_head_delay_pending(p))
+                reactor_wait_delay(p, head);
             else
             {
                 if (origin_backend_dead(p))
@@ -1455,6 +1568,8 @@ shm_producer_create(const char *name,
     p->tcp_scratch_cap = 0;
     p->send_k_configured = 1;   /* set by shm_producer_set_send_inflight; default single-in-flight (P1) */
     p->send_frames = NULL;      /* lazily allocated at the first publish (tcp_reactor_init) */
+    p->tcp_sndbuf_bytes = 0;    /* set by shm_producer_set_sndbuf; 0 = default 32 MiB */
+    p->tcp_send_delay_us = 0;   /* set by shm_producer_set_send_delay_us; 0 = no injected latency */
     p->tcp_port = 0;
     p->tcp_send_method = PGCH_TCP_SEND_BLOCKING;   /* set by shm_producer_set_tcp_send_method */
 
@@ -1628,6 +1743,31 @@ shm_producer_set_send_inflight(ShmProducer *p, int k)
     /* P2 producer run-ahead depth (the GUC already clamps to [1,64]); the pool is sized at the first
      * publish (tcp_reactor_init), which may further cap K for msg_zerocopy (RLIMIT_MEMLOCK). */
     p->send_k_configured = (k >= 1) ? k : 1;
+}
+
+void
+shm_producer_set_sndbuf(ShmProducer *p, int bytes)
+{
+    p->tcp_sndbuf_bytes = (bytes > 0) ? bytes : 0;
+}
+
+void
+shm_producer_set_send_delay_us(ShmProducer *p, int us)
+{
+    p->tcp_send_delay_us = (us > 0) ? us : 0;
+}
+
+void
+shm_producer_tcp_pipeline_stats(const ShmProducer *p, int *k_effective,
+                                uint64_t *pump_calls, uint64_t *overlap_frames)
+{
+    /* P2 mechanism observability: k_effective = the pool depth actually used (post RLIMIT cap);
+     * overlap_frames = #frames enqueued while an earlier frame was still in flight (the structural
+     * overlap signal — >0 means deform/serialize of a later block ran ahead of the send of an earlier
+     * one). All zero for an SHM producer or a stream that never pipelined. */
+    if (k_effective)    *k_effective = p->send_k;
+    if (pump_calls)     *pump_calls = p->send_pump_calls;
+    if (overlap_frames) *overlap_frames = p->send_overlap_frames;
 }
 
 void

@@ -103,6 +103,24 @@ extern int   pgch_tcp_send_method;
 extern int   pgch_tcp_send_inflight_blocks;
 
 /*
+ * Hot-Cold Phase 3, Branch P2 (experiment knob): per-socket producer SO_SNDBUF in bytes. 0 = the default
+ * 32 MiB. Used to size the send buffer toward an emulated link's bandwidth-delay-product for the netem
+ * K-sweep (so the socket buffer no longer dwarfs the K-deep run-ahead) WITHOUT touching the global
+ * net.core.wmem_max (which, clamped small, starves netlink). Snapshotted into the worker header.
+ */
+extern int   pgch_tcp_sndbuf_bytes;
+
+/*
+ * Hot-Cold Phase 3, Branch P2 (controlled microbench knob): inject `tcp_send_delay_us` microseconds of
+ * simulated per-frame in-flight latency — a pooled frame cannot be reclaimed to the free pool until this
+ * long after its send completed. 0 = off. This emulates the real-NIC send/zerocopy-completion latency that
+ * loopback (a fast deferred copy) cannot reproduce, so the K-deep run-ahead's throughput benefit can be
+ * demonstrated in a controlled way (K=1 stalls one frame at a time; K>1 overlaps the latency with the next
+ * blocks' deform). NOT for production. Snapshotted into the worker header.
+ */
+extern int   pgch_tcp_send_delay_us;
+
+/*
  * Hard cap on cooperating SHM streaming workers: the final clamp on the count
  * derived from PostgreSQL's parallel-query budget. Stays comfortably below the
  * producer's MAX_PARKED_CONNS so every worker's control-socket connection can

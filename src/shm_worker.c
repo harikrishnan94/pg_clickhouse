@@ -106,6 +106,8 @@ typedef struct ShmWorkerHeader
     int         transport;           /* ShmProducerTransport: SHM ring or per-stream TCP listener */
     int         tcp_send_method;     /* PgchTcpSendMethod: epoll non-blocking send / blocking / msg_zerocopy */
     int         tcp_send_inflight_blocks;  /* P2: producer run-ahead depth K (>=1) for the pipelined sender */
+    int         tcp_sndbuf_bytes;          /* P2 experiment: per-socket producer SO_SNDBUF (0 = 32 MiB default) */
+    int         tcp_send_delay_us;         /* P2 microbench: injected per-frame in-flight latency (0 = off) */
     char        shm_name[256];
     PGPROC     *backend_proc;        /* for snapshot xmin tracking + latch wakeups */
     int         backend_pid;         /* originating backend PID, for liveness checks */
@@ -195,6 +197,8 @@ pgch_shm_worker_register(const char *shm_name, Oid heap_relid, List *attnos,
                    : PGCH_PRODUCER_TRANSPORT_SHM;
     hdr->tcp_send_method = pgch_tcp_send_method;
     hdr->tcp_send_inflight_blocks = pgch_tcp_send_inflight_blocks;
+    hdr->tcp_sndbuf_bytes = pgch_tcp_sndbuf_bytes;
+    hdr->tcp_send_delay_us = pgch_tcp_send_delay_us;
     strlcpy(hdr->shm_name, shm_name, sizeof(hdr->shm_name));
     hdr->backend_proc = MyProc;
     hdr->backend_pid = MyProcPid;
@@ -522,6 +526,10 @@ pgch_shm_worker_main(Datum main_arg)
         shm_producer_set_tcp_send_method(producer, hdr->tcp_send_method);
         /* P2: honor the backend session's producer run-ahead depth K; no-op for SHM. */
         shm_producer_set_send_inflight(producer, hdr->tcp_send_inflight_blocks);
+        /* P2 experiment: honor the per-socket SO_SNDBUF override (0 = default); no-op for SHM. */
+        shm_producer_set_sndbuf(producer, hdr->tcp_sndbuf_bytes);
+        /* P2 microbench: honor the injected per-frame in-flight latency (0 = off); no-op for SHM. */
+        shm_producer_set_send_delay_us(producer, hdr->tcp_send_delay_us);
 
         /* Publish the TCP listener port (0 for SHM) BEFORE marking ready, so the backend reads a
          * valid port the instant it observes WS_READY and can emit tcp:127.0.0.1:<port> (D-HC-0102). */
@@ -618,17 +626,21 @@ pgch_shm_worker_main(Datum main_arg)
             {
                 uint64 epoll = 0, blk = 0, sb = 0;
                 uint64 zc_s = 0, zc_n = 0, zc_c = 0;
+                int    keff = 0;
+                uint64 pumps = 0, overlap = 0;
 
                 shm_producer_tcp_send_stats(producer, &epoll, &blk, &sb);
                 shm_producer_tcp_zc_stats(producer, &zc_s, &zc_n, &zc_c);
+                shm_producer_tcp_pipeline_stats(producer, &keff, &pumps, &overlap);
                 elog(LOG, "pg_clickhouse shm tcp-send: method=%s epoll_sends=" UINT64_FORMAT
                           " blocking_sends=" UINT64_FORMAT " send_bytes=" UINT64_FORMAT
                           " zc_sends=" UINT64_FORMAT " zc_notifs=" UINT64_FORMAT
-                          " zc_copied=" UINT64_FORMAT,
+                          " zc_copied=" UINT64_FORMAT " K=%d pumps=" UINT64_FORMAT
+                          " overlap_frames=" UINT64_FORMAT,
                      zc_s > 0 ? "msg_zerocopy"
                               : (epoll > 0 && blk == 0 ? "epoll"
                                                        : (blk > 0 && epoll == 0 ? "blocking" : "mixed")),
-                     epoll, blk, sb, zc_s, zc_n, zc_c);
+                     epoll, blk, sb, zc_s, zc_n, zc_c, keff, pumps, overlap);
             }
         }
         else

@@ -164,6 +164,23 @@ extern void shm_producer_set_tcp_send_method(ShmProducer *p, int method);
  */
 extern void shm_producer_set_send_inflight(ShmProducer *p, int k);
 
+/* Phase 3 Branch P2 experiment: override the producer's per-socket SO_SNDBUF (bytes; 0 = default 32 MiB).
+ * Must be called before the first publish (the socket is set up at accept). No-op for an SHM producer. */
+extern void shm_producer_set_sndbuf(ShmProducer *p, int bytes);
+
+/* Phase 3 Branch P2 microbench: inject `us` microseconds of simulated per-frame in-flight latency (a sent
+ * pooled frame is reclaimable only `us` after its send completes). 0 = off. No-op for an SHM producer. */
+extern void shm_producer_set_send_delay_us(ShmProducer *p, int us);
+
+/*
+ * Phase 3 Branch P2 mechanism observability: the effective run-ahead depth (post RLIMIT_MEMLOCK cap), the
+ * reactor pump-call count, and the number of frames that were enqueued while an earlier frame was still in
+ * flight (overlap_frames > 0 proves deform/serialize of a later block ran ahead of an earlier block's
+ * send). Any out-param may be NULL; all zero for an SHM producer.
+ */
+extern void shm_producer_tcp_pipeline_stats(const ShmProducer *p, int *k_effective,
+                                            uint64_t *pump_calls, uint64_t *overlap_frames);
+
 /*
  * Branch-P1 observability: how many logical TCP sends the producer issued via the epoll non-blocking
  * path vs the blocking send() path, and the total bytes sent. Lets a test/benchmark prove the epoll

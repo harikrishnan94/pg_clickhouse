@@ -56,6 +56,8 @@ int   pgch_jit_row_threshold = 2000000;
 int   pgch_shm_transport_mode = PGCH_TRANSPORT_ADOPT;
 int   pgch_tcp_send_method = PGCH_TCP_SEND_EPOLL;
 int   pgch_tcp_send_inflight_blocks = 2;
+int   pgch_tcp_sndbuf_bytes = 0;
+int   pgch_tcp_send_delay_us = 0;
 
 /* adopt/copy = SHM transport (consumer-side data path); tcp = bespoke TCP stream (Phase 1);
  * arrow = Apache Arrow IPC over the same per-stream TCP socket (Phase 2 Branch A). */
@@ -1198,6 +1200,25 @@ pgch_shm_offload_init(void)
                             "K so K x max_frame stays under RLIMIT_MEMLOCK. Snapshotted into the "
                             "streaming-worker header.",
                             NULL, &pgch_tcp_send_inflight_blocks, 2, 1, 64,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.tcp_sndbuf_bytes",
+                            "For the 'tcp'/'arrow' transports: per-socket producer SO_SNDBUF in bytes "
+                            "(0 = the default 32 MiB). An experiment knob to size the send buffer toward an "
+                            "emulated link's bandwidth-delay-product for the P2 netem K-sweep, without "
+                            "touching the global net.core.wmem_max. Snapshotted into the streaming-worker "
+                            "header.",
+                            NULL, &pgch_tcp_sndbuf_bytes, 0, 0, 256 * 1024 * 1024,
+                            PGC_USERSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_clickhouse.tcp_send_delay_us",
+                            "P2 controlled microbench knob: inject N microseconds of simulated per-frame "
+                            "in-flight latency (a pooled send frame is not reclaimed until N us after its "
+                            "send completes), emulating the real-NIC send/zerocopy-completion latency that "
+                            "loopback's deferred copy cannot reproduce. 0 = off. Demonstrates the K-deep "
+                            "run-ahead's overlap benefit (K=1 stalls per frame; K>1 hides the latency). "
+                            "NOT for production.",
+                            NULL, &pgch_tcp_send_delay_us, 0, 0, 1000000,
                             PGC_USERSET, 0, NULL, NULL, NULL);
 
     /* Planner/executor hooks, CustomScan methods, and the
