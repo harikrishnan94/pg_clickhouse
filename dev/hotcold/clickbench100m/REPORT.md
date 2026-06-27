@@ -143,3 +143,21 @@ PG restored to 16GB after). Cold confirmed: EXPLAIN BUFFERS `shared read=84480` 
 ---
 *(Numbers above are committed in `results/bench/{cells.tsv,baselines10m.tsv}`; reproduction in
 `10-REPRODUCTION.md`; every claim's sources in the evidence matrix, methodology log L0031–L0045.)*
+
+---
+
+## Evidence matrix (every MATERIAL claim → ≥3 independent sources)
+
+| Claim ID | Material claim | Source 1 | Source 2 | Source 3 | Converge? | Noise/confounder check | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| M0-correct | merged hot/cold == pure-CH-100M (eligible×f) within fidelity bounds | cmp_results.py 112/126 exact (oracle summary.tsv) | 14 DIFF → 18/18 exact under tiebreak (topn summary.tsv) | 10M native-PG↔pure-CH(fixed) bridge identical (L0040) | YES | top-N tiebreak benign (D-HC-0407); A1 TZ bug fixed+reverified | GREEN |
+| M0-part | partition exact: hot=N(f), hot+cold=99,997,497, disjoint | uniqExact(5-tuple)==count (L0034) | countIf(tuple>=B)==N per f | count(hot)+count(cold)==total | YES | 5-tuple uniqueness proven (no ties at boundary) | GREEN |
+| M0-push | the merge offloads (hot streamed, not dropped) | query_log ShmAdoptedBlocks 49/239/478 every cell | producer returns exactly N(f) rows | q5 cold-only≠full proves hot contributes (Agent A) | YES | poll-retry for async flush | GREEN |
+| M1-win | merge 15.6×/5.4× vs native-PG/full-offload @f1% (42/42) | cells.tsv merge_wall (measured 100M) | baselines10m.tsv ×10 projection | Agent A independent re-derivation (exact) | YES | projection CONSERVATIVE (native-PG super-linear); losses incl | GREEN |
+| M1-overlap | merge_ch ≈ max(cold-arm,hot); 11/16 HIDDEN (overlap real) | overlap.tsv (cache-controlled, N=5) | producer-window≈merge-window all cells (instrument B) | EXPLAIN PIPELINE arms concurrent | YES | C1 fixed (cold-arm not pure-CH ref); same-cache | GREEN |
+| M1-parhot | parallel-hot (P=8) 2.64× faster @f10%, restores full-offload win | parallel_hot.tsv (N=5) | clean-TIER1 single-hot baseline (cells.tsv) | vs-baselines recompute | YES | cache-confounder root-caused (used clean baseline) | GREEN |
+| M2-nic | NO RESULT for true cross-box; hot fits under cold @3GB/s f1% (bound) | analytic hot-bytes÷3GB/s vs cold-arm | netem corroborates bytes/bw (narrow 492≈427ms) | phase3 K-deep latency-hiding (cited) | n/a (bound) | netem-on-lo unreliable (caveat); NO RESULT honest | NO RESULT (bounded) |
+| M3-coldio | streaming memory BOUNDED (~64MiB ring + staging), data-size-indep | coldio.tsv RSS 108→129MB (+12% for 10× data) | ring fixed 64MiB both f | delta vs native (+46MB/−307MB) | YES | cold confirmed EXPLAIN BUFFERS read=84480 vs warm hit | GREEN |
+| M3-cold | the hot pages were read COLD from disk | shared_buffers=256MB < table | drop_caches each run | EXPLAIN BUFFERS shared read=84480 (vs warm hit, 27×) | YES | /proc/<backend>/io=0 = PG18 io-worker reads (caveat) | GREEN |
+
+(MATERIAL claims settle on ≥3 independent converging sources per §9.1; the NIC headline is NO RESULT per §9.7.)
