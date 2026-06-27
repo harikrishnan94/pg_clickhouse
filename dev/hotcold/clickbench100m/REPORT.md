@@ -13,7 +13,7 @@ ETL-everything baseline) by 4–24× — the price of keeping the hot data fresh
 it. The headline win shrinks as f grows (at f=10% the *single-threaded* hot producer streaming 10M
 rows erases the advantage over full-offload). On loopback the hot transfer is **CPU-bound** and only
 *hides* under the cold scan for the slowest queries — the **network-overlap thesis is NOT proven here
-and is deferred to Unit 2 (NO RESULT)**. Cold-IO: streaming's added memory is BOUNDED (a fixed 64 MiB ring + ~tens-MB staging, ~independent of data size) — bounded and sub-linear (+19% RSS for 10× data), and no throughput penalty when cold.
+and is deferred to Unit 2 (NO RESULT)**. Cold-IO: streaming’s added memory is BOUNDED and sub-linear (a fixed 64 MiB ring + ~tens-MB staging; +19% RSS for 10× more data) with no throughput penalty when cold — Andrey’s concern refuted.
 
 ---
 
